@@ -28,7 +28,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 // Show variables statement.
-public class ShowVariablesStmt extends ShowStmt {
+public class ShowVariablesStmt extends ShowStmt implements NotFallbackInParser {
     private static final Logger LOG = LogManager.getLogger(ShowVariablesStmt.class);
     private static final String NAME_COL = "Variable_name";
     private static final String VALUE_COL = "Value";
@@ -106,7 +106,9 @@ public class ShowVariablesStmt extends ShowStmt {
         selectStmt = new SelectStmt(selectList,
                 new FromClause(Lists.newArrayList(new TableRef(tableName, null))),
                 where, null, null, null, LimitElement.NO_LIMIT);
-        LOG.debug("select stmt is {}", selectStmt.toSql());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("select stmt is {}", selectStmt.toSql());
+        }
 
         // DB: type
         // table: thread id

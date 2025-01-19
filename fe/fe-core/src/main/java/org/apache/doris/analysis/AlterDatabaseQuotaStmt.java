@@ -17,6 +17,7 @@
 
 package org.apache.doris.analysis;
 
+import org.apache.doris.alter.QuotaType;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
@@ -27,19 +28,20 @@ import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.qe.ConnectContext;
 
 import com.google.common.base.Strings;
+import com.google.gson.annotations.SerializedName;
 
-public class AlterDatabaseQuotaStmt extends DdlStmt {
+public class AlterDatabaseQuotaStmt extends DdlStmt implements NotFallbackInParser {
+    @SerializedName("db")
     private String dbName;
-    private QuotaType quotaType;
-    private String quotaValue;
-    private long quota;
 
-    public enum QuotaType {
-        NONE,
-        DATA,
-        REPLICA,
-        TRANSACTION
-    }
+    @SerializedName("qt")
+    private QuotaType quotaType;
+
+    @SerializedName("qv")
+    private String quotaValue;
+
+    @SerializedName("q")
+    private long quota;
 
     public AlterDatabaseQuotaStmt(String dbName, QuotaType quotaType, String quotaValue) {
         this.dbName = dbName;
@@ -72,7 +74,7 @@ public class AlterDatabaseQuotaStmt extends DdlStmt {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_NO_DB_ERROR);
         }
         if (quotaType == QuotaType.DATA) {
-            quota = ParseUtil.analyzeDataVolumn(quotaValue);
+            quota = ParseUtil.analyzeDataVolume(quotaValue);
         } else if (quotaType == QuotaType.REPLICA) {
             quota = ParseUtil.analyzeReplicaNumber(quotaValue);
         } else if (quotaType == QuotaType.TRANSACTION) {
@@ -85,5 +87,10 @@ public class AlterDatabaseQuotaStmt extends DdlStmt {
         return "ALTER DATABASE " + dbName + " SET "
                 + quotaType.name()
                 + " QUOTA " + quotaValue;
+    }
+
+    @Override
+    public StmtType stmtType() {
+        return StmtType.ALTER;
     }
 }

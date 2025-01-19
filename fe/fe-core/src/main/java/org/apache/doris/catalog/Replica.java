@@ -18,25 +18,27 @@
 package org.apache.doris.catalog;
 
 import org.apache.doris.common.Config;
+import org.apache.doris.common.UserException;
 import org.apache.doris.common.io.Text;
-import org.apache.doris.common.io.Writable;
 import org.apache.doris.common.util.DebugPointUtil;
 import org.apache.doris.system.Backend;
+import org.apache.doris.thrift.TTabletInfo;
 import org.apache.doris.thrift.TUniqueId;
 
 import com.google.gson.annotations.SerializedName;
+import lombok.Getter;
+import lombok.Setter;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 import java.util.Comparator;
 
 /**
  * This class represents the olap replica related metadata.
  */
-public class Replica implements Writable {
+public class Replica {
     private static final Logger LOG = LogManager.getLogger(Replica.class);
     public static final VersionComparator<Replica> VERSION_DESC_COMPARATOR = new VersionComparator<Replica>();
     public static final LastSuccessVersionComparator<Replica> LAST_SUCCESS_VERSION_COMPARATOR =
@@ -70,45 +72,77 @@ public class Replica implements Writable {
         VERSION_ERROR, // missing version
         MISSING, // replica does not exist
         SCHEMA_ERROR, // replica's schema hash does not equal to index's schema hash
-        BAD // replica is broken.
+        BAD, // replica is broken.
+        DROP,  // user force drop replica on this backend
+    }
+
+    public static class ReplicaContext {
+        public long replicaId;
+        public long backendId;
+        public ReplicaState state;
+        public long version;
+        public int schemaHash;
+        public long dbId;
+        public long tableId;
+        public long partitionId;
+        public long indexId;
+        public Replica originReplica;
     }
 
     @SerializedName(value = "id")
     private long id;
-    @SerializedName(value = "backendId")
+    @SerializedName(value = "bid", alternate = {"backendId"})
     private long backendId;
     // the version could be queried
-    @SerializedName(value = "version")
+    @SerializedName(value = "v", alternate = {"version"})
     private volatile long version;
     @Deprecated
-    @SerializedName(value = "versionHash")
+    @SerializedName(value = "vh", alternate = {"versionHash"})
     private long versionHash = 0L;
     private int schemaHash = -1;
-    @SerializedName(value = "dataSize")
+    @SerializedName(value = "ds", alternate = {"dataSize"})
     private volatile long dataSize = 0;
-    @SerializedName(value = "remoteDataSize")
+    @SerializedName(value = "rds", alternate = {"remoteDataSize"})
     private volatile long remoteDataSize = 0;
-    @SerializedName(value = "rowCount")
+    @SerializedName(value = "rc", alternate = {"rowCount"})
     private volatile long rowCount = 0;
-    @SerializedName(value = "state")
+    @SerializedName(value = "st", alternate = {"state"})
     private volatile ReplicaState state;
 
     // the last load failed version
-    @SerializedName(value = "lastFailedVersion")
+    @SerializedName(value = "lfv", alternate = {"lastFailedVersion"})
     private long lastFailedVersion = -1L;
     @Deprecated
-    @SerializedName(value = "lastFailedVersionHash")
+    @SerializedName(value = "lfvh", alternate = {"lastFailedVersionHash"})
     private long lastFailedVersionHash = 0L;
     // not serialized, not very important
     private long lastFailedTimestamp = 0;
     // the last load successful version
-    @SerializedName(value = "lastSuccessVersion")
+    @SerializedName(value = "lsv", alternate = {"lastSuccessVersion"})
     private long lastSuccessVersion = -1L;
     @Deprecated
-    @SerializedName(value = "lastSuccessVersionHash")
+    @SerializedName(value = "lsvh", alternate = {"lastSuccessVersionHash"})
     private long lastSuccessVersionHash = 0L;
 
-    private volatile long versionCount = -1;
+    @Setter
+    @Getter
+    @SerializedName(value = "lis", alternate = {"localInvertedIndexSize"})
+    private Long localInvertedIndexSize = 0L;
+    @Setter
+    @Getter
+    @SerializedName(value = "lss", alternate = {"localSegmentSize"})
+    private Long localSegmentSize = 0L;
+    @Setter
+    @Getter
+    @SerializedName(value = "ris", alternate = {"remoteInvertedIndexSize"})
+    private Long remoteInvertedIndexSize = 0L;
+    @Setter
+    @Getter
+    @SerializedName(value = "rss", alternate = {"remoteSegmentSize"})
+    private Long remoteSegmentSize = 0L;
+
+    private volatile long totalVersionCount = -1;
+    private volatile long visibleVersionCount = -1;
 
     private long pathHash = -1;
 
@@ -158,8 +192,18 @@ public class Replica implements Writable {
      */
     private long preWatermarkTxnId = -1;
     private long postWatermarkTxnId = -1;
+    private long segmentCount = 0L;
+    private long rowsetCount = 0L;
+
+    private long userDropTime = -1;
+
+    private long lastReportVersion = 0;
 
     public Replica() {
+    }
+
+    public Replica(ReplicaContext context) {
+        this(context.replicaId, context.backendId, context.state, context.version, context.schemaHash);
     }
 
     // for rollup
@@ -217,7 +261,16 @@ public class Replica implements Writable {
         return this.id;
     }
 
-    public long getBackendId() {
+    public long getBackendIdWithoutException() {
+        try {
+            return getBackendId();
+        } catch (UserException e) {
+            LOG.warn("getBackendIdWithoutException: ", e);
+            return -1;
+        }
+    }
+
+    public long getBackendId() throws UserException {
         return this.backendId;
     }
 
@@ -230,12 +283,40 @@ public class Replica implements Writable {
         return dataSize;
     }
 
+    public void setDataSize(long dataSize) {
+        this.dataSize = dataSize;
+    }
+
     public long getRemoteDataSize() {
         return remoteDataSize;
     }
 
+    public void setRemoteDataSize(long remoteDataSize) {
+        this.remoteDataSize = remoteDataSize;
+    }
+
     public long getRowCount() {
         return rowCount;
+    }
+
+    public void setRowCount(long rowCount) {
+        this.rowCount = rowCount;
+    }
+
+    public long getSegmentCount() {
+        return segmentCount;
+    }
+
+    public void setSegmentCount(long segmentCount) {
+        this.segmentCount = segmentCount;
+    }
+
+    public long getRowsetCount() {
+        return rowsetCount;
+    }
+
+    public void setRowsetCount(long rowsetCount) {
+        this.rowsetCount = rowsetCount;
     }
 
     public long getLastFailedVersion() {
@@ -318,28 +399,24 @@ public class Replica implements Writable {
         this.furtherRepairWatermarkTxnTd = furtherRepairWatermarkTxnTd;
     }
 
-    // for compatibility
-    public synchronized void updateStat(long dataSize, long rowNum) {
-        this.dataSize = dataSize;
-        this.rowCount = rowNum;
+    public void updateWithReport(TTabletInfo backendReplica) {
+        updateVersion(backendReplica.getVersion());
+        setDataSize(backendReplica.getDataSize());
+        setRemoteDataSize(backendReplica.getRemoteDataSize());
+        setRowCount(backendReplica.getRowCount());
+        setTotalVersionCount(backendReplica.getTotalVersionCount());
+        setVisibleVersionCount(
+                backendReplica.isSetVisibleVersionCount() ? backendReplica.getVisibleVersionCount()
+                        : backendReplica.getTotalVersionCount());
     }
 
-    public synchronized void updateStat(long dataSize, long remoteDataSize, long rowNum, long versionCount) {
-        this.dataSize = dataSize;
-        this.remoteDataSize = remoteDataSize;
-        this.rowCount = rowNum;
-        this.versionCount = versionCount;
+    public synchronized void updateVersion(long newVersion) {
+        updateReplicaVersion(newVersion, this.lastFailedVersion, this.lastSuccessVersion);
     }
 
-    public synchronized void updateVersionInfo(long newVersion, long newDataSize, long newRemoteDataSize,
-                                               long newRowCount) {
-        updateReplicaInfo(newVersion, this.lastFailedVersion, this.lastSuccessVersion, newDataSize, newRemoteDataSize,
-                newRowCount);
-    }
-
-    public synchronized void updateVersionWithFailedInfo(
+    public synchronized void updateVersionWithFailed(
             long newVersion, long lastFailedVersion, long lastSuccessVersion) {
-        updateReplicaInfo(newVersion, lastFailedVersion, lastSuccessVersion, dataSize, remoteDataSize, rowCount);
+        updateReplicaVersion(newVersion, lastFailedVersion, lastSuccessVersion);
     }
 
     public synchronized void adminUpdateVersionInfo(Long version, Long lastFailedVersion, Long lastSuccessVersion,
@@ -402,9 +479,7 @@ public class Replica implements Writable {
      *      the V(hash) equals to LSV(hash), and V equals to LFV, but LFV hash is 0 or some unknown number.
      *      We just reset the LFV(hash) to recovery this replica.
      */
-    private void updateReplicaInfo(long newVersion,
-            long lastFailedVersion, long lastSuccessVersion,
-            long newDataSize, long newRemoteDataSize, long newRowCount) {
+    private void updateReplicaVersion(long newVersion, long lastFailedVersion, long lastSuccessVersion) {
         if (LOG.isDebugEnabled()) {
             LOG.debug("before update: {}", this.toString());
         }
@@ -429,9 +504,6 @@ public class Replica implements Writable {
         long oldLastFailedVersion = this.lastFailedVersion;
 
         this.version = newVersion;
-        this.dataSize = newDataSize;
-        this.remoteDataSize = newRemoteDataSize;
-        this.rowCount = newRowCount;
 
         // just check it
         if (lastSuccessVersion <= this.version) {
@@ -445,9 +517,11 @@ public class Replica implements Writable {
 
         // TODO: this case is unknown, add log to observe
         if (this.version > lastFailedVersion && lastFailedVersion > 0) {
-            LOG.debug("current version {} is larger than last failed version {}, "
-                        + "maybe a fatal error or be report version, print a stack here ",
-                    this.version, lastFailedVersion, new Exception());
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("current version {} is larger than last failed version {}, "
+                            + "maybe a fatal error or be report version, print a stack here ",
+                        this.version, lastFailedVersion, new Exception());
+            }
         }
 
         if (lastFailedVersion != this.lastFailedVersion) {
@@ -492,7 +566,16 @@ public class Replica implements Writable {
     }
 
     public synchronized void updateLastFailedVersion(long lastFailedVersion) {
-        updateReplicaInfo(this.version, lastFailedVersion, this.lastSuccessVersion, dataSize, remoteDataSize, rowCount);
+        updateReplicaVersion(this.version, lastFailedVersion, this.lastSuccessVersion);
+    }
+
+    /*
+     * If a replica is overwritten by a restore job, we need to reset version and lastSuccessVersion to
+     * the restored replica version
+     */
+    public void updateVersionForRestore(long version) {
+        this.version = version;
+        this.lastSuccessVersion = version;
     }
 
     /*
@@ -516,8 +599,10 @@ public class Replica implements Writable {
         }
 
         if (this.version < expectedVersion) {
-            LOG.debug("replica version does not catch up with version: {}. replica: {}",
-                      expectedVersion, this);
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("replica version does not catch up with version: {}. replica: {}",
+                          expectedVersion, this);
+            }
             return false;
         }
         return true;
@@ -535,16 +620,28 @@ public class Replica implements Writable {
         return state == ReplicaState.COMPACTION_TOO_SLOW;
     }
 
+    public boolean tooBigVersionCount() {
+        return visibleVersionCount >= Config.min_version_count_indicate_replica_compaction_too_slow;
+    }
+
     public boolean isNormal() {
         return state == ReplicaState.NORMAL;
     }
 
-    public long getVersionCount() {
-        return versionCount;
+    public long getTotalVersionCount() {
+        return totalVersionCount;
     }
 
-    public void setVersionCount(long versionCount) {
-        this.versionCount = versionCount;
+    public void setTotalVersionCount(long totalVersionCount) {
+        this.totalVersionCount = totalVersionCount;
+    }
+
+    public long getVisibleVersionCount() {
+        return visibleVersionCount;
+    }
+
+    public void setVisibleVersionCount(long visibleVersionCount) {
+        this.visibleVersionCount = visibleVersionCount;
     }
 
     public boolean checkVersionRegressive(long newVersion) {
@@ -588,6 +685,8 @@ public class Replica implements Writable {
         strBuffer.append(schemaHash);
         strBuffer.append(", state=");
         strBuffer.append(state.name());
+        strBuffer.append(", isBad=");
+        strBuffer.append(isBad());
         strBuffer.append("]");
         return strBuffer.toString();
     }
@@ -640,22 +739,7 @@ public class Replica implements Writable {
         return strBuffer.toString();
     }
 
-    @Override
-    public void write(DataOutput out) throws IOException {
-        out.writeLong(id);
-        out.writeLong(backendId);
-        out.writeLong(version);
-        out.writeLong(versionHash);
-        out.writeLong(dataSize);
-        out.writeLong(rowCount);
-        Text.writeString(out, state.name());
-
-        out.writeLong(lastFailedVersion);
-        out.writeLong(lastFailedVersionHash);
-        out.writeLong(lastSuccessVersion);
-        out.writeLong(lastSuccessVersionHash);
-    }
-
+    @Deprecated
     public void readFields(DataInput in) throws IOException {
         id = in.readLong();
         backendId = in.readLong();
@@ -670,8 +754,9 @@ public class Replica implements Writable {
         lastSuccessVersionHash = in.readLong();
     }
 
+    @Deprecated
     public static Replica read(DataInput in) throws IOException {
-        Replica replica = EnvFactory.createReplica();
+        Replica replica = EnvFactory.getInstance().createReplica();
         replica.readFields(in);
         return replica;
     }
@@ -760,9 +845,37 @@ public class Replica implements Writable {
         return postWatermarkTxnId;
     }
 
+    public void setUserDropTime(long userDropTime) {
+        this.userDropTime = userDropTime;
+    }
+
+    public boolean isUserDrop() {
+        if (userDropTime > 0) {
+            if (System.currentTimeMillis() - userDropTime < Config.manual_drop_replica_valid_second * 1000L) {
+                return true;
+            }
+            userDropTime = -1;
+        }
+
+        return false;
+    }
+
     public boolean isAlive() {
         return getState() != ReplicaState.CLONE
                 && getState() != ReplicaState.DECOMMISSION
                 && !isBad();
+    }
+
+    public boolean isScheduleAvailable() {
+        return Env.getCurrentSystemInfo().checkBackendScheduleAvailable(backendId)
+            && !isUserDrop();
+    }
+
+    public void setLastReportVersion(long version) {
+        this.lastReportVersion = version;
+    }
+
+    public long getLastReportVersion() {
+        return lastReportVersion;
     }
 }

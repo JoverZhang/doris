@@ -38,16 +38,19 @@ import org.apache.doris.catalog.PartitionKey;
 import org.apache.doris.catalog.PrimitiveType;
 import org.apache.doris.catalog.ResourceMgr;
 import org.apache.doris.catalog.Type;
-import org.apache.doris.catalog.external.EsExternalDatabase;
-import org.apache.doris.catalog.external.EsExternalTable;
-import org.apache.doris.catalog.external.HMSExternalDatabase;
-import org.apache.doris.catalog.external.HMSExternalTable;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.ExceptionChecker;
 import org.apache.doris.common.FeConstants;
+import org.apache.doris.datasource.es.EsExternalCatalog;
+import org.apache.doris.datasource.es.EsExternalDatabase;
+import org.apache.doris.datasource.es.EsExternalTable;
+import org.apache.doris.datasource.hive.HMSExternalCatalog;
+import org.apache.doris.datasource.hive.HMSExternalDatabase;
+import org.apache.doris.datasource.hive.HMSExternalTable;
 import org.apache.doris.datasource.hive.HiveMetaStoreCache;
 import org.apache.doris.datasource.hive.HiveMetaStoreCache.FileCacheKey;
+import org.apache.doris.datasource.hive.HiveMetaStoreCache.FileCacheValue;
 import org.apache.doris.datasource.hive.HiveMetaStoreCache.HivePartitionValues;
 import org.apache.doris.datasource.hive.HiveMetaStoreCache.PartitionValueCacheKey;
 import org.apache.doris.mysql.privilege.Auth;
@@ -58,8 +61,10 @@ import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.ShowResultSet;
 import org.apache.doris.utframe.TestWithFeService;
 
+import com.github.benmanes.caffeine.cache.LoadingCache;
 import com.google.common.base.Preconditions;
-import com.google.common.cache.LoadingCache;
+import com.google.common.collect.BiMap;
+import com.google.common.collect.HashBiMap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Range;
@@ -100,13 +105,6 @@ public class CatalogMgrTest extends TestWithFeService {
         // grant with no catalog is switched, internal catalog works.
         CreateRoleStmt createRole1 = (CreateRoleStmt) parseAndAnalyzeStmt("create role role1;", rootCtx);
         auth.createRole(createRole1);
-        GrantStmt grantRole1 = (GrantStmt) parseAndAnalyzeStmt("grant grant_priv on tpch.* to role 'role1';", rootCtx);
-        auth.grant(grantRole1);
-        // grant with ctl.db.tbl. grant can succeed even if the catalog does not exist
-        GrantStmt grantRole1WithCtl = (GrantStmt) parseAndAnalyzeStmt(
-                "grant select_priv on testc.testdb.* to role 'role1';", rootCtx);
-        auth.grant(grantRole1WithCtl);
-        // user1 can't switch to hive
         auth.createUser((CreateUserStmt) parseAndAnalyzeStmt(
                 "create user 'user1'@'%' identified by 'pwd1' default role 'role1';", rootCtx));
         user1 = new UserIdentity("user1", "%");
@@ -165,15 +163,15 @@ public class CatalogMgrTest extends TestWithFeService {
         schema.add(new Column("k1", PrimitiveType.INT));
         if (catalog instanceof HMSExternalCatalog) {
             HMSExternalCatalog hmsCatalog = (HMSExternalCatalog) catalog;
-            HMSExternalDatabase db = new HMSExternalDatabase(hmsCatalog, 10000, "hive_db1");
-            HMSExternalTable tbl = new HMSExternalTable(10001, "hive_tbl1", "hive_db1", hmsCatalog);
+            HMSExternalDatabase db = new HMSExternalDatabase(hmsCatalog, 10000, "hive_db1", "hive_db1");
+            HMSExternalTable tbl = new HMSExternalTable(10001, "hive_tbl1", "hive_db1", hmsCatalog, db);
             tbl.setNewFullSchema(schema);
             db.addTableForTest(tbl);
             hmsCatalog.addDatabaseForTest(db);
         } else if (catalog instanceof EsExternalCatalog) {
             EsExternalCatalog esCatalog = (EsExternalCatalog) catalog;
-            EsExternalDatabase db = new EsExternalDatabase(esCatalog, 10002, "es_db1");
-            EsExternalTable tbl = new EsExternalTable(10003, "es_tbl1", "es_tbl1", esCatalog);
+            EsExternalDatabase db = new EsExternalDatabase(esCatalog, 10002, "es_db1", "es_db1");
+            EsExternalTable tbl = new EsExternalTable(10003, "es_tbl1", "es_tbl1", esCatalog, db);
             tbl.setNewFullSchema(schema);
             db.addTableForTest(tbl);
             esCatalog.addDatabaseForTest(db);
@@ -232,7 +230,7 @@ public class CatalogMgrTest extends TestWithFeService {
 
         CatalogIf catalog = env.getCatalogMgr().getCatalog(MY_CATALOG);
         // type, hive.metastore.uris and create_time
-        Assert.assertEquals(4, catalog.getProperties().size());
+        Assert.assertEquals(5, catalog.getProperties().size());
         Assert.assertEquals("thrift://172.16.5.9:9083", catalog.getProperties().get("hive.metastore.uris"));
 
         // test add property
@@ -246,14 +244,14 @@ public class CatalogMgrTest extends TestWithFeService {
         AlterCatalogPropertyStmt alterStmt = new AlterCatalogPropertyStmt(MY_CATALOG, alterProps2);
         mgr.alterCatalogProps(alterStmt);
         catalog = env.getCatalogMgr().getCatalog(MY_CATALOG);
-        Assert.assertEquals(9, catalog.getProperties().size());
+        Assert.assertEquals(10, catalog.getProperties().size());
         Assert.assertEquals("service1", catalog.getProperties().get("dfs.nameservices"));
 
         String showDetailCatalog = "SHOW CATALOG my_catalog";
         ShowCatalogStmt showDetailStmt = (ShowCatalogStmt) parseAndAnalyzeStmt(showDetailCatalog);
         showResultSet = mgr.showCatalogs(showDetailStmt);
 
-        Assert.assertEquals(9, showResultSet.getResultRows().size());
+        Assert.assertEquals(10, showResultSet.getResultRows().size());
         for (List<String> row : showResultSet.getResultRows()) {
             Assertions.assertEquals(2, row.size());
             if (row.get(0).equalsIgnoreCase("type")) {
@@ -271,6 +269,8 @@ public class CatalogMgrTest extends TestWithFeService {
         List<String> result = showResultSet.getResultRows().get(0);
         Assertions.assertEquals("my_catalog", result.get(0));
         Assertions.assertTrue(result.get(1).startsWith("\nCREATE CATALOG `my_catalog`\nCOMMENT \"hms comment\"\n PROPERTIES ("));
+        Assertions.assertTrue(!result.get(1).contains(ExternalCatalog.CREATE_TIME));
+        Assertions.assertTrue(!result.get(1).contains(ExternalCatalog.USE_META_CACHE));
 
         testCatalogMgrPersist();
 
@@ -322,7 +322,7 @@ public class CatalogMgrTest extends TestWithFeService {
 
         CatalogIf hms = mgr2.getCatalog(MY_CATALOG);
         properties = hms.getProperties();
-        Assert.assertEquals(9, properties.size());
+        Assert.assertEquals(10, properties.size());
         Assert.assertEquals("hms", properties.get("type"));
         Assert.assertEquals("thrift://172.16.5.9:9083", properties.get("hive.metastore.uris"));
 
@@ -357,21 +357,18 @@ public class CatalogMgrTest extends TestWithFeService {
         String showCatalogSql = "SHOW CATALOGS";
         ShowCatalogStmt showStmt = (ShowCatalogStmt) parseAndAnalyzeStmt(showCatalogSql);
         ShowResultSet showResultSet = mgr.showCatalogs(showStmt, user2Ctx.getCurrentCatalog().getName());
-        Assertions.assertEquals("yes", showResultSet.getResultRows().get(1).get(3));
+        Assertions.assertEquals("Yes", showResultSet.getResultRows().get(1).get(3));
+        Assertions.assertEquals("No", showResultSet.getResultRows().get(0).get(3));
 
         // user2 can switch to hive
         SwitchStmt switchHive = (SwitchStmt) parseAndAnalyzeStmt("switch hive;", user2Ctx);
         env.changeCatalog(user2Ctx, switchHive.getCatalogName());
         Assert.assertEquals(user2Ctx.getDefaultCatalog(), "hive");
-        // user2 can grant select_priv to tpch.customer
-        GrantStmt user2GrantHiveTable = (GrantStmt) parseAndAnalyzeStmt(
-                "grant select_priv on tpch.customer to 'user2'@'%';", user2Ctx);
-        auth.grant(user2GrantHiveTable);
 
         showCatalogSql = "SHOW CATALOGS";
         showStmt = (ShowCatalogStmt) parseAndAnalyzeStmt(showCatalogSql);
         showResultSet = mgr.showCatalogs(showStmt, user2Ctx.getCurrentCatalog().getName());
-        Assertions.assertEquals("yes", showResultSet.getResultRows().get(0).get(3));
+        Assertions.assertEquals("Yes", showResultSet.getResultRows().get(0).get(3));
     }
 
     @Test
@@ -478,6 +475,7 @@ public class CatalogMgrTest extends TestWithFeService {
                 partitionValueCacheKey.getTypes());
         HivePartitionValues partitionValues = metaStoreCache.getPartitionValues(partitionValueCacheKey);
         Assert.assertEquals(partitionValues.getPartitionNameToIdMap().size(), 4);
+        Assert.assertEquals(partitionValues.getPartitionNameToIdMap().inverse().size(), 4);
     }
 
     @Test
@@ -521,7 +519,7 @@ public class CatalogMgrTest extends TestWithFeService {
             HiveMetaStoreCache metaStoreCache) {
         // partition name format: nation=cn/city=beijing
         Map<Long, PartitionItem> idToPartitionItem = Maps.newHashMapWithExpectedSize(partitionNames.size());
-        Map<String, Long> partitionNameToIdMap = Maps.newHashMapWithExpectedSize(partitionNames.size());
+        BiMap<String, Long> partitionNameToIdMap = HashBiMap.create(partitionNames.size());
         Map<Long, List<UniqueId>> idToUniqueIdsMap = Maps.newHashMapWithExpectedSize(partitionNames.size());
         long idx = 0;
         for (String partitionName : partitionNames) {
@@ -546,7 +544,7 @@ public class CatalogMgrTest extends TestWithFeService {
             singleUidToColumnRangeMap = ListPartitionPrunerV2.genSingleUidToColumnRange(singleColumnRangeMap);
         }
         Map<Long, List<String>> partitionValuesMap = ListPartitionPrunerV2.getPartitionValuesMap(idToPartitionItem);
-        return new HivePartitionValues(idToPartitionItem, uidToPartitionRange, rangeToId, singleColumnRangeMap, idx,
+        return new HivePartitionValues(idToPartitionItem, uidToPartitionRange, rangeToId, singleColumnRangeMap,
                 partitionNameToIdMap, idToUniqueIdsMap, singleUidToColumnRangeMap, partitionValuesMap);
     }
 
@@ -715,7 +713,7 @@ public class CatalogMgrTest extends TestWithFeService {
         mgr.alterCatalogProps(alterCatalogPropertyStmt3);
 
         CatalogIf catalog = env.getCatalogMgr().getCatalog(catalogName);
-        Assert.assertEquals(10, catalog.getProperties().size());
+        Assert.assertEquals(11, catalog.getProperties().size());
         Assert.assertEquals("nn1,nn3", catalog.getProperties().get("dfs.ha.namenodes.HANN"));
     }
 
@@ -740,7 +738,7 @@ public class CatalogMgrTest extends TestWithFeService {
 
         HMSExternalCatalog hiveCatalog = (HMSExternalCatalog) mgr.getCatalog(catalogName);
         HiveMetaStoreCache metaStoreCache = externalMetaCacheMgr.getMetaStoreCache(hiveCatalog);
-        LoadingCache<FileCacheKey, HiveMetaStoreCache.FileCacheValue> preFileCache = metaStoreCache.getFileCacheRef().get();
+        LoadingCache<FileCacheKey, FileCacheValue> preFileCache = metaStoreCache.getFileCacheRef().get();
 
 
         // 1. properties contains `file.meta.cache.ttl-second`, it should not be equal
@@ -757,8 +755,6 @@ public class CatalogMgrTest extends TestWithFeService {
                 + " (\"type\" = \"hms\", \"hive.metastore.uris\" = \"thrift://172.16.5.9:9083\");";
         mgr.alterCatalogProps((AlterCatalogPropertyStmt) parseAndAnalyzeStmt(alterCatalogProp));
         Assertions.assertEquals(preFileCache, metaStoreCache.getFileCacheRef().get());
-
-
     }
 
     @Test

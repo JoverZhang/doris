@@ -24,6 +24,7 @@
 
 #include "common/status.h"
 #include "io/fs/path.h"
+#include "util/profile_collector.h"
 #include "util/slice.h"
 
 namespace doris {
@@ -62,12 +63,15 @@ struct FileReaderOptions {
 
 inline const FileReaderOptions FileReaderOptions::DEFAULT;
 
-class FileReader {
+class FileReader : public doris::ProfileCollector {
 public:
     FileReader() = default;
     virtual ~FileReader() = default;
 
-    DISALLOW_COPY_AND_ASSIGN(FileReader);
+    FileReader(const FileReader&) = delete;
+    const FileReader& operator=(const FileReader&) = delete;
+
+    static const std::string VIRTUAL_REMOTE_DATA_DIR;
 
     /// If io_ctx is not null,
     /// the caller must ensure that the IOContext exists during the left cycle of read_at()
@@ -82,7 +86,7 @@ public:
 
     virtual bool closed() const = 0;
 
-    virtual std::shared_ptr<FileSystem> fs() const = 0;
+    virtual const std::string& get_data_dir_path() { return VIRTUAL_REMOTE_DATA_DIR; }
 
 protected:
     virtual Status read_at_impl(size_t offset, Slice result, size_t* bytes_read,
@@ -90,6 +94,9 @@ protected:
 };
 
 using FileReaderSPtr = std::shared_ptr<FileReader>;
+
+Result<FileReaderSPtr> create_cached_file_reader(FileReaderSPtr raw_reader,
+                                                 const FileReaderOptions& opts);
 
 } // namespace io
 } // namespace doris

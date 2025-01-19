@@ -17,14 +17,16 @@
 
 import org.codehaus.groovy.runtime.IOGroovyMethods
 
-suite("test_index_compaction_unique_keys", "p0") {
+suite("test_index_compaction_unique_keys", "nonConcurrent") {
+    def isCloudMode = isCloudMode()
     def tableName = "test_index_compaction_unique_keys"
     def backendId_to_backendIP = [:]
     def backendId_to_backendHttpPort = [:]
     getBackendIpHttpPort(backendId_to_backendIP, backendId_to_backendHttpPort);
 
+    sql """ set global enable_match_without_inverted_index = false """
     boolean disableAutoCompaction = false
-  
+
     def set_be_config = { key, value ->
         for (String backend_id: backendId_to_backendIP.keySet()) {
             def (code, out, err) = update_be_config(backendId_to_backendIP.get(backend_id), backendId_to_backendHttpPort.get(backend_id), key, value)
@@ -32,54 +34,10 @@ suite("test_index_compaction_unique_keys", "p0") {
         }
     }
 
-    def trigger_full_compaction_on_tablets = { String[][] tablets ->
-        for (String[] tablet : tablets) {
-            String tablet_id = tablet[0]
-            String backend_id = tablet[2]
-            int times = 1
-            
-            String compactionStatus;
-            do{
-                def (code, out, err) = be_run_full_compaction(backendId_to_backendIP.get(backend_id), backendId_to_backendHttpPort.get(backend_id), tablet_id)
-                logger.info("Run compaction: code=" + code + ", out=" + out + ", err=" + err)
-                ++times
-                sleep(2000)
-                compactionStatus = parseJson(out.trim()).status.toLowerCase();
-            } while (compactionStatus!="success" && times<=10)
-
-
-            if (compactionStatus == "fail") {
-                assertEquals(disableAutoCompaction, false)
-                logger.info("Compaction was done automatically!")
-            }
-            if (disableAutoCompaction) {
-                assertEquals("success", compactionStatus)
-            }
-        }
-    }
-
-    def wait_full_compaction_done = { String[][] tablets ->
-        for (String[] tablet in tablets) {
-            boolean running = true
-            do {
-                Thread.sleep(1000)
-                String tablet_id = tablet[0]
-                String backend_id = tablet[2]
-                def (code, out, err) = be_get_compaction_status(backendId_to_backendIP.get(backend_id), backendId_to_backendHttpPort.get(backend_id), tablet_id)
-                logger.info("Get compaction status: code=" + code + ", out=" + out + ", err=" + err)
-                assertEquals(code, 0)
-                def compactionStatus = parseJson(out.trim())
-                assertEquals("success", compactionStatus.status.toLowerCase())
-                running = compactionStatus.run_status
-            } while (running)
-        }
-    }
-
-    def get_rowset_count = {String[][] tablets ->
+    def get_rowset_count = { tablets ->
         int rowsetCount = 0
-        for (String[] tablet in tablets) {
-            def compactionStatusUrlIndex = 18
-            def (code, out, err) = curl("GET", tablet[compactionStatusUrlIndex])
+        for (def tablet in tablets) {
+            def (code, out, err) = curl("GET", tablet.CompactionStatus)
             logger.info("Show tablets status: code=" + code + ", out=" + out + ", err=" + err)
             assertEquals(code, 0)
             def tabletJson = parseJson(out.trim())
@@ -111,7 +69,7 @@ suite("test_index_compaction_unique_keys", "p0") {
         String backend_id;
         backend_id = backendId_to_backendIP.keySet()[0]
         def (code, out, err) = show_be_config(backendId_to_backendIP.get(backend_id), backendId_to_backendHttpPort.get(backend_id))
-        
+
         logger.info("Show config: code=" + code + ", out=" + out + ", err=" + err)
         assertEquals(code, 0)
         def configList = parseJson(out.trim())
@@ -141,18 +99,20 @@ suite("test_index_compaction_unique_keys", "p0") {
                 `hobbies` text NULL,
                 `score` int(11) NULL,
                 index index_name (name) using inverted,
-                index index_hobbies (hobbies) using inverted properties("parser"="english"),
+                index index_hobbies (hobbies) using inverted properties("support_phrase" = "true", "parser" = "english", "lower_case" = "true"),
                 index index_score (score) using inverted
             ) ENGINE=OLAP
             UNIQUE KEY(`id`)
             COMMENT 'OLAP'
             DISTRIBUTED BY HASH(`id`) BUCKETS 1
-            PROPERTIES ( 
+            PROPERTIES (
                 "replication_num" = "1",
                 "disable_auto_compaction" = "true",
-                "enable_unique_key_merge_on_write" = "true"
+                "enable_unique_key_merge_on_write" = "true",
+                "inverted_index_storage_format" = "V1"
             );
         """
+        sql """ set enable_common_expr_pushdown = true """
 
         sql """ INSERT INTO ${tableName} VALUES (1, "andy", "andy love apple", 100); """
         sql """ INSERT INTO ${tableName} VALUES (1, "bason", "bason hate pear", 99); """
@@ -167,8 +127,8 @@ suite("test_index_compaction_unique_keys", "p0") {
         qt_sql """ select * from ${tableName} where score < 100 order by id, name, hobbies, score """
 
         //TabletId,ReplicaId,BackendId,SchemaHash,Version,LstSuccessVersion,LstFailedVersion,LstFailedTime,LocalDataSize,RemoteDataSize,RowCount,State,LstConsistencyCheckTime,CheckVersion,VersionCount,PathHash,MetaUrl,CompactionStatus
-        String[][] tablets = sql """ show tablets from ${tableName}; """
-        String[][] dedup_tablets = deduplicate_tablets(tablets)
+        def tablets = sql_return_maparray """ show tablets from ${tableName}; """
+        def dedup_tablets = deduplicate_tablets(tablets)
 
         // In the p0 testing environment, there are no expected operations such as scaling down BE (backend) services
         // if tablets or dedup_tablets is empty, exception is thrown, and case fail
@@ -183,14 +143,15 @@ suite("test_index_compaction_unique_keys", "p0") {
         assert (rowsetCount == 7 * replicaNum)
 
         // trigger full compactions for all tablets in ${tableName}
-        trigger_full_compaction_on_tablets.call(tablets)
-
-        // wait for full compaction done
-        wait_full_compaction_done.call(tablets)
+        trigger_and_wait_compaction(tableName, "full")
 
         // after full compaction, there is only 1 rowset.
         rowsetCount = get_rowset_count.call(tablets);
-        assert (rowsetCount == 1 * replicaNum)
+        if (isCloudMode) {
+            assert (rowsetCount == (1 + 1) * replicaNum)
+        } else {
+            assert (rowsetCount == 1 * replicaNum)
+        }
 
         qt_sql """ select * from ${tableName} order by id, name, hobbies, score """
         qt_sql """ select * from ${tableName} where name match "andy" order by id, name, hobbies, score """
@@ -211,17 +172,22 @@ suite("test_index_compaction_unique_keys", "p0") {
         qt_sql """ select * from ${tableName} where score < 100 order by id, name, hobbies, score """
 
         rowsetCount = get_rowset_count.call(tablets);
-        assert (rowsetCount == 7 * replicaNum)
+        if (isCloudMode) {
+            assert (rowsetCount == (7 + 1) * replicaNum)
+        } else {
+            assert (rowsetCount == 7 * replicaNum)
+        }
 
         // trigger full compactions for all tablets in ${tableName}
-        trigger_full_compaction_on_tablets.call(tablets)
-
-        // wait for full compaction done
-        wait_full_compaction_done.call(tablets)
+        trigger_and_wait_compaction(tableName, "full")
 
         // after full compaction, there is only 1 rowset.
         rowsetCount = get_rowset_count.call(tablets);
-        assert (rowsetCount == 1 * replicaNum)
+        if (isCloudMode) {
+            assert (rowsetCount == (1 + 1) * replicaNum)
+        } else {
+            assert (rowsetCount == 1 * replicaNum)
+        }
 
         qt_sql """ select * from ${tableName} order by id, name, hobbies, score """
         qt_sql """ select * from ${tableName} where name match "andy" order by id, name, hobbies, score """
@@ -232,5 +198,6 @@ suite("test_index_compaction_unique_keys", "p0") {
         if (has_update_be_config) {
             set_be_config.call("inverted_index_compaction_enable", invertedIndexCompactionEnable.toString())
         }
+        sql """ set global enable_match_without_inverted_index = true """
     }
 }

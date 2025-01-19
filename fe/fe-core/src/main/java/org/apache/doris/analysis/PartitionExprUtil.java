@@ -18,13 +18,16 @@
 package org.apache.doris.analysis;
 
 import org.apache.doris.catalog.Column;
+import org.apache.doris.catalog.DataProperty;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.PartitionInfo;
 import org.apache.doris.catalog.PartitionType;
 import org.apache.doris.catalog.Type;
 import org.apache.doris.common.AnalysisException;
-import org.apache.doris.thrift.TStringLiteral;
+import org.apache.doris.common.util.PropertyAnalyzer;
+import org.apache.doris.thrift.TNullableStringLiteral;
 
+import com.google.common.base.Objects;
 import com.google.common.collect.Maps;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -34,7 +37,6 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Set;
 
 public class PartitionExprUtil {
@@ -88,7 +90,7 @@ public class PartitionExprUtil {
         } else {
             throw new AnalysisException("now range partition only support date_trunc/date_floor/date_ceil.");
         }
-        return partitionExprUtil.new FunctionIntervalInfo(timeUnit, interval);
+        return partitionExprUtil.new FunctionIntervalInfo(fnName, timeUnit, interval);
     }
 
     public static DateLiteral getRangeEnd(DateLiteral beginTime, FunctionIntervalInfo intervalInfo)
@@ -98,8 +100,12 @@ public class PartitionExprUtil {
         switch (timeUnit) {
             case "year":
                 return beginTime.plusYears(interval);
+            case "quarter":
+                return beginTime.plusMonths(interval * 3);
             case "month":
                 return beginTime.plusMonths(interval);
+            case "week":
+                return beginTime.plusDays(interval * 7);
             case "day":
                 return beginTime.plusDays(interval);
             case "hour":
@@ -115,7 +121,7 @@ public class PartitionExprUtil {
     }
 
     public static Map<String, AddPartitionClause> getAddPartitionClauseFromPartitionValues(OlapTable olapTable,
-            ArrayList<List<TStringLiteral>> partitionValues, PartitionInfo partitionInfo)
+            ArrayList<List<TNullableStringLiteral>> partitionValues, PartitionInfo partitionInfo)
             throws AnalysisException {
         Map<String, AddPartitionClause> result = Maps.newHashMap();
         ArrayList<Expr> partitionExprs = partitionInfo.getPartitionExprs();
@@ -125,15 +131,23 @@ public class PartitionExprUtil {
         FunctionIntervalInfo intervalInfo = getFunctionIntervalInfo(partitionExprs, partitionType);
         Set<String> filterPartitionValues = new HashSet<String>();
 
-        for (List<TStringLiteral> partitionValueList : partitionValues) {
+        for (List<TNullableStringLiteral> partitionValueList : partitionValues) {
             PartitionKeyDesc partitionKeyDesc = null;
             String partitionName = "p";
             ArrayList<String> curPartitionValues = new ArrayList<>();
-            for (TStringLiteral tStringLiteral : partitionValueList) {
-                curPartitionValues.add(tStringLiteral.value);
+            for (TNullableStringLiteral tStringLiteral : partitionValueList) {
+                if (tStringLiteral.is_null) {
+                    if (partitionType == PartitionType.RANGE) {
+                        throw new AnalysisException("Can't create partition for NULL Range");
+                    }
+                    curPartitionValues.add(null);
+                } else {
+                    curPartitionValues.add(tStringLiteral.value);
+                }
             }
+            // Concatenate each string with its length. X means null
             String filterStr = curPartitionValues.stream()
-                    .map(s -> s + s.length()) // Concatenate each string with its length
+                    .map(s -> (s == null) ? "X" : (s + s.length()))
                     .reduce("", (s1, s2) -> s1 + s2);
             if (filterPartitionValues.contains(filterStr)) {
                 continue;
@@ -152,16 +166,18 @@ public class PartitionExprUtil {
                 List<List<PartitionValue>> listValues = new ArrayList<>();
                 List<PartitionValue> inValues = new ArrayList<>();
                 for (String value : curPartitionValues) {
-                    inValues.add(new PartitionValue(value));
+                    if (value == null) {
+                        inValues.add(new PartitionValue("", true));
+                    } else {
+                        inValues.add(new PartitionValue(value));
+                    }
                 }
                 listValues.add(inValues);
-                partitionKeyDesc = PartitionKeyDesc.createIn(
-                        listValues);
+                partitionKeyDesc = PartitionKeyDesc.createIn(listValues);
                 partitionName += getFormatPartitionValue(filterStr);
                 if (hasStringType) {
                     if (partitionName.length() > 50) {
-                        partitionName = partitionName.substring(0, 30) + Math.abs(Objects.hash(partitionName))
-                                + "_" + System.currentTimeMillis();
+                        throw new AnalysisException("Partition name's length is over limit of 50. abort to create.");
                     }
                 }
             } else {
@@ -173,7 +189,12 @@ public class PartitionExprUtil {
 
             SinglePartitionDesc singleRangePartitionDesc = new SinglePartitionDesc(true, partitionName,
                     partitionKeyDesc, partitionProperties);
-
+            // iff table's storage medium is not equal default storage medium,
+            // should add storage medium in partition properties
+            if (!DataProperty.DEFAULT_STORAGE_MEDIUM.equals(olapTable.getStorageMedium())) {
+                partitionProperties.put(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM,
+                        olapTable.getStorageMedium().name());
+            }
             AddPartitionClause addPartitionClause = new AddPartitionClause(singleRangePartitionDesc,
                     distributionDesc, partitionProperties, false);
             result.put(partitionName, addPartitionClause);
@@ -181,35 +202,43 @@ public class PartitionExprUtil {
         return result;
     }
 
-    public static PartitionKeyDesc createPartitionKeyDescWithRange(DateLiteral beginDateTime,
+    private static PartitionKeyDesc createPartitionKeyDescWithRange(DateLiteral beginDateTime,
             DateLiteral endDateTime, Type partitionColumnType) throws AnalysisException {
-        String beginTime;
-        String endTime;
-        // maybe need check the range in FE also, like getAddPartitionClause.
-        if (partitionColumnType.isDate() || partitionColumnType.isDateV2()) {
-            beginTime = String.format(DATE_FORMATTER, beginDateTime.getYear(), beginDateTime.getMonth(),
-                    beginDateTime.getDay());
-            endTime = String.format(DATE_FORMATTER, endDateTime.getYear(), endDateTime.getMonth(),
-                    endDateTime.getDay());
-        } else if (partitionColumnType.isDatetime() || partitionColumnType.isDatetimeV2()) {
-            beginTime = String.format(DATETIME_FORMATTER,
-                    beginDateTime.getYear(), beginDateTime.getMonth(), beginDateTime.getDay(),
-                    beginDateTime.getHour(), beginDateTime.getMinute(), beginDateTime.getSecond());
-            endTime = String.format(DATETIME_FORMATTER,
-                    endDateTime.getYear(), endDateTime.getMonth(), endDateTime.getDay(),
-                    endDateTime.getHour(), endDateTime.getMinute(), endDateTime.getSecond());
-        } else {
-            throw new AnalysisException(
-                    "not support range partition with column type : " + partitionColumnType.toString());
-        }
-        PartitionValue lowerValue = new PartitionValue(beginTime);
-        PartitionValue upperValue = new PartitionValue(endTime);
+        PartitionValue lowerValue = getPartitionFromDate(partitionColumnType, beginDateTime);
+        PartitionValue upperValue = getPartitionFromDate(partitionColumnType, endDateTime);
         return PartitionKeyDesc.createFixed(
                 Collections.singletonList(lowerValue),
                 Collections.singletonList(upperValue));
     }
 
-    public static String getFormatPartitionValue(String value) {
+    private static PartitionValue getPartitionFromDate(Type partitionColumnType, DateLiteral dateLiteral)
+            throws AnalysisException {
+        // check out of range.
+        try {
+            // if lower than range, parse will error. so if hits here, the only possiblility
+            // is rounding to beyond the limit
+            dateLiteral.checkValueValid();
+        } catch (AnalysisException e) {
+            return PartitionValue.MAX_VALUE;
+        }
+
+        String timeString;
+        if (partitionColumnType.isDate() || partitionColumnType.isDateV2()) {
+            timeString = String.format(DATE_FORMATTER, dateLiteral.getYear(), dateLiteral.getMonth(),
+                    dateLiteral.getDay());
+        } else if (partitionColumnType.isDatetime() || partitionColumnType.isDatetimeV2()) {
+            timeString = String.format(DATETIME_FORMATTER,
+                    dateLiteral.getYear(), dateLiteral.getMonth(), dateLiteral.getDay(),
+                    dateLiteral.getHour(), dateLiteral.getMinute(), dateLiteral.getSecond());
+        } else {
+            throw new AnalysisException(
+                    "not support range partition with column type : " + partitionColumnType.toString());
+        }
+
+        return new PartitionValue(timeString);
+    }
+
+    private static String getFormatPartitionValue(String value) {
         StringBuilder sb = new StringBuilder();
         // When the value is negative
         if (value.length() > 0 && value.charAt(0) == '-') {
@@ -229,12 +258,32 @@ public class PartitionExprUtil {
     }
 
     public class FunctionIntervalInfo {
+        public String fnName;
         public String timeUnit;
         public long interval;
 
-        public FunctionIntervalInfo(String timeUnit, long interval) {
+        public FunctionIntervalInfo(String fnName, String timeUnit, long interval) {
+            this.fnName = fnName;
             this.timeUnit = timeUnit;
             this.interval = interval;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (o == null || getClass() != o.getClass()) {
+                return false;
+            }
+            FunctionIntervalInfo that = (FunctionIntervalInfo) o;
+            return interval == that.interval && Objects.equal(fnName, that.fnName)
+                    && Objects.equal(timeUnit, that.timeUnit);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hashCode(fnName, timeUnit, interval);
         }
     }
 }

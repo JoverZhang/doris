@@ -32,6 +32,7 @@ import org.apache.doris.proto.InternalService.PFetchRemoteSchemaResponse;
 import org.apache.doris.proto.InternalService.PTabletsLocation;
 import org.apache.doris.proto.OlapFile.ColumnPB;
 import org.apache.doris.proto.OlapFile.TabletSchemaPB;
+import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.rpc.BackendServiceProxy;
 import org.apache.doris.rpc.RpcException;
 import org.apache.doris.system.Backend;
@@ -76,7 +77,7 @@ public class FetchRemoteTabletSchemaUtil {
                 // only need alive replica
                 if (replica.isAlive()) {
                     Set<Long> tabletIds = beIdToTabletId.computeIfAbsent(
-                                    replica.getBackendId(), k -> Sets.newHashSet());
+                                    replica.getBackendIdWithoutException(), k -> Sets.newHashSet());
                     tabletIds.add(tablet.getId());
                 }
             }
@@ -91,19 +92,24 @@ public class FetchRemoteTabletSchemaUtil {
             Long backendId = entry.getKey();
             Set<Long> tabletIds = entry.getValue();
             Backend backend = Env.getCurrentEnv().getCurrentSystemInfo().getBackend(backendId);
+            LOG.debug("fetch schema from coord backend {}, sample tablets count {}",
+                            backend.getId(), tabletIds.size());
             // only need alive be
             if (!backend.isAlive()) {
                 continue;
             }
-            // need 2 be to provide a retry
-            if (coordinatorBackend.size() < 2) {
-                coordinatorBackend.add(backend);
-            }
+            coordinatorBackend.add(backend);
             PTabletsLocation.Builder locationBuilder = PTabletsLocation.newBuilder()
                                                         .setHost(backend.getHost())
                                                         .setBrpcPort(backend.getBrpcPort());
             PTabletsLocation location = locationBuilder.addAllTabletId(tabletIds).build();
             locations.add(location);
+        }
+        // pick 2 random coordinator
+        Collections.shuffle(coordinatorBackend);
+        if (!coordinatorBackend.isEmpty()) {
+            coordinatorBackend = coordinatorBackend.subList(0, Math.min(2, coordinatorBackend.size()));
+            LOG.debug("pick coordinator backend {}", coordinatorBackend.get(0));
         }
         PFetchRemoteSchemaRequest.Builder requestBuilder = PFetchRemoteSchemaRequest.newBuilder()
                                                                     .addAllTabletLocation(locations)
@@ -116,7 +122,8 @@ public class FetchRemoteTabletSchemaUtil {
                                             .fetchRemoteTabletSchemaAsync(be.getBrpcAddress(), request);
                 PFetchRemoteSchemaResponse response = null;
                 try {
-                    response = future.get(60, TimeUnit.SECONDS);
+                    response = future.get(
+                        ConnectContext.get().getSessionVariable().fetchRemoteSchemaTimeoutSeconds, TimeUnit.SECONDS);
                     TStatusCode code = TStatusCode.findByValue(response.getStatus().getStatusCode());
                     String errMsg;
                     if (code != TStatusCode.OK) {

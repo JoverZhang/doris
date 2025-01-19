@@ -63,12 +63,14 @@ public interface Task {
     /**
      * This method is called to cancel the execution of the task.
      * Implementations should define the necessary steps to cancel the task.
+     *
+     * @param needWaitCancelComplete Do we need to wait for the cancellation to be completed.
      */
-    void cancel() throws JobException;
+    void cancel(boolean needWaitCancelComplete) throws JobException;
 
     /**
      * get info for tvf `tasks`
      * @return TRow
      */
-    TRow getTvfInfo();
+    TRow getTvfInfo(String jobName);
 }

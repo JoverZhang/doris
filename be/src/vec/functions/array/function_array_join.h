@@ -25,6 +25,7 @@
 
 namespace doris::vectorized {
 
+#include "common/compile_check_begin.h"
 struct NameArrayJoin {
     static constexpr auto name = "array_join";
 };
@@ -54,7 +55,7 @@ public:
         return std::make_shared<DataTypeString>();
     }
 
-    static Status execute(Block& block, const ColumnNumbers& arguments, size_t result,
+    static Status execute(Block& block, const ColumnNumbers& arguments, uint32_t result,
                           const DataTypeArray* data_type_array, const ColumnArray& array) {
         ColumnPtr src_column =
                 block.get_by_position(arguments[0]).column->convert_to_full_column_if_const();
@@ -77,10 +78,11 @@ public:
 
         auto nested_type = data_type_array->get_nested_type();
         auto dest_column_ptr = ColumnString::create();
-        DCHECK(dest_column_ptr != nullptr);
+        DCHECK(dest_column_ptr);
 
-        auto res_val = _execute_by_type(*src.nested_col, *src.offsets_ptr, src.nested_nullmap_data,
-                                        sep_str, null_replace_str, nested_type, dest_column_ptr);
+        auto res_val =
+                _execute_by_type(*src.nested_col, *src.offsets_ptr, src.nested_nullmap_data,
+                                 sep_str, null_replace_str, nested_type, dest_column_ptr.get());
         if (!res_val) {
             return Status::RuntimeError(fmt::format(
                     "execute failed or unsupported types for function {}({},{},{})", "array_join",
@@ -147,7 +149,7 @@ private:
 
                 if (is_decimal) {
                     DecimalV2Value decimal_value =
-                            (DecimalV2Value)(src_data_concrete->get_data()[j]);
+                            (DecimalV2Value)(int128_t(src_data_concrete->get_data()[j]));
                     std::string decimal_str = decimal_value.to_string();
                     _fill_result_string(decimal_str, sep_str, result_str, is_first_elem);
                 } else {
@@ -266,4 +268,5 @@ private:
     }
 };
 
+#include "common/compile_check_end.h"
 } // namespace doris::vectorized

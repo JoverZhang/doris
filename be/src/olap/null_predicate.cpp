@@ -53,7 +53,7 @@ Status NullPredicate::evaluate(BitmapIndexIterator* iterator, uint32_t num_rows,
     return Status::OK();
 }
 
-Status NullPredicate::evaluate(const vectorized::NameAndTypePair& name_with_type,
+Status NullPredicate::evaluate(const vectorized::IndexFieldNameAndTypePair& name_with_type,
                                InvertedIndexIterator* iterator, uint32_t num_rows,
                                roaring::Roaring* bitmap) const {
     if (iterator->has_null()) {
@@ -77,8 +77,8 @@ Status NullPredicate::evaluate(const vectorized::NameAndTypePair& name_with_type
     return Status::OK();
 }
 
-uint16_t NullPredicate::evaluate(const vectorized::IColumn& column, uint16_t* sel,
-                                 uint16_t size) const {
+uint16_t NullPredicate::_evaluate_inner(const vectorized::IColumn& column, uint16_t* sel,
+                                        uint16_t size) const {
     uint16_t new_size = 0;
     if (auto* nullable = check_and_get_column<ColumnNullable>(column)) {
         if (!nullable->has_null()) {

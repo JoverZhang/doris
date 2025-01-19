@@ -36,15 +36,17 @@ import org.apache.hudi.common.table.{HoodieTableConfig, HoodieTableMetaClient, T
 import org.apache.hudi.common.util.ValidationUtils.checkState
 import org.apache.hudi.common.util.{ConfigUtils, StringUtils}
 import org.apache.hudi.config.HoodieWriteConfig
-import org.apache.hudi.hadoop.CachingPath
+import org.apache.hudi.hadoop.fs.CachingPath
 import org.apache.hudi.internal.schema.convert.AvroInternalSchemaConverter
 import org.apache.hudi.internal.schema.utils.{InternalSchemaUtils, SerDeHelper}
 import org.apache.hudi.internal.schema.{HoodieSchemaException, InternalSchema}
-import org.apache.hudi.io.storage.HoodieAvroHFileReader
+import org.apache.hudi.io.hadoop.HoodieHBaseAvroHFileReader
 import org.apache.hudi.metadata.HoodieTableMetadataUtil
 import org.apache.hudi.{AvroConversionUtils, DataSourceReadOptions, DataSourceWriteOptions, HoodieSparkConfUtils, HoodieTableSchema, HoodieTableState}
+import org.apache.hudi.storage.StoragePath;
+import org.apache.hudi.storage.hadoop.HadoopStorageConfiguration;
 import org.apache.log4j.Logger
-import org.apache.spark.sql.adapter.Spark3_2Adapter
+import org.apache.spark.sql.adapter.Spark3_4Adapter
 import org.apache.spark.sql.avro.{HoodieAvroSchemaConverters, HoodieSparkAvroSchemaConverters}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat
@@ -66,7 +68,7 @@ import scala.collection.JavaConverters._
 import scala.util.control.NonFatal
 import scala.util.{Failure, Success, Try}
 
-class DorisSparkAdapter extends Spark3_2Adapter {
+class DorisSparkAdapter extends Spark3_4Adapter {
   override def getAvroSchemaConverters: HoodieAvroSchemaConverters = HoodieSparkAvroSchemaConverters
 }
 
@@ -125,6 +127,10 @@ class HoodieSplit(private val params: jutil.Map[String, String]) {
     conf
   }
 
+  def incrementalRead: Boolean = {
+    "true".equalsIgnoreCase(optParams.getOrElse("hoodie.datasource.read.incr.operation", "false"))
+  }
+
   // NOTE: In cases when Hive Metastore is used as catalog and the table is partitioned, schema in the HMS might contain
   //       Hive-specific partitioning columns created specifically for HMS to handle partitioning appropriately. In that
   //       case  we opt in to not be providing catalog's schema, and instead force Hudi relations to fetch the schema
@@ -168,6 +174,8 @@ abstract class BaseSplitReader(val split: HoodieSplit) {
   protected val optParams: Map[String, String] = split.optParams
 
   protected val tableInformation: HoodieTableInformation = cache.get(split)
+
+  protected val timeline: HoodieTimeline = tableInformation.timeline
 
   protected val sparkSession: SparkSession = tableInformation.sparkSession
   protected val sqlContext: SQLContext = sparkSession.sqlContext
@@ -424,7 +432,7 @@ abstract class BaseSplitReader(val split: HoodieSplit) {
     try {
       if (shouldExtractPartitionValuesFromPartitionPath) {
         val filePath = new Path(split.dataFilePath)
-        val tablePathWithoutScheme = CachingPath.getPathWithoutSchemeAndAuthority(tableInformation.metaClient.getBasePathV2)
+        val tablePathWithoutScheme = CachingPath.getPathWithoutSchemeAndAuthority(new Path(tableInformation.metaClient.getBasePathV2.toUri))
         val partitionPathWithoutScheme = CachingPath.getPathWithoutSchemeAndAuthority(filePath.getParent)
         val relativePath = new URI(tablePathWithoutScheme.toString).relativize(new URI(partitionPathWithoutScheme.toString)).toString
         val hiveStylePartitioningEnabled = tableConfig.getHiveStylePartitioningEnable.toBoolean
@@ -464,7 +472,7 @@ abstract class BaseSplitReader(val split: HoodieSplit) {
                                              options: Map[String, String],
                                              hadoopConf: Configuration,
                                              appendPartitionValues: Boolean = false): PartitionedFile => Iterator[InternalRow] = {
-    val parquetFileFormat: ParquetFileFormat = sparkAdapter.createHoodieParquetFileFormat(appendPartitionValues).get
+    val parquetFileFormat: ParquetFileFormat = sparkAdapter.createLegacyHoodieParquetFileFormat(appendPartitionValues).get
     val readParquetFile: PartitionedFile => Iterator[Any] = parquetFileFormat.buildReaderWithPartitionValues(
       sparkSession = sparkSession,
       dataSchema = dataSchema,
@@ -491,8 +499,11 @@ abstract class BaseSplitReader(val split: HoodieSplit) {
                                 options: Map[String, String],
                                 hadoopConf: Configuration): PartitionedFile => Iterator[InternalRow] = {
     partitionedFile => {
-      val reader = new HoodieAvroHFileReader(
-        hadoopConf, new Path(partitionedFile.filePath), new CacheConfig(hadoopConf))
+      var hadoopStorageConfiguration = new HadoopStorageConfiguration(hadoopConf);
+      var storagePath = new StoragePath(partitionedFile.toPath.toUri.getPath);
+      var emptySchema = org.apache.hudi.common.util.Option.empty[org.apache.avro.Schema]()
+      val reader = new HoodieHBaseAvroHFileReader(
+        hadoopStorageConfiguration, storagePath, emptySchema)
 
       val requiredRowSchema = requiredDataSchema.structTypeSchema
       // NOTE: Schema has to be parsed at this point, since Avro's [[Schema]] aren't serializable
@@ -567,7 +578,7 @@ abstract class BaseSplitReader(val split: HoodieSplit) {
 
     BaseFileReader(
       read = partitionedFile => {
-        val extension = FSUtils.getFileExtension(partitionedFile.filePath)
+        val extension = FSUtils.getFileExtension(partitionedFile.filePath.toString())
         if (tableBaseFileFormat.getFileExtension.equals(extension)) {
           read(partitionedFile)
         } else {
@@ -577,8 +588,6 @@ abstract class BaseSplitReader(val split: HoodieSplit) {
       schema = schema
     )
   }
-
-  protected val timeline: HoodieTimeline = tableInformation.timeline
 
   protected def embedInternalSchema(conf: Configuration, internalSchemaOpt: Option[InternalSchema]): Configuration = {
     val internalSchema = internalSchemaOpt.getOrElse(InternalSchema.getEmptyInternalSchema)

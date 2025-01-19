@@ -22,6 +22,7 @@ import org.apache.doris.catalog.Type;
 import org.apache.doris.nereids.types.DataType;
 import org.apache.doris.nereids.types.NullType;
 import org.apache.doris.nereids.types.coercion.AnyDataType;
+import org.apache.doris.nereids.types.coercion.ComplexDataType;
 import org.apache.doris.nereids.types.coercion.FollowToAnyDataType;
 
 import java.util.List;
@@ -48,6 +49,9 @@ public interface ExplicitlyCastableSignature extends ComputeSignature {
         }
         if (realType instanceof NullType) {
             return true;
+        }
+        if (signatureType instanceof ComplexDataType && !(realType instanceof ComplexDataType)) {
+            return false;
         }
         try {
             // TODO: copy canCastTo method to DataType

@@ -17,6 +17,8 @@
 
 #include "transactional_hive_reader.h"
 
+#include <re2/re2.h>
+
 #include "runtime/runtime_state.h"
 #include "transactional_hive_common.h"
 #include "vec/data_types/data_type_factory.hpp"
@@ -84,24 +86,14 @@ Status TransactionalHiveReader::get_next_block(Block* block, size_t* read_rows, 
     return res;
 }
 
-Status TransactionalHiveReader::set_fill_columns(
-        const std::unordered_map<std::string, std::tuple<std::string, const SlotDescriptor*>>&
-                partition_columns,
-        const std::unordered_map<std::string, VExprContextSPtr>& missing_columns) {
-    return _file_format_reader->set_fill_columns(partition_columns, missing_columns);
-}
-
-bool TransactionalHiveReader::fill_all_columns() const {
-    return _file_format_reader->fill_all_columns();
-};
-
 Status TransactionalHiveReader::get_columns(
         std::unordered_map<std::string, TypeDescriptor>* name_to_type,
         std::unordered_set<std::string>* missing_cols) {
     return _file_format_reader->get_columns(name_to_type, missing_cols);
 }
 
-Status TransactionalHiveReader::init_row_filters(const TFileRangeDesc& range) {
+Status TransactionalHiveReader::init_row_filters(const TFileRangeDesc& range,
+                                                 io::IOContext* io_ctx) {
     std::string data_file_path = _range.path;
     // the path in _range is remove the namenode prefix,
     // and the file_path in delete file is full path, so we should add it back.
@@ -118,15 +110,38 @@ Status TransactionalHiveReader::init_row_filters(const TFileRangeDesc& range) {
     int64_t num_delete_files = 0;
     std::filesystem::path file_path(data_file_path);
 
+    //See https://github.com/apache/hive/commit/ffee30e6267e85f00a22767262192abb9681cfb7#diff-5fe26c36b4e029dcd344fc5d484e7347R165
+    // bucket_xxx_attemptId => bucket_xxx
+    // bucket_xxx           => bucket_xxx
+    auto remove_bucket_attemptId = [](const std::string& str) {
+        re2::RE2 pattern("^bucket_\\d+_\\d+$");
+
+        if (re2::RE2::FullMatch(str, pattern)) {
+            size_t pos = str.rfind('_');
+            if (pos != std::string::npos) {
+                return str.substr(0, pos);
+            }
+        }
+        return str;
+    };
+
     SCOPED_TIMER(_transactional_orc_profile.delete_files_read_time);
     for (auto& delete_delta : range.table_format_params.transactional_hive_params.delete_deltas) {
         const std::string file_name = file_path.filename().string();
-        auto iter = std::find(delete_delta.file_names.begin(), delete_delta.file_names.end(),
-                              file_name);
-        if (iter == delete_delta.file_names.end()) {
+
+        //need opt.
+        std::vector<std::string> delete_delta_file_names;
+        for (const auto& x : delete_delta.file_names) {
+            delete_delta_file_names.emplace_back(remove_bucket_attemptId(x));
+        }
+        auto iter = std::find(delete_delta_file_names.begin(), delete_delta_file_names.end(),
+                              remove_bucket_attemptId(file_name));
+        if (iter == delete_delta_file_names.end()) {
             continue;
         }
-        auto delete_file = fmt::format("{}/{}", delete_delta.directory_location, file_name);
+        auto delete_file =
+                fmt::format("{}/{}", delete_delta.directory_location,
+                            delete_delta.file_names[iter - delete_delta_file_names.begin()]);
 
         TFileRangeDesc delete_range;
         // must use __set() method to make sure __isset is true
@@ -146,7 +161,7 @@ Status TransactionalHiveReader::init_row_filters(const TFileRangeDesc& range) {
         std::unordered_map<std::string, std::tuple<std::string, const SlotDescriptor*>>
                 partition_columns;
         std::unordered_map<std::string, VExprContextSPtr> missing_columns;
-        static_cast<void>(delete_reader.set_fill_columns(partition_columns, missing_columns));
+        RETURN_IF_ERROR(delete_reader.set_fill_columns(partition_columns, missing_columns));
 
         bool eof = false;
         while (!eof) {
@@ -190,6 +205,7 @@ Status TransactionalHiveReader::init_row_filters(const TFileRangeDesc& range) {
         ++num_delete_files;
     }
     if (num_delete_rows > 0) {
+        orc_reader->set_push_down_agg_type(TPushAggOp::NONE);
         orc_reader->set_delete_rows(&_delete_rows);
         COUNTER_UPDATE(_transactional_orc_profile.num_delete_files, num_delete_files);
         COUNTER_UPDATE(_transactional_orc_profile.num_delete_rows, num_delete_rows);

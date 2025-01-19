@@ -93,7 +93,9 @@ public class SelectNode extends PlanNode {
         } else {
             this.cardinality = Math.round(cardinality * selectivity);
         }
-        LOG.debug("stats Select: cardinality={}", this.cardinality);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("stats Select: cardinality={}", this.cardinality);
+        }
     }
 
     @Override
@@ -106,5 +108,11 @@ public class SelectNode extends PlanNode {
             output.append(prefix).append("predicates: ").append(getExplainString(conjuncts)).append("\n");
         }
         return output.toString();
+    }
+
+    // Determined by its child.
+    @Override
+    public boolean isSerialOperator() {
+        return children.get(0).isSerialOperator();
     }
 }

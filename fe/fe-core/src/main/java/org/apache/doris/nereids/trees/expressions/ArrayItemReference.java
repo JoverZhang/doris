@@ -17,6 +17,7 @@
 
 package org.apache.doris.nereids.trees.expressions;
 
+import org.apache.doris.common.Pair;
 import org.apache.doris.nereids.trees.expressions.typecoercion.ExpectsInputTypes;
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
 import org.apache.doris.nereids.types.ArrayType;
@@ -91,7 +92,7 @@ public class ArrayItemReference extends NamedExpression implements ExpectsInputT
     }
 
     @Override
-    public String toSql() {
+    public String computeToSql() {
         return child(0).toSql();
     }
 
@@ -120,7 +121,7 @@ public class ArrayItemReference extends NamedExpression implements ExpectsInputT
     }
 
     @Override
-    public int hashCode() {
+    public int computeHashCode() {
         return Objects.hash(exprId);
     }
 
@@ -142,12 +143,33 @@ public class ArrayItemReference extends NamedExpression implements ExpectsInputT
          * @param nullable true if nullable
          */
         public ArrayItemSlot(ExprId exprId, String name, DataType dataType, boolean nullable) {
-            super(exprId, name, dataType, nullable, ImmutableList.of(), null, Optional.empty());
+            super(exprId, name, dataType, nullable, ImmutableList.of(),
+                    null, null, Optional.empty(), ImmutableList.of());
         }
 
         @Override
         public ArrayItemSlot withExprId(ExprId exprId) {
+            return new ArrayItemSlot(exprId, name.get(), dataType, nullable);
+        }
+
+        @Override
+        public ArrayItemSlot withName(String name) {
             return new ArrayItemSlot(exprId, name, dataType, nullable);
+        }
+
+        @Override
+        public SlotReference withNullable(boolean nullable) {
+            return new ArrayItemSlot(exprId, name.get(), dataType, this.nullable);
+        }
+
+        @Override
+        public Slot withNullableAndDataType(boolean nullable, DataType dataType) {
+            return new ArrayItemSlot(exprId, name.get(), dataType, nullable);
+        }
+
+        @Override
+        public Slot withIndexInSql(Pair<Integer, Integer> index) {
+            return this;
         }
 
         @Override

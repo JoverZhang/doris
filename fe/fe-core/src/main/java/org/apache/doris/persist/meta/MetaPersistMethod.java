@@ -18,6 +18,7 @@
 package org.apache.doris.persist.meta;
 
 import org.apache.doris.catalog.Env;
+import org.apache.doris.cloud.catalog.CloudEnv;
 import org.apache.doris.common.io.CountingDataOutputStream;
 
 import java.io.DataInputStream;
@@ -76,6 +77,12 @@ public class MetaPersistMethod {
                         Env.class.getDeclaredMethod("loadAlterJob", DataInputStream.class, long.class);
                 metaPersistMethod.writeMethod =
                         Env.class.getDeclaredMethod("saveAlterJob", CountingDataOutputStream.class, long.class);
+                break;
+            case "cloudWarmUpJob":
+                metaPersistMethod.readMethod = CloudEnv.class.getDeclaredMethod(
+                        "loadCloudWarmUpJob", DataInputStream.class, long.class);
+                metaPersistMethod.writeMethod = CloudEnv.class.getDeclaredMethod(
+                        "saveCloudWarmUpJob", CountingDataOutputStream.class, long.class);
                 break;
             case "recycleBin":
                 metaPersistMethod.readMethod =
@@ -245,6 +252,13 @@ public class MetaPersistMethod {
                         Env.class.getDeclaredMethod("loadInsertOverwrite", DataInputStream.class, long.class);
                 metaPersistMethod.writeMethod =
                         Env.class.getDeclaredMethod("saveInsertOverwrite", CountingDataOutputStream.class, long.class);
+                break;
+            case "plsql":
+                // package and stored procedure use the same method in PlsqlManager.
+                metaPersistMethod.readMethod = Env.class.getDeclaredMethod("loadPlsqlProcedure", DataInputStream.class,
+                        long.class);
+                metaPersistMethod.writeMethod = Env.class.getDeclaredMethod("savePlsqlProcedure",
+                        CountingDataOutputStream.class, long.class);
                 break;
             default:
                 break;

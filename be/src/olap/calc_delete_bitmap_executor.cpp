@@ -23,26 +23,30 @@
 
 #include "common/config.h"
 #include "common/logging.h"
+#include "olap/base_tablet.h"
 #include "olap/memtable.h"
-#include "olap/tablet.h"
 #include "util/time.h"
 
 namespace doris {
 using namespace ErrorCode;
 
-Status CalcDeleteBitmapToken::submit(TabletSharedPtr tablet, RowsetSharedPtr cur_rowset,
+Status CalcDeleteBitmapToken::submit(BaseTabletSPtr tablet, RowsetSharedPtr cur_rowset,
                                      const segment_v2::SegmentSharedPtr& cur_segment,
                                      const std::vector<RowsetSharedPtr>& target_rowsets,
                                      int64_t end_version, DeleteBitmapPtr delete_bitmap,
-                                     RowsetWriter* rowset_writer) {
+                                     RowsetWriter* rowset_writer,
+                                     DeleteBitmapPtr tablet_delete_bitmap) {
     {
         std::shared_lock rlock(_lock);
         RETURN_IF_ERROR(_status);
+        _query_thread_context.init_unlocked();
     }
 
     return _thread_token->submit_func([=, this]() {
+        SCOPED_ATTACH_TASK(_query_thread_context);
         auto st = tablet->calc_segment_delete_bitmap(cur_rowset, cur_segment, target_rowsets,
-                                                     delete_bitmap, end_version, rowset_writer);
+                                                     delete_bitmap, end_version, rowset_writer,
+                                                     tablet_delete_bitmap);
         if (!st.ok()) {
             LOG(WARNING) << "failed to calc segment delete bitmap, tablet_id: "
                          << tablet->tablet_id() << " rowset: " << cur_rowset->rowset_id()

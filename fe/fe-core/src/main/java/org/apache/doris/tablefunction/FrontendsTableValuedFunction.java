@@ -18,8 +18,12 @@
 package org.apache.doris.tablefunction;
 
 import org.apache.doris.catalog.Column;
+import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.ScalarType;
+import org.apache.doris.common.ErrorCode;
+import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.nereids.exceptions.AnalysisException;
+import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.thrift.TFrontendsMetadataParams;
 import org.apache.doris.thrift.TMetaScanRange;
 import org.apache.doris.thrift.TMetadataType;
@@ -76,6 +80,12 @@ public class FrontendsTableValuedFunction extends MetadataTableValuedFunction {
         if (params.size() != 0) {
             throw new AnalysisException("frontends table-valued-function does not support any params");
         }
+        if (!Env.getCurrentEnv().getAccessManager()
+                .checkGlobalPriv(ConnectContext.get(), PrivPredicate.ADMIN_OR_NODE)) {
+            String message = ErrorCode.ERR_SPECIFIC_ACCESS_DENIED_ERROR.formatErrorMsg(
+                    PrivPredicate.ADMIN_OR_NODE.getPrivs().toString());
+            throw new AnalysisException(message);
+        }
     }
 
     @Override
@@ -103,4 +113,3 @@ public class FrontendsTableValuedFunction extends MetadataTableValuedFunction {
         return SCHEMA;
     }
 }
-

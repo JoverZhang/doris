@@ -24,6 +24,7 @@ import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.DatabaseIf;
 import org.apache.doris.catalog.Env;
+import org.apache.doris.catalog.EnvFactory;
 import org.apache.doris.catalog.JdbcTable;
 import org.apache.doris.catalog.KeysType;
 import org.apache.doris.catalog.MysqlTable;
@@ -33,8 +34,6 @@ import org.apache.doris.catalog.Partition;
 import org.apache.doris.catalog.PartitionType;
 import org.apache.doris.catalog.Table;
 import org.apache.doris.catalog.TableIf;
-import org.apache.doris.catalog.external.JdbcExternalDatabase;
-import org.apache.doris.catalog.external.JdbcExternalTable;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.ErrorCode;
@@ -46,6 +45,9 @@ import org.apache.doris.common.util.DebugUtil;
 import org.apache.doris.common.util.Util;
 import org.apache.doris.datasource.ExternalCatalog;
 import org.apache.doris.datasource.jdbc.JdbcExternalCatalog;
+import org.apache.doris.datasource.jdbc.JdbcExternalDatabase;
+import org.apache.doris.datasource.jdbc.JdbcExternalTable;
+import org.apache.doris.datasource.jdbc.sink.JdbcTableSink;
 import org.apache.doris.load.Load;
 import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.planner.DataPartition;
@@ -54,10 +56,10 @@ import org.apache.doris.planner.ExportSink;
 import org.apache.doris.planner.GroupCommitBlockSink;
 import org.apache.doris.planner.GroupCommitPlanner;
 import org.apache.doris.planner.OlapTableSink;
-import org.apache.doris.planner.external.jdbc.JdbcTableSink;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.SqlModeHelper;
 import org.apache.doris.rewrite.ExprRewriter;
+import org.apache.doris.service.ExecuteEnv;
 import org.apache.doris.service.FrontendOptions;
 import org.apache.doris.thrift.TQueryOptions;
 import org.apache.doris.thrift.TUniqueId;
@@ -82,6 +84,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.BooleanSupplier;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 /**
@@ -100,6 +104,7 @@ import java.util.stream.Collectors;
  * The only difference is that non-streaming will record the load info in LoadManager and return label.
  * User can check the load info by show load stmt.
  */
+@Deprecated
 public class NativeInsertStmt extends InsertStmt {
 
     private static final Logger LOG = LogManager.getLogger(InsertStmt.class);
@@ -149,7 +154,6 @@ public class NativeInsertStmt extends InsertStmt {
 
     // Used for group commit insert
     private boolean isGroupCommit = false;
-    private int baseSchemaVersion = -1;
     private TUniqueId loadId = null;
     private long tableId = -1;
     public boolean isGroupCommitStreamLoadSql = false;
@@ -172,6 +176,17 @@ public class NativeInsertStmt extends InsertStmt {
         InsertType(String labePrefix) {
             this.labePrefix = labePrefix;
         }
+    }
+
+    public NativeInsertStmt(NativeInsertStmt other) {
+        super(other.label, null, null);
+        this.tblName = other.tblName;
+        this.targetPartitionNames = other.targetPartitionNames;
+        this.label = other.label;
+        this.queryStmt = other.queryStmt;
+        this.planHints = other.planHints;
+        this.targetColumnNames = other.targetColumnNames;
+        this.isValuesOrConstantSelect = other.isValuesOrConstantSelect;
     }
 
     public NativeInsertStmt(InsertTarget target, String label, List<String> cols, InsertSource source,
@@ -388,7 +403,9 @@ public class NativeInsertStmt extends InsertStmt {
                 LoadJobSourceType sourceType = LoadJobSourceType.INSERT_STREAMING;
                 transactionId = Env.getCurrentGlobalTransactionMgr().beginTransaction(db.getId(),
                         Lists.newArrayList(targetTable.getId()), label.getLabelName(),
-                        new TxnCoordinator(TxnSourceType.FE, FrontendOptions.getLocalHostAddress()),
+                        new TxnCoordinator(TxnSourceType.FE, 0,
+                                FrontendOptions.getLocalHostAddress(),
+                                ExecuteEnv.getInstance().getStartupTime()),
                         sourceType, timeoutSecond);
             }
             isTransactionBegin = true;
@@ -402,7 +419,7 @@ public class NativeInsertStmt extends InsertStmt {
             boolean isInsertStrict = analyzer.getContext().getSessionVariable().getEnableInsertStrict()
                     && !isFromDeleteOrUpdateStmt;
             sink.init(loadId, transactionId, db.getId(), timeoutSecond,
-                    sendBatchParallelism, false, isInsertStrict);
+                    sendBatchParallelism, false, isInsertStrict, timeoutSecond);
         }
     }
 
@@ -467,7 +484,7 @@ public class NativeInsertStmt extends InsertStmt {
                         haveInputSeqCol = true; // case1.b
                     }
                     seqColInTable = olapTable.getFullSchema().stream()
-                            .filter(col -> col.getName().equals(olapTable.getSequenceMapCol())).findFirst();
+                            .filter(col -> col.getName().equalsIgnoreCase(olapTable.getSequenceMapCol())).findFirst();
                 } else {
                     if (targetColumnNames != null) {
                         if (targetColumnNames.stream()
@@ -478,9 +495,11 @@ public class NativeInsertStmt extends InsertStmt {
                 }
 
                 if (!haveInputSeqCol && !isPartialUpdate && !isFromDeleteOrUpdateStmt
-                        && !analyzer.getContext().getSessionVariable().isEnableUniqueKeyPartialUpdate()) {
+                        && !analyzer.getContext().getSessionVariable().isEnableUniqueKeyPartialUpdate()
+                        && analyzer.getContext().getSessionVariable().isRequireSequenceInInsert()) {
                     if (!seqColInTable.isPresent() || seqColInTable.get().getDefaultValue() == null
-                            || !seqColInTable.get().getDefaultValue().equals(DefaultValue.CURRENT_TIMESTAMP)) {
+                            || !seqColInTable.get().getDefaultValue()
+                            .equalsIgnoreCase(DefaultValue.CURRENT_TIMESTAMP)) {
                         throw new AnalysisException("Table " + olapTable.getName()
                                 + " has sequence column, need to specify the sequence column");
                     }
@@ -488,14 +507,14 @@ public class NativeInsertStmt extends InsertStmt {
             }
 
             if (isPartialUpdate && olapTable.hasSequenceCol() && olapTable.getSequenceMapCol() != null
-                    && partialUpdateCols.contains(olapTable.getSequenceMapCol())) {
+                    && partialUpdateCols.stream().anyMatch(c -> c.equalsIgnoreCase(olapTable.getSequenceMapCol()))) {
                 partialUpdateCols.add(Column.SEQUENCE_COL);
             }
             // need a descriptor
             DescriptorTable descTable = analyzer.getDescTbl();
             olapTuple = descTable.createTupleDescriptor();
             for (Column col : olapTable.getFullSchema()) {
-                if (isPartialUpdate && !partialUpdateCols.contains(col.getName())) {
+                if (isPartialUpdate && partialUpdateCols.stream().noneMatch(c -> c.equalsIgnoreCase(col.getName()))) {
                     continue;
                 }
                 SlotDescriptor slotDesc = descTable.addSlotDescriptor(olapTuple);
@@ -550,7 +569,6 @@ public class NativeInsertStmt extends InsertStmt {
     private void analyzeSubquery(Analyzer analyzer, boolean skipCheck) throws UserException {
         // Analyze columns mentioned in the statement.
         Set<String> mentionedColumns = Sets.newTreeSet(String.CASE_INSENSITIVE_ORDER);
-        List<String> realTargetColumnNames;
         if (targetColumnNames == null) {
             hasEmptyTargetColumns = true;
             // the mentioned columns are columns which are visible to user, so here we use
@@ -572,7 +590,8 @@ public class NativeInsertStmt extends InsertStmt {
             }
             // hll column must in mentionedColumns
             for (Column col : targetTable.getBaseSchema()) {
-                if (col.getType().isObjectStored() && !mentionedColumns.contains(col.getName())) {
+                if (col.getType().isObjectStored() && !col.hasDefaultValue()
+                        && !mentionedColumns.contains(col.getName())) {
                     throw new AnalysisException(
                             "object-stored column " + col.getName() + " must in insert into columns");
                 }
@@ -600,32 +619,35 @@ public class NativeInsertStmt extends InsertStmt {
          * will be used in as a mapping from queryStmt.getResultExprs() to targetColumns define expr
          */
         List<Pair<Integer, Column>> origColIdxsForExtendCols = Lists.newArrayList();
-        for (Column column : targetTable.getFullSchema()) {
-            if (column.isNameWithPrefix(SchemaChangeHandler.SHADOW_NAME_PREFIX)) {
-                String origName = Column.removeNamePrefix(column.getName());
-                for (int i = 0; i < targetColumns.size(); i++) {
-                    if (targetColumns.get(i).nameEquals(origName, false)) {
-                        // Rule A
-                        origColIdxsForExtendCols.add(Pair.of(i, null));
-                        targetColumns.add(column);
-                        break;
-                    }
-                }
-            }
-            if (column.isNameWithPrefix(CreateMaterializedViewStmt.MATERIALIZED_VIEW_NAME_PREFIX)
-                    || column.isNameWithPrefix(CreateMaterializedViewStmt.MATERIALIZED_VIEW_AGGREGATE_NAME_PREFIX)) {
-                List<SlotRef> refColumns = column.getRefColumns();
-                if (refColumns == null) {
-                    ErrorReport.reportAnalysisException(ErrorCode.ERR_BAD_FIELD_ERROR,
-                            column.getName(), targetTable.getName());
-                }
-                for (SlotRef refColumn : refColumns) {
-                    String origName = refColumn.getColumnName();
-                    for (int originColumnIdx = 0; originColumnIdx < targetColumns.size(); originColumnIdx++) {
-                        if (targetColumns.get(originColumnIdx).nameEquals(origName, false)) {
-                            origColIdxsForExtendCols.add(Pair.of(originColumnIdx, column));
+        if (!ConnectContext.get().isTxnModel()) {
+            for (Column column : targetTable.getFullSchema()) {
+                if (column.isNameWithPrefix(SchemaChangeHandler.SHADOW_NAME_PREFIX)) {
+                    String origName = Column.removeNamePrefix(column.getName());
+                    for (int i = 0; i < targetColumns.size(); i++) {
+                        if (targetColumns.get(i).nameEquals(origName, false)) {
+                            // Rule A
+                            origColIdxsForExtendCols.add(Pair.of(i, null));
                             targetColumns.add(column);
                             break;
+                        }
+                    }
+                }
+                if (column.isNameWithPrefix(CreateMaterializedViewStmt.MATERIALIZED_VIEW_NAME_PREFIX)
+                        || column.isNameWithPrefix(
+                        CreateMaterializedViewStmt.MATERIALIZED_VIEW_AGGREGATE_NAME_PREFIX)) {
+                    List<SlotRef> refColumns = column.getRefColumns();
+                    if (refColumns == null) {
+                        ErrorReport.reportAnalysisException(ErrorCode.ERR_BAD_FIELD_ERROR,
+                                column.getName(), targetTable.getName());
+                    }
+                    for (SlotRef refColumn : refColumns) {
+                        String origName = refColumn.getColumnName();
+                        for (int originColumnIdx = 0; originColumnIdx < targetColumns.size(); originColumnIdx++) {
+                            if (targetColumns.get(originColumnIdx).nameEquals(origName, false)) {
+                                origColIdxsForExtendCols.add(Pair.of(originColumnIdx, column));
+                                targetColumns.add(column);
+                                break;
+                            }
                         }
                     }
                 }
@@ -664,9 +686,12 @@ public class NativeInsertStmt extends InsertStmt {
         }
 
         // Check if all columns mentioned is enough
-        checkColumnCoverage(mentionedColumns, targetTable.getBaseSchema());
+        // For JdbcTable, it is allowed to insert without specifying all columns and without checking
+        if (!(targetTable instanceof JdbcTable)) {
+            checkColumnCoverage(mentionedColumns, targetTable.getBaseSchema());
+        }
 
-        realTargetColumnNames = targetColumns.stream().map(Column::getName).collect(Collectors.toList());
+        List<String> realTargetColumnNames = targetColumns.stream().map(Column::getName).collect(Collectors.toList());
 
         // handle VALUES() or SELECT constant list
         if (isValuesOrConstantSelect) {
@@ -675,6 +700,21 @@ public class NativeInsertStmt extends InsertStmt {
                 // INSERT INTO VALUES(...)
                 List<ArrayList<Expr>> rows = selectStmt.getValueList().getRows();
                 for (int rowIdx = 0; rowIdx < rows.size(); ++rowIdx) {
+                    // Only check for JdbcTable
+                    if (targetTable instanceof JdbcTable) {
+                        // Check for NULL values in not-nullable columns
+                        for (int colIdx = 0; colIdx < targetColumns.size(); ++colIdx) {
+                            Column column = targetColumns.get(colIdx);
+                            // Ensure rows.get(rowIdx) has enough columns to match targetColumns
+                            if (colIdx < rows.get(rowIdx).size()) {
+                                Expr expr = rows.get(rowIdx).get(colIdx);
+                                if (!column.isAllowNull() && expr instanceof NullLiteral) {
+                                    throw new AnalysisException("Column `" + column.getName()
+                                            + "` is not nullable, but the inserted value is nullable.");
+                                }
+                            }
+                        }
+                    }
                     analyzeRow(analyzer, targetColumns, rows, rowIdx, origColIdxsForExtendCols, realTargetColumnNames,
                             skipCheck);
                 }
@@ -698,6 +738,19 @@ public class NativeInsertStmt extends InsertStmt {
                         skipCheck);
                 // rows may be changed in analyzeRow(), so rebuild the result exprs
                 selectStmt.getResultExprs().clear();
+
+                // For JdbcTable, need to check whether there is a NULL value inserted into the NOT NULL column
+                if (targetTable instanceof JdbcTable) {
+                    for (int colIdx = 0; colIdx < targetColumns.size(); ++colIdx) {
+                        Column column = targetColumns.get(colIdx);
+                        Expr expr = rows.get(0).get(colIdx);
+                        if (!column.isAllowNull() && expr instanceof NullLiteral) {
+                            throw new AnalysisException("Column `" + column.getName()
+                                    + "` is not nullable, but the inserted value is nullable.");
+                        }
+                    }
+                }
+
                 for (Expr expr : rows.get(0)) {
                     selectStmt.getResultExprs().add(expr);
                 }
@@ -768,13 +821,19 @@ public class NativeInsertStmt extends InsertStmt {
 
         if (LOG.isDebugEnabled()) {
             for (Expr expr : queryStmt.getResultExprs()) {
-                LOG.debug("final result expr: {}, {}", expr, System.identityHashCode(expr));
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("final result expr: {}, {}", expr, System.identityHashCode(expr));
+                }
             }
             for (Expr expr : queryStmt.getBaseTblResultExprs()) {
-                LOG.debug("final base table result expr: {}, {}", expr, System.identityHashCode(expr));
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("final base table result expr: {}, {}", expr, System.identityHashCode(expr));
+                }
             }
             for (String colLabel : queryStmt.getColLabels()) {
-                LOG.debug("final col label: {}", colLabel);
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("final col label: {}", colLabel);
+                }
             }
         }
     }
@@ -858,11 +917,16 @@ public class NativeInsertStmt extends InsertStmt {
             Column col = targetColumns.get(i);
 
             if (expr instanceof DefaultValueExpr) {
-                if (targetColumns.get(i).getDefaultValue() == null) {
+                if (targetColumns.get(i).getDefaultValue() == null && !targetColumns.get(i).isAllowNull()
+                        && !targetColumns.get(i).isAutoInc()) {
                     throw new AnalysisException("Column has no default value, column="
                             + targetColumns.get(i).getName());
                 }
-                expr = new StringLiteral(targetColumns.get(i).getDefaultValue());
+                if (targetColumns.get(i).getDefaultValue() == null) {
+                    expr = new NullLiteral();
+                } else {
+                    expr = new StringLiteral(targetColumns.get(i).getDefaultValue());
+                }
             }
             if (expr instanceof Subquery) {
                 throw new AnalysisException("Insert values can not be query");
@@ -929,10 +993,11 @@ public class NativeInsertStmt extends InsertStmt {
                         && col.getName().equals(Column.SEQUENCE_COL)
                         && ((OlapTable) targetTable).getSequenceMapCol() != null) {
                     if (resultExprByName.stream().map(Pair::key)
-                            .anyMatch(key -> key.equals(((OlapTable) targetTable).getSequenceMapCol()))) {
+                            .anyMatch(key -> key.equalsIgnoreCase(((OlapTable) targetTable).getSequenceMapCol()))) {
                         resultExprByName.add(Pair.of(Column.SEQUENCE_COL,
                                 resultExprByName.stream()
-                                        .filter(p -> p.key().equals(((OlapTable) targetTable).getSequenceMapCol()))
+                                        .filter(p -> p.key()
+                                                .equalsIgnoreCase(((OlapTable) targetTable).getSequenceMapCol()))
                                         .map(Pair::value).findFirst().orElse(null)));
                     }
                     continue;
@@ -975,13 +1040,16 @@ public class NativeInsertStmt extends InsertStmt {
         }
         if (targetTable instanceof OlapTable) {
             OlapTableSink sink;
+            final boolean enableSingleReplicaLoad =
+                    analyzer.getContext().getSessionVariable().isEnableMemtableOnSinkNode()
+                    ? false : analyzer.getContext().getSessionVariable().isEnableSingleReplicaInsert();
             if (isGroupCommitStreamLoadSql) {
                 sink = new GroupCommitBlockSink((OlapTable) targetTable, olapTuple,
-                        targetPartitionIds, analyzer.getContext().getSessionVariable().isEnableSingleReplicaInsert(),
+                        targetPartitionIds, enableSingleReplicaLoad,
                         ConnectContext.get().getSessionVariable().getGroupCommit(), 0);
             } else {
                 sink = new OlapTableSink((OlapTable) targetTable, olapTuple, targetPartitionIds,
-                        analyzer.getContext().getSessionVariable().isEnableSingleReplicaInsert());
+                        enableSingleReplicaLoad);
             }
             dataSink = sink;
             sink.setPartialUpdateInputColumns(isPartialUpdate, partialUpdateCols);
@@ -1103,14 +1171,14 @@ public class NativeInsertStmt extends InsertStmt {
         targetColumns.clear();
     }
 
-    protected void resetPrepare() {
+    public void resetPrepare() {
         label = null;
         isTransactionBegin = false;
     }
 
     @Override
     public RedirectStatus getRedirectStatus() {
-        if (isExplain() || isGroupCommit()) {
+        if (isExplain() || isGroupCommit() || (ConnectContext.get() != null && ConnectContext.get().isTxnModel())) {
             return RedirectStatus.NO_FORWARD;
         } else {
             return RedirectStatus.FORWARD_WITH_SYNC;
@@ -1139,28 +1207,55 @@ public class NativeInsertStmt extends InsertStmt {
             LOG.warn("analyze group commit failed", e);
             return;
         }
-        boolean partialUpdate = ConnectContext.get().getSessionVariable().isEnableUniqueKeyPartialUpdate();
-        if (!partialUpdate && ConnectContext.get().getSessionVariable().isEnableInsertGroupCommit()
-                && ConnectContext.get().getSessionVariable().getSqlMode() != SqlModeHelper.MODE_NO_BACKSLASH_ESCAPES
-                && targetTable instanceof OlapTable
-                && ((OlapTable) targetTable).getTableProperty().getUseSchemaLightChange()
-                && !targetTable.getQualifiedDbName().equalsIgnoreCase(FeConstants.INTERNAL_DB_NAME)
-                && !ConnectContext.get().isTxnModel()
-                && getQueryStmt() instanceof SelectStmt
-                && ((SelectStmt) getQueryStmt()).getTableRefs().isEmpty() && targetPartitionNames == null
-                && (label == null || Strings.isNullOrEmpty(label.getLabelName()))
-                && (analyzer == null || analyzer != null && !analyzer.isReAnalyze())) {
+        ConnectContext ctx = ConnectContext.get();
+        List<Pair<BooleanSupplier, Supplier<String>>> conditions = new ArrayList<>();
+        conditions.add(Pair.of(() -> ctx.getSessionVariable().isEnableInsertGroupCommit(),
+                () -> "group_commit session variable: " + ctx.getSessionVariable().groupCommit));
+        conditions.add(Pair.of(() -> !isExplain(), () -> "isExplain"));
+        conditions.add(Pair.of(() -> !ctx.getSessionVariable().isEnableUniqueKeyPartialUpdate(),
+                () -> "enableUniqueKeyPartialUpdate"));
+        conditions.add(Pair.of(() -> !ctx.isTxnModel(), () -> "isTxnModel"));
+        conditions.add(Pair.of(() -> targetTable instanceof OlapTable,
+                () -> "not olapTable, class: " + targetTable.getClass().getName()));
+        conditions.add(Pair.of(() -> ((OlapTable) targetTable).getTableProperty().getUseSchemaLightChange(),
+                () -> "notUseSchemaLightChange"));
+        conditions.add(Pair.of(() -> !targetTable.getQualifiedDbName().equalsIgnoreCase(FeConstants.INTERNAL_DB_NAME),
+                () -> "db is internal"));
+        conditions.add(
+                Pair.of(() -> targetPartitionNames == null, () -> "targetPartitionNames: " + targetPartitionNames));
+        conditions.add(Pair.of(() -> ctx.getSessionVariable().getSqlMode() != SqlModeHelper.MODE_NO_BACKSLASH_ESCAPES,
+                () -> "sqlMode: " + ctx.getSessionVariable().getSqlMode()));
+        conditions.add(Pair.of(() -> queryStmt instanceof SelectStmt,
+                () -> "queryStmt is not SelectStmt, class: " + queryStmt.getClass().getName()));
+        conditions.add(Pair.of(() -> ((SelectStmt) queryStmt).getTableRefs().isEmpty(),
+                () -> "tableRefs is not empty: " + ((SelectStmt) queryStmt).getTableRefs()));
+        conditions.add(
+                Pair.of(() -> (label == null || Strings.isNullOrEmpty(label.getLabelName())), () -> "label: " + label));
+        conditions.add(
+                Pair.of(() -> (analyzer == null || analyzer != null && !analyzer.isReAnalyze()), () -> "analyzer"));
+        boolean match = conditions.stream().allMatch(p -> p.first.getAsBoolean());
+        if (match) {
             SelectStmt selectStmt = (SelectStmt) queryStmt;
             if (selectStmt.getValueList() != null) {
                 for (List<Expr> row : selectStmt.getValueList().getRows()) {
                     for (Expr expr : row) {
                         if (!(expr instanceof LiteralExpr)) {
+                            if (LOG.isDebugEnabled()) {
+                                LOG.debug("group commit is off for query_id: {}, table: {}, "
+                                                + "because not literal expr: {}, row: {}",
+                                        DebugUtil.printId(ctx.queryId()), targetTable.getName(), expr, row);
+                            }
                             return;
                         }
                     }
                 }
                 // Does not support: insert into tbl values();
                 if (selectStmt.getValueList().getFirstRow().isEmpty() && CollectionUtils.isEmpty(targetColumnNames)) {
+                    if (LOG.isDebugEnabled()) {
+                        LOG.debug("group commit is off for query_id: {}, table: {}, because first row: {}, "
+                                        + "target columns: {}", DebugUtil.printId(ctx.queryId()), targetTable.getName(),
+                                selectStmt.getValueList().getFirstRow(), targetColumnNames);
+                    }
                     return;
                 }
             } else {
@@ -1170,6 +1265,12 @@ public class NativeInsertStmt extends InsertStmt {
                     if (items != null) {
                         for (SelectListItem item : items) {
                             if (item.getExpr() != null && !(item.getExpr() instanceof LiteralExpr)) {
+                                if (LOG.isDebugEnabled()) {
+                                    LOG.debug("group commit is off for query_id: {}, table: {}, "
+                                                    + "because not literal expr: {}, row: {}",
+                                            DebugUtil.printId(ctx.queryId()), targetTable.getName(), item.getExpr(),
+                                            item);
+                                }
                                 return;
                             }
                         }
@@ -1177,6 +1278,16 @@ public class NativeInsertStmt extends InsertStmt {
                 }
             }
             isGroupCommit = true;
+        } else {
+            if (LOG.isDebugEnabled()) {
+                for (Pair<BooleanSupplier, Supplier<String>> pair : conditions) {
+                    if (pair.first.getAsBoolean() == false) {
+                        LOG.debug("group commit is off for query_id: {}, table: {}, because: {}",
+                                DebugUtil.printId(ctx.queryId()), targetTable.getName(), pair.second.get());
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -1192,8 +1303,11 @@ public class NativeInsertStmt extends InsertStmt {
         OlapTable olapTable = (OlapTable) getTargetTable();
         olapTable.readLock();
         try {
-            if (groupCommitPlanner != null && olapTable.getBaseSchemaVersion() == baseSchemaVersion) {
-                LOG.debug("reuse group commit plan, table={}", olapTable);
+            if (groupCommitPlanner != null
+                    && olapTable.getBaseSchemaVersion() == groupCommitPlanner.baseSchemaVersion) {
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("reuse group commit plan, table={}", olapTable);
+                }
                 reuseGroupCommitPlan = true;
                 return groupCommitPlanner;
             }
@@ -1204,11 +1318,10 @@ public class NativeInsertStmt extends InsertStmt {
                 this.analyzer = analyzerTmp;
             }
             analyzeSubquery(analyzer, true);
-            groupCommitPlanner = new GroupCommitPlanner((Database) db, olapTable, targetColumnNames, queryId,
-                    ConnectContext.get().getSessionVariable().getGroupCommit());
+            groupCommitPlanner = EnvFactory.getInstance().createGroupCommitPlanner((Database) db, olapTable,
+                    targetColumnNames, queryId, ConnectContext.get().getSessionVariable().getGroupCommit());
             // save plan message to be reused for prepare stmt
             loadId = queryId;
-            baseSchemaVersion = olapTable.getBaseSchemaVersion();
             return groupCommitPlanner;
         } finally {
             olapTable.readUnlock();
@@ -1220,7 +1333,7 @@ public class NativeInsertStmt extends InsertStmt {
     }
 
     public int getBaseSchemaVersion() {
-        return baseSchemaVersion;
+        return groupCommitPlanner.baseSchemaVersion;
     }
 
     public void setIsFromDeleteOrUpdateStmt(boolean isFromDeleteOrUpdateStmt) {
@@ -1232,16 +1345,29 @@ public class NativeInsertStmt extends InsertStmt {
             return;
         }
         OlapTable olapTable = (OlapTable) targetTable;
-        if (olapTable.getKeysType() != KeysType.UNIQUE_KEYS) {
+        if (olapTable.getKeysType() != KeysType.UNIQUE_KEYS || olapTable.isUniqKeyMergeOnWriteWithClusterKeys()) {
             return;
         }
+        // when enable_unique_key_partial_update = true,
+        // only unique table with MOW insert with target columns can consider be a partial update,
+        // and unique table without MOW, insert will be like a normal insert.
+        // when enable_unique_key_partial_update = false,
+        // unique table with MOW, insert will be a normal insert, and column that not set will insert default value.
         if (!olapTable.getEnableUniqueKeyMergeOnWrite()) {
-            throw new UserException("Partial update is only allowed on unique table with merge-on-write enabled.");
+            return;
         }
         if (hasEmptyTargetColumns) {
-            throw new AnalysisException("You must explicitly specify the columns to be updated when "
-                    + "updating partial columns using the INSERT statement.");
+            return;
         }
+
+        boolean hasSyncMaterializedView = olapTable.getFullSchema().stream()
+                .anyMatch(col -> col.isMaterializedViewColumn());
+        if (hasSyncMaterializedView) {
+            throw new UserException("Can't do partial update on merge-on-write Unique table"
+                    + " with sync materialized view.");
+        }
+
+        boolean hasMissingColExceptAutoIncKey = false;
         for (Column col : olapTable.getFullSchema()) {
             boolean exists = false;
             for (Column insertCol : targetColumns) {
@@ -1254,9 +1380,17 @@ public class NativeInsertStmt extends InsertStmt {
                     break;
                 }
             }
-            if (col.isKey() && !exists) {
-                throw new UserException("Partial update should include all key columns, missing: " + col.getName());
+            if (!exists) {
+                if (col.isKey() && !col.isAutoInc()) {
+                    throw new UserException("Partial update should include all key columns, missing: " + col.getName());
+                }
+                if (!(col.isKey() && col.isAutoInc()) && col.isVisible()) {
+                    hasMissingColExceptAutoIncKey = true;
+                }
             }
+        }
+        if (!hasMissingColExceptAutoIncKey) {
+            return;
         }
 
         isPartialUpdate = true;
@@ -1282,5 +1416,10 @@ public class NativeInsertStmt extends InsertStmt {
             slotDesc.setColumn(col);
             slotDesc.setIsNullable(col.isAllowNull());
         }
+    }
+
+    public boolean containTargetColumnName(String columnName) {
+        return targetColumnNames != null && targetColumnNames.stream()
+                .anyMatch(col -> col.equalsIgnoreCase(columnName));
     }
 }

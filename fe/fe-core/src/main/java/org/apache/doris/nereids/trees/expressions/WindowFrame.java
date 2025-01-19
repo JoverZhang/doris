@@ -90,16 +90,16 @@ public class WindowFrame extends Expression implements PropagateNullable, LeafEx
     }
 
     @Override
-    public int hashCode() {
+    public int computeHashCode() {
         return Objects.hash(frameUnits, leftBoundary, rightBoundary);
     }
 
     @Override
-    public String toSql() {
+    public String computeToSql() {
         StringBuilder sb = new StringBuilder();
         sb.append(frameUnits + " ");
         if (rightBoundary != null) {
-            sb.append("BETWEEN " + leftBoundary + " AND " + rightBoundary);
+            sb.append("BETWEEN " + leftBoundary.toSql() + " AND " + rightBoundary.toSql());
         } else {
             sb.append(leftBoundary);
         }
@@ -212,6 +212,32 @@ public class WindowFrame extends Expression implements PropagateNullable, LeafEx
             boundOffset.ifPresent(value -> sb.append(value + " "));
             sb.append(frameBoundType);
 
+            return sb.toString();
+        }
+
+        /** toSql*/
+        public String toSql() {
+            StringBuilder sb = new StringBuilder();
+            boundOffset.ifPresent(value -> sb.append(value + " "));
+            switch (frameBoundType) {
+                case UNBOUNDED_PRECEDING:
+                    sb.append("UNBOUNDED PRECEDING");
+                    break;
+                case UNBOUNDED_FOLLOWING:
+                    sb.append("UNBOUNDED FOLLOWING");
+                    break;
+                case CURRENT_ROW:
+                    sb.append("CURRENT ROW");
+                    break;
+                case PRECEDING:
+                    sb.append("PRECEDING");
+                    break;
+                case FOLLOWING:
+                    sb.append("FOLLOWING");
+                    break;
+                default:
+                    break;
+            }
             return sb.toString();
         }
 

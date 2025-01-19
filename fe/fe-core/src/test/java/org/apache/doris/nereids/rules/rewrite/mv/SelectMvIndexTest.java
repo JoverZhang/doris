@@ -77,6 +77,7 @@ class SelectMvIndexTest extends BaseMaterializedIndexSelectTest implements MemoP
         createDatabase(HR_DB_NAME);
         useDatabase(HR_DB_NAME);
         connectContext.getSessionVariable().enableNereidsTimeout = false;
+        connectContext.getSessionVariable().setEnableSyncMvCostBasedRewrite(false);
     }
 
     @BeforeEach
@@ -780,7 +781,7 @@ class SelectMvIndexTest extends BaseMaterializedIndexSelectTest implements MemoP
         String uniqueTable = "CREATE TABLE " + TEST_TABLE_NAME + " (k1 int, k2 int, v1 int) UNIQUE KEY (k1, k2) "
                 + "DISTRIBUTED BY HASH(k1) BUCKETS 3 PROPERTIES ('replication_num' = '1','enable_unique_key_merge_on_write' = 'false');";
         createTable(uniqueTable);
-        String createK1MV = "create materialized view only_k1 as select k2 from " + TEST_TABLE_NAME;
+        String createK1MV = "create materialized view only_k1 as select k2,k1 from " + TEST_TABLE_NAME;
         createMv(createK1MV);
         String query = "select * from " + TEST_TABLE_NAME + ";";
         singleTableTest(query, TEST_TABLE_NAME, false);
@@ -1224,7 +1225,7 @@ class SelectMvIndexTest extends BaseMaterializedIndexSelectTest implements MemoP
     private void assertOneAggFuncType(LogicalAggregate<? extends Plan> agg, Class<?> aggFuncType) {
         Set<AggregateFunction> aggFuncs = agg.getOutputExpressions()
                 .stream()
-                .flatMap(e -> e.<Set<AggregateFunction>>collect(AggregateFunction.class::isInstance)
+                .flatMap(e -> e.<AggregateFunction>collect(AggregateFunction.class::isInstance)
                         .stream())
                 .collect(Collectors.toSet());
         Assertions.assertEquals(1, aggFuncs.size());
@@ -1239,7 +1240,7 @@ class SelectMvIndexTest extends BaseMaterializedIndexSelectTest implements MemoP
             Assertions.assertEquals(2, scans.size());
 
             ScanNode scanNode0 = scans.get(0);
-            Assertions.assertTrue(scanNode0 instanceof OlapScanNode);
+            Assertions.assertInstanceOf(OlapScanNode.class, scanNode0);
             OlapScanNode scan0 = (OlapScanNode) scanNode0;
             Assertions.assertTrue(scan0.isPreAggregation());
             Assertions.assertEquals(firstTableIndexName, scan0.getSelectedIndexName());
@@ -1250,5 +1251,94 @@ class SelectMvIndexTest extends BaseMaterializedIndexSelectTest implements MemoP
             Assertions.assertTrue(scan1.isPreAggregation());
             Assertions.assertEquals(secondTableIndexName, scan1.getSelectedIndexName());
         });
+    }
+
+    @Test
+    public void testSubExpressionsInAggregation() throws Exception {
+        createTable("CREATE TABLE db1.`test_pre_agg_tbl` (\n"
+                + "  `k1` int,\n"
+                + "  `k2` int,\n"
+                + "  `k3` char,\n"
+                + "  `k4` int,\n"
+                + "  `k5` bigint,\n"
+                + "  `k6` bigint,\n"
+                + "  `v1` int SUM,\n"
+                + "  `v2` bigint SUM,\n"
+                + "  `v3` bigint MAX,\n"
+                + "  `v4` bigint MIN,\n"
+                + "  `v5` float SUM,\n"
+                + "  `v6` double SUM,\n"
+                + "  `v7` decimal SUM\n"
+                + ") ENGINE=OLAP\n"
+                + "AGGREGATE KEY(`k1`, `k2`, `k3`, `k4`, `k5`, `k6`)\n"
+                + "COMMENT \"OLAP\"\n"
+                + "DISTRIBUTED BY HASH(`k1`) BUCKETS 5\n"
+                + "PROPERTIES (\n"
+                + "\"replication_num\" = \"1\"\n"
+                + ");");
+        addRollup("alter table db1.test_pre_agg_tbl add rollup test_rollup(k1, k2, k3, v1, v2, v3, v4, v5, v6, v7)");
+
+        String sql1 = "select sum(case when k1 > 0 then v1 when k1 = 0 then 0 when k1 < 0 then v2 else 0 end),"
+                + "sum(case when k2 = 1 then 0 else v1 end),"
+                + "sum(case when k2 = 1 then null else v2 end),"
+                + "sum(case when k2 = 1 then null else v5 end),"
+                + "sum(case when k2 = 1 then null else v6 end),"
+                + "sum(case when k2 = 1 then null else v7 end)"
+                + "from db1.test_pre_agg_tbl";
+        // legacy planner
+        Assertions.assertTrue(getSQLPlanOrErrorMsg(sql1).contains(
+                "TABLE: db1.test_pre_agg_tbl(test_rollup), PREAGGREGATION: ON"));
+        // nereids planner
+        PlanChecker.from(connectContext)
+                .analyze(sql1)
+                .rewrite()
+                .matches(logicalOlapScan().when(scan -> {
+                    Assertions.assertEquals("test_rollup", scan.getSelectedMaterializedIndexName().get());
+                    Assertions.assertTrue(scan.getPreAggStatus().isOn());
+                    return true;
+                }));
+
+        String sql2 = "select sum(case when k1 > 0 then v1 else 1 end) from db1.test_pre_agg_tbl";
+        // legacy planner
+        Assertions.assertTrue(getSQLPlanOrErrorMsg(sql2).contains("PREAGGREGATION: OFF"));
+        // nereids planner
+        PlanChecker.from(connectContext)
+                .analyze(sql2)
+                .rewrite()
+                .matches(logicalOlapScan().when(scan -> {
+                    Assertions.assertEquals("test_pre_agg_tbl", scan.getSelectedMaterializedIndexName().get());
+                    Assertions.assertTrue(scan.getPreAggStatus().isOff());
+                    return true;
+                }));
+
+        String sql3 = "select max(case when k1 > 0 then v3 else null end),min(case when k1 > 0 then null else v4 end)"
+                + " from db1.test_pre_agg_tbl";
+        // legacy planner
+        Assertions.assertTrue(getSQLPlanOrErrorMsg(sql3).contains(
+                "TABLE: db1.test_pre_agg_tbl(test_rollup), PREAGGREGATION: ON"));
+        // nereids planner
+        PlanChecker.from(connectContext)
+                .analyze(sql3)
+                .rewrite()
+                .matches(logicalOlapScan().when(scan -> {
+                    Assertions.assertEquals("test_rollup", scan.getSelectedMaterializedIndexName().get());
+                    Assertions.assertTrue(scan.getPreAggStatus().isOn());
+                    return true;
+                }));
+
+        String sql4 = "select count(distinct case when k1 > 0 then k1 else null end), "
+                + "count(distinct if(k2 < 0, null, k2)) from db1.test_pre_agg_tbl";
+        // legacy planner
+        Assertions.assertTrue(getSQLPlanOrErrorMsg(sql4).contains(
+                "TABLE: db1.test_pre_agg_tbl(test_rollup), PREAGGREGATION: ON"));
+        // nereids planner
+        PlanChecker.from(connectContext)
+                .analyze(sql4)
+                .rewrite()
+                .matches(logicalOlapScan().when(scan -> {
+                    Assertions.assertEquals("test_rollup", scan.getSelectedMaterializedIndexName().get());
+                    Assertions.assertTrue(scan.getPreAggStatus().isOn());
+                    return true;
+                }));
     }
 }

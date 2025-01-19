@@ -20,6 +20,8 @@ package org.apache.doris.nereids.trees.expressions.functions.scalar;
 import org.apache.doris.catalog.FunctionSignature;
 import org.apache.doris.common.Config;
 import org.apache.doris.nereids.trees.expressions.Expression;
+import org.apache.doris.nereids.trees.expressions.functions.ComputeSignatureForDateArithmetic;
+import org.apache.doris.nereids.trees.expressions.functions.DateAddSubMonotonic;
 import org.apache.doris.nereids.trees.expressions.functions.ExplicitlyCastableSignature;
 import org.apache.doris.nereids.trees.expressions.functions.PropagateNullableOnDateLikeV2Args;
 import org.apache.doris.nereids.trees.expressions.shape.BinaryExpression;
@@ -39,7 +41,8 @@ import java.util.List;
  * ScalarFunction 'weeks_add'.
  */
 public class WeeksAdd extends ScalarFunction
-        implements BinaryExpression, ExplicitlyCastableSignature, PropagateNullableOnDateLikeV2Args {
+        implements BinaryExpression, ExplicitlyCastableSignature,
+        ComputeSignatureForDateArithmetic, PropagateNullableOnDateLikeV2Args, DateAddSubMonotonic {
 
     // When enable_date_conversion is true, we prefer to V2 signature.
     // This preference follows original planner. refer to ScalarType.getDefaultDateType()
@@ -75,5 +78,10 @@ public class WeeksAdd extends ScalarFunction
     @Override
     public <R, C> R accept(ExpressionVisitor<R, C> visitor, C context) {
         return visitor.visitWeeksAdd(this, context);
+    }
+
+    @Override
+    public Expression withConstantArgs(Expression literal) {
+        return new WeeksAdd(literal, child(1));
     }
 }

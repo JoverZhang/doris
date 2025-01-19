@@ -71,7 +71,7 @@ public class UnboundOneRowRelation extends LogicalRelation implements Unbound, O
 
     @Override
     public List<? extends Expression> getExpressions() {
-        throw new UnsupportedOperationException(this.getClass().getSimpleName() + " don't support getExpression()");
+        return projects;
     }
 
     @Override
@@ -84,6 +84,11 @@ public class UnboundOneRowRelation extends LogicalRelation implements Unbound, O
     public Plan withGroupExprLogicalPropChildren(Optional<GroupExpression> groupExpression,
             Optional<LogicalProperties> logicalProperties, List<Plan> children) {
         return new UnboundOneRowRelation(relationId, projects, groupExpression, logicalProperties);
+    }
+
+    @Override
+    public UnboundOneRowRelation withRelationId(RelationId relationId) {
+        throw new UnboundException("should not call UnboundOneRowRelation's withRelationId method");
     }
 
     @Override

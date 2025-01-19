@@ -73,7 +73,7 @@ public class ThreadPoolManager {
 
     private static String[] poolMetricTypes = {"pool_size", "active_thread_num", "task_in_queue"};
 
-    private static final long KEEP_ALIVE_TIME = 60L;
+    public static final long KEEP_ALIVE_TIME = 60L;
 
     public static void registerAllThreadPoolMetric() {
         for (Map.Entry<String, ThreadPoolExecutor> entry : nameToThreadPoolMap.entrySet()) {
@@ -117,6 +117,13 @@ public class ThreadPoolManager {
         return newDaemonThreadPool(0, maxNumThread, KEEP_ALIVE_TIME,
                 TimeUnit.SECONDS, new SynchronousQueue(),
                 new LogDiscardPolicy(poolName), poolName, needRegisterMetric);
+    }
+
+    public static ThreadPoolExecutor newDaemonCacheThreadPoolUseBlockedPolicy(int maxNumThread,
+                                                              String poolName, boolean needRegisterMetric) {
+        return newDaemonThreadPool(0, maxNumThread, KEEP_ALIVE_TIME,
+            TimeUnit.SECONDS, new SynchronousQueue(),
+            new BlockedPolicy(poolName, 10), poolName, needRegisterMetric);
     }
 
     public static ThreadPoolExecutor newDaemonCacheThreadPoolThrowException(int maxNumThread,

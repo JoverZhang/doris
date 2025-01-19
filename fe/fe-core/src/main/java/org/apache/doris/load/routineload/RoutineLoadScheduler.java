@@ -73,6 +73,7 @@ public class RoutineLoadScheduler extends MasterDaemon {
         if (!routineLoadJobList.isEmpty()) {
             LOG.info("there are {} job need schedule", routineLoadJobList.size());
         }
+
         for (RoutineLoadJob routineLoadJob : routineLoadJobList) {
             RoutineLoadJob.JobState errorJobState = null;
             UserException userException = null;

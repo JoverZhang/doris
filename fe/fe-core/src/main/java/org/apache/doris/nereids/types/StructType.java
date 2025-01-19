@@ -20,6 +20,7 @@ package org.apache.doris.nereids.types;
 import org.apache.doris.catalog.Type;
 import org.apache.doris.nereids.annotation.Developing;
 import org.apache.doris.nereids.exceptions.AnalysisException;
+import org.apache.doris.nereids.types.coercion.ComplexDataType;
 
 import com.google.common.base.Suppliers;
 import com.google.common.collect.ImmutableList;
@@ -36,7 +37,7 @@ import java.util.stream.Collectors;
  * Struct type in Nereids.
  */
 @Developing
-public class StructType extends DataType {
+public class StructType extends DataType implements ComplexDataType {
 
     public static final StructType SYSTEM_DEFAULT = new StructType();
 

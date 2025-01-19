@@ -19,6 +19,7 @@ package org.apache.doris.qe;
 
 import org.apache.doris.analysis.AccessTestUtil;
 import org.apache.doris.analysis.Analyzer;
+import org.apache.doris.analysis.DbName;
 import org.apache.doris.analysis.DescribeStmt;
 import org.apache.doris.analysis.HelpStmt;
 import org.apache.doris.analysis.SetType;
@@ -48,6 +49,7 @@ import org.apache.doris.catalog.SinglePartitionInfo;
 import org.apache.doris.catalog.Table;
 import org.apache.doris.catalog.TableIf.TableType;
 import org.apache.doris.common.AnalysisException;
+import org.apache.doris.common.CaseSensibility;
 import org.apache.doris.common.PatternMatcher;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.jmockit.Deencapsulation;
@@ -55,6 +57,7 @@ import org.apache.doris.datasource.CatalogMgr;
 import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.mysql.MysqlCommand;
 import org.apache.doris.mysql.privilege.AccessControllerManager;
+import org.apache.doris.qe.help.HelpModule;
 import org.apache.doris.system.SystemInfoService;
 import org.apache.doris.thrift.TStorageType;
 
@@ -325,6 +328,16 @@ public class ShowExecutorTest {
     }
 
     @Test
+    public void testShowViews() throws AnalysisException {
+        ShowTableStmt stmt = new ShowTableStmt("testDb", null, false, TableType.VIEW,
+                null, null);
+        ShowExecutor executor = new ShowExecutor(ctx, stmt);
+        ShowResultSet resultSet = executor.execute();
+
+        Assert.assertFalse(resultSet.next());
+    }
+
+    @Test
     public void testShowTableFromCatalog() throws AnalysisException {
         ShowTableStmt stmt = new ShowTableStmt("testDb", "internal", false, null);
         ShowExecutor executor = new ShowExecutor(ctx, stmt);
@@ -448,7 +461,7 @@ public class ShowExecutorTest {
         ctx.setEnv(env);
         ctx.setQualifiedUser("testUser");
 
-        ShowCreateDbStmt stmt = new ShowCreateDbStmt("testDb");
+        ShowCreateDbStmt stmt = new ShowCreateDbStmt(new DbName(InternalCatalog.INTERNAL_CATALOG_NAME, "testDb"));
         ShowExecutor executor = new ShowExecutor(ctx, stmt);
         ShowResultSet resultSet = executor.execute();
 
@@ -463,7 +476,7 @@ public class ShowExecutorTest {
         ctx.setEnv(env);
         ctx.setQualifiedUser("testUser");
 
-        ShowCreateDbStmt stmt = new ShowCreateDbStmt("emptyDb");
+        ShowCreateDbStmt stmt = new ShowCreateDbStmt(new DbName(InternalCatalog.INTERNAL_CATALOG_NAME, "emptyDb"));
         ShowExecutor executor = new ShowExecutor(ctx, stmt);
         executor.execute();
 
@@ -671,5 +684,17 @@ public class ShowExecutorTest {
         Assert.assertEquals("Cardinality", resultSet.getMetaData().getColumn(5).getName());
         Assert.assertEquals("Global", resultSet.getMetaData().getColumn(6).getName());
         Assert.assertEquals("Enable", resultSet.getMetaData().getColumn(7).getName());
+    }
+
+    @Test
+    public void testIsShowTablesCaseSensitive() {
+        ShowSqlBlockRuleStmt stmt = new ShowSqlBlockRuleStmt("test_case_sensitive");
+        ShowExecutor executor = new ShowExecutor(ctx, stmt);
+        GlobalVariable.lowerCaseTableNames = 0;
+        Assert.assertEquals(CaseSensibility.TABLE.getCaseSensibility(), executor.isShowTablesCaseSensitive());
+        GlobalVariable.lowerCaseTableNames = 1;
+        Assert.assertEquals(false, executor.isShowTablesCaseSensitive());
+        GlobalVariable.lowerCaseTableNames = 2;
+        Assert.assertEquals(false, executor.isShowTablesCaseSensitive());
     }
 }

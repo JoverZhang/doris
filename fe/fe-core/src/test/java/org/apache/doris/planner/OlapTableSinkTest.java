@@ -109,7 +109,7 @@ public class OlapTableSinkTest {
                 new DataProperty(DataProperty.DEFAULT_STORAGE_MEDIUM));
         dstTable.getPartitionInfo().setIsMutable(partition.getId(), true);
         OlapTableSink sink = new OlapTableSink(dstTable, tuple, Lists.newArrayList(2L), false);
-        sink.init(new TUniqueId(1, 2), 3, 4, 1000, 1, false, false);
+        sink.init(new TUniqueId(1, 2), 3, 4, 1000, 1, false, false, 5);
         sink.complete(null);
         LOG.info("sink is {}", sink.toThrift());
         LOG.info("{}", sink.getExplainString("", TExplainLevel.NORMAL));
@@ -126,7 +126,6 @@ public class OlapTableSinkTest {
 
         Column partKey = new Column("k2", PrimitiveType.VARCHAR);
         Partition p1 = new Partition(1, "p1", index, distInfo);
-        Partition p2 = new Partition(2, "p2", index, distInfo);
 
         new Expectations() {
             {
@@ -140,15 +139,13 @@ public class OlapTableSinkTest {
                 result = PartitionType.RANGE;
                 partInfo.getPartitionColumns();
                 result = Lists.newArrayList(partKey);
-                dstTable.getPartitions();
-                result = Lists.newArrayList(p1, p2);
                 dstTable.getPartition(p1.getId());
                 result = p1;
             }
         };
 
         OlapTableSink sink = new OlapTableSink(dstTable, tuple, Lists.newArrayList(p1.getId()), false);
-        sink.init(new TUniqueId(1, 2), 3, 4, 1000, 1, false, false);
+        sink.init(new TUniqueId(1, 2), 3, 4, 1000, 1, false, false, 5);
         try {
             sink.complete(null);
         } catch (UserException e) {
@@ -173,7 +170,7 @@ public class OlapTableSinkTest {
         };
 
         OlapTableSink sink = new OlapTableSink(dstTable, tuple, Lists.newArrayList(unknownPartId), false);
-        sink.init(new TUniqueId(1, 2), 3, 4, 1000, 1, false, false);
+        sink.init(new TUniqueId(1, 2), 3, 4, 1000, 1, false, false, 5);
         sink.complete(null);
         LOG.info("sink is {}", sink.toThrift());
         LOG.info("{}", sink.getExplainString("", TExplainLevel.NORMAL));
@@ -190,7 +187,6 @@ public class OlapTableSinkTest {
 
         Column partKey = new Column("k2", PrimitiveType.VARCHAR);
         Partition p1 = new Partition(1, "p1", index, distInfo);
-        Partition p2 = new Partition(2, "p2", index, distInfo);
 
         new Expectations() {
             {
@@ -204,15 +200,13 @@ public class OlapTableSinkTest {
                 result = PartitionType.LIST;
                 partInfo.getPartitionColumns();
                 result = Lists.newArrayList(partKey);
-                dstTable.getPartitions();
-                result = Lists.newArrayList(p1, p2);
                 dstTable.getPartition(p1.getId());
                 result = p1;
             }
         };
 
         OlapTableSink sink = new OlapTableSink(dstTable, tuple, Lists.newArrayList(p1.getId()), false);
-        sink.init(new TUniqueId(1, 2), 3, 4, 1000, 1, false, false);
+        sink.init(new TUniqueId(1, 2), 3, 4, 1000, 1, false, false, 5);
         try {
             sink.complete(null);
         } catch (UserException e) {

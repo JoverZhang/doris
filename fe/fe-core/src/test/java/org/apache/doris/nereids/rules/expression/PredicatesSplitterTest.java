@@ -24,7 +24,7 @@ import org.apache.doris.nereids.rules.exploration.mv.Predicates.SplitPredicate;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.expressions.SlotReference;
-import org.apache.doris.nereids.trees.expressions.literal.BooleanLiteral;
+import org.apache.doris.nereids.util.ExpressionUtils;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
@@ -48,7 +48,7 @@ public class PredicatesSplitterTest extends ExpressionRewriteTestHelper {
                 "c = d or a = 10");
         assetEquals("a = b and c + d = e and a > 7 and 10 > d",
                 "a = b",
-                "10 > d and a > 7",
+                "a > 7 and 10 > d",
                 "c + d = e");
         assetEquals("a = b and c + d = e or a > 7 and 10 > d",
                 "",
@@ -61,29 +61,33 @@ public class PredicatesSplitterTest extends ExpressionRewriteTestHelper {
             String expectedRangeExpr,
             String expectedResidualExpr) {
 
-        Map<String, Slot> mem = Maps.newHashMap();
+        Map<String, Slot> mem = Maps.newLinkedHashMap();
         Expression targetExpr = replaceUnboundSlot(PARSER.parseExpression(expression), mem);
         SplitPredicate splitPredicate = Predicates.splitPredicates(targetExpr);
 
         if (!StringUtils.isEmpty(expectedEqualExpr)) {
             Expression equalExpression = replaceUnboundSlot(PARSER.parseExpression(expectedEqualExpr), mem);
-            Assertions.assertEquals(equalExpression, splitPredicate.getEqualPredicate());
+            Assertions.assertEquals(ExpressionUtils.extractConjunctionToSet(equalExpression),
+                    splitPredicate.getEqualPredicateMap().keySet());
         } else {
-            Assertions.assertEquals(splitPredicate.getEqualPredicate(), BooleanLiteral.TRUE);
+            Assertions.assertTrue(splitPredicate.getEqualPredicateMap().isEmpty());
         }
 
         if (!StringUtils.isEmpty(expectedRangeExpr)) {
             Expression rangeExpression = replaceUnboundSlot(PARSER.parseExpression(expectedRangeExpr), mem);
-            Assertions.assertEquals(rangeExpression, splitPredicate.getRangePredicate());
+            Assertions.assertEquals(ExpressionUtils.extractConjunctionToSet(rangeExpression),
+                    splitPredicate.getRangePredicateMap().keySet());
         } else {
-            Assertions.assertEquals(splitPredicate.getRangePredicate(), BooleanLiteral.TRUE);
+            Assertions.assertTrue(splitPredicate.getRangePredicateMap().isEmpty());
         }
 
         if (!StringUtils.isEmpty(expectedResidualExpr)) {
             Expression residualExpression = replaceUnboundSlot(PARSER.parseExpression(expectedResidualExpr), mem);
-            Assertions.assertEquals(residualExpression, splitPredicate.getResidualPredicate());
+            Assertions.assertEquals(
+                    ExpressionUtils.extractConjunctionToSet(residualExpression),
+                    splitPredicate.getResidualPredicateMap().keySet());
         } else {
-            Assertions.assertEquals(splitPredicate.getResidualPredicate(), BooleanLiteral.TRUE);
+            Assertions.assertTrue(splitPredicate.getResidualPredicateMap().isEmpty());
         }
     }
 
@@ -100,7 +104,7 @@ public class PredicatesSplitterTest extends ExpressionRewriteTestHelper {
         }
         if (expression instanceof UnboundSlot) {
             String name = ((UnboundSlot) expression).getName();
-            mem.putIfAbsent(name, SlotReference.fromColumn(
+            mem.putIfAbsent(name, SlotReference.fromColumn(null,
                     new Column(name, getType(name.charAt(0)).toCatalogDataType()),
                     Lists.newArrayList("table")));
             return mem.get(name);

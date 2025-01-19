@@ -191,6 +191,12 @@ message ColumnMetaPB {
     optional bytes default_value = 14; // ColumnMessage.default_value ?
     optional int32 precision = 15; // ColumnMessage.precision
     optional int32 frac = 16; // ColumnMessag
+
+    repeated ColumnMetaPB sparse_columns = 17; // sparse column within a variant column
+
+    optional bool result_is_nullable = 18; // used on agg_state type
+    optional string function_name = 19; // used on agg_state type
+    optional int32 be_exec_version = 20; // used on agg_state type
 }
 
 message PrimaryKeyIndexMetaPB {

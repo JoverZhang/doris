@@ -18,15 +18,18 @@
 package org.apache.doris.nereids.trees.plans;
 
 import org.apache.doris.nereids.memo.GroupExpression;
+import org.apache.doris.nereids.properties.DataTrait;
 import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.properties.UnboundLogicalProperties;
 import org.apache.doris.nereids.trees.TreeNode;
 import org.apache.doris.nereids.trees.expressions.ExprId;
 import org.apache.doris.nereids.trees.expressions.Expression;
-import org.apache.doris.nereids.trees.expressions.NamedExpression;
 import org.apache.doris.nereids.trees.expressions.Slot;
+import org.apache.doris.nereids.trees.plans.algebra.Join;
+import org.apache.doris.nereids.trees.plans.physical.PhysicalDistribute;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
 import org.apache.doris.nereids.util.MutableState;
+import org.apache.doris.nereids.util.PlanUtils;
 import org.apache.doris.qe.ConnectContext;
 
 import com.google.common.collect.ImmutableList;
@@ -36,8 +39,6 @@ import com.google.common.collect.Sets;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
-import java.util.function.Supplier;
-import java.util.stream.Collectors;
 
 /**
  * Abstract class for all plan node.
@@ -61,14 +62,20 @@ public interface Plan extends TreeNode<Plan> {
         return !(getLogicalProperties() instanceof UnboundLogicalProperties);
     }
 
+    /** hasUnboundExpression */
     default boolean hasUnboundExpression() {
-        return getExpressions().stream().anyMatch(Expression::hasUnbound);
+        for (Expression expression : getExpressions()) {
+            if (expression.hasUnbound()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     default boolean containsSlots(ImmutableSet<Slot> slots) {
         return getExpressions().stream().anyMatch(
-                expression -> !Sets.intersection(slots, expression.getInputSlots()).isEmpty()
-                        || children().stream().anyMatch(plan -> plan.containsSlots(slots)));
+                expression -> !Sets.intersection(slots, expression.getInputSlots()).isEmpty())
+                        || children().stream().anyMatch(plan -> plan.containsSlots(slots));
     }
 
     default LogicalProperties computeLogicalProperties() {
@@ -94,16 +101,48 @@ public interface Plan extends TreeNode<Plan> {
     /**
      * Get output slot set of the plan.
      */
-    default Set<Slot> getOutputSet() {
-        return ImmutableSet.copyOf(getOutput());
-    }
+    Set<Slot> getOutputSet();
 
+    /** getOutputExprIds */
     default List<ExprId> getOutputExprIds() {
-        return getOutput().stream().map(NamedExpression::getExprId).collect(Collectors.toList());
+        List<Slot> output = getOutput();
+        ImmutableList.Builder<ExprId> exprIds = ImmutableList.builderWithExpectedSize(output.size());
+        for (Slot slot : output) {
+            exprIds.add(slot.getExprId());
+        }
+        return exprIds.build();
     }
 
+    /** getOutputExprIdSet */
     default Set<ExprId> getOutputExprIdSet() {
-        return getOutput().stream().map(NamedExpression::getExprId).collect(Collectors.toSet());
+        List<Slot> output = getOutput();
+        ImmutableSet.Builder<ExprId> exprIds = ImmutableSet.builderWithExpectedSize(output.size());
+        for (Slot slot : output) {
+            exprIds.add(slot.getExprId());
+        }
+        return exprIds.build();
+    }
+
+    /** getChildrenOutputExprIdSet */
+    default Set<ExprId> getChildrenOutputExprIdSet() {
+        switch (arity()) {
+            case 0: return ImmutableSet.of();
+            case 1: return child(0).getOutputExprIdSet();
+            default: {
+                int exprIdSize = 0;
+                for (Plan child : children()) {
+                    exprIdSize += child.getOutput().size();
+                }
+
+                ImmutableSet.Builder<ExprId> exprIds = ImmutableSet.builderWithExpectedSize(exprIdSize);
+                for (Plan child : children()) {
+                    for (Slot slot : child.getOutput()) {
+                        exprIds.add(slot.getExprId());
+                    }
+                }
+                return exprIds.build();
+            }
+        }
     }
 
     /**
@@ -113,9 +152,7 @@ public interface Plan extends TreeNode<Plan> {
      * Note that the input slots of subquery's inner plan are not included.
      */
     default Set<Slot> getInputSlots() {
-        return getExpressions().stream()
-                .flatMap(expr -> expr.getInputSlots().stream())
-                .collect(ImmutableSet.toImmutableSet());
+        return PlanUtils.fastGetInputSlots(this.getExpressions());
     }
 
     default List<Slot> computeOutput() {
@@ -141,21 +178,6 @@ public interface Plan extends TreeNode<Plan> {
     Plan withGroupExprLogicalPropChildren(Optional<GroupExpression> groupExpression,
             Optional<LogicalProperties> logicalProperties, List<Plan> children);
 
-    <T> Optional<T> getMutableState(String key);
-
-    /** getOrInitMutableState */
-    default <T> T getOrInitMutableState(String key, Supplier<T> initState) {
-        Optional<T> mutableState = getMutableState(key);
-        if (!mutableState.isPresent()) {
-            T state = initState.get();
-            setMutableState(key, state);
-            return state;
-        }
-        return mutableState.get();
-    }
-
-    void setMutableState(String key, Object value);
-
     /**
      * a simple version of explain, used to verify plan shape
      * @param prefix "  "
@@ -172,6 +194,11 @@ public interface Plan extends TreeNode<Plan> {
         String childPrefix = prefix + prefixTail;
         children().forEach(
                 child -> {
+                    if (this instanceof Join) {
+                        if (child instanceof PhysicalDistribute) {
+                            child = child.child(0);
+                        }
+                    }
                     builder.append(child.shape(childPrefix));
                 }
         );
@@ -206,4 +233,52 @@ public interface Plan extends TreeNode<Plan> {
     default String getGroupIdWithPrefix() {
         return "@" + getGroupIdAsString();
     }
+
+    /**
+     * Compute DataTrait for different plan
+     * Note: Unless you really know what you're doing, please use the following interface.
+     *   - BlockFDPropagation: clean the fd
+     *   - PropagateFD: propagate the fd
+     */
+    default DataTrait computeDataTrait() {
+        DataTrait.Builder fdBuilder = new DataTrait.Builder();
+        computeUniform(fdBuilder);
+        computeUnique(fdBuilder);
+        computeEqualSet(fdBuilder);
+        computeFd(fdBuilder);
+
+        for (Slot slot : getOutput()) {
+            Set<Slot> o = ImmutableSet.of(slot);
+            // all slots dependent unique slot
+            for (Set<Slot> uniqueSlot : fdBuilder.getAllUniqueAndNotNull()) {
+                fdBuilder.addDeps(uniqueSlot, o);
+            }
+            // uniform slot dependents all slots
+            for (Set<Slot> uniformSlot : fdBuilder.getAllUniformAndNotNull()) {
+                fdBuilder.addDeps(o, uniformSlot);
+            }
+        }
+        for (Set<Slot> equalSet : fdBuilder.calEqualSetList()) {
+            Set<Slot> validEqualSet = Sets.intersection(getOutputSet(), equalSet);
+            fdBuilder.addDepsByEqualSet(validEqualSet);
+            fdBuilder.addUniformByEqualSet(validEqualSet);
+            fdBuilder.addUniqueByEqualSet(validEqualSet);
+        }
+        Set<Slot> output = this.getOutputSet();
+        for (Plan child : children()) {
+            if (!output.containsAll(child.getOutputSet())) {
+                fdBuilder.pruneSlots(output);
+                break;
+            }
+        }
+        return fdBuilder.build();
+    }
+
+    void computeUnique(DataTrait.Builder builder);
+
+    void computeUniform(DataTrait.Builder builder);
+
+    void computeEqualSet(DataTrait.Builder builder);
+
+    void computeFd(DataTrait.Builder builder);
 }

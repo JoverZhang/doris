@@ -31,8 +31,6 @@ public:
 
     size_t get_number_of_arguments() const override { return 1; }
 
-    bool get_is_injective(const Block&) override { return false; }
-
     DataTypePtr get_return_type_impl(const DataTypes& arguments) const override {
         DCHECK(is_string_or_fixed_string(arguments[0]) || is_array(arguments[0]))
                 << fmt::format("Illegal type {} used for argument of function {}",
@@ -42,7 +40,7 @@ public:
     }
 
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                        size_t result, size_t input_rows_count) const override {
+                        uint32_t result, size_t input_rows_count) const override {
         ColumnPtr& src_column = block.get_by_position(arguments[0]).column;
         if (const ColumnString* col_string = check_and_get_column<ColumnString>(src_column.get())) {
             auto col_res = ColumnString::create();

@@ -17,11 +17,14 @@
 
 #pragma once
 
+#include <jni.h>
+
 #include <memory>
 #include <set>
 #include <string>
 #include <vector>
 
+#include "util/jvm_metrics.h"
 #include "util/metrics.h"
 #include "util/system_metrics.h"
 
@@ -81,11 +84,16 @@ public:
     IntCounter* base_compaction_request_failed = nullptr;
     IntCounter* cumulative_compaction_request_total = nullptr;
     IntCounter* cumulative_compaction_request_failed = nullptr;
+    IntCounter* single_compaction_request_total = nullptr;
+    IntCounter* single_compaction_request_failed = nullptr;
+    IntCounter* single_compaction_request_cancelled = nullptr;
 
     IntCounter* base_compaction_deltas_total = nullptr;
     IntCounter* base_compaction_bytes_total = nullptr;
     IntCounter* cumulative_compaction_deltas_total = nullptr;
     IntCounter* cumulative_compaction_bytes_total = nullptr;
+    IntCounter* full_compaction_deltas_total = nullptr;
+    IntCounter* full_compaction_bytes_total = nullptr;
 
     IntCounter* publish_task_request_total = nullptr;
     IntCounter* publish_task_failed_total = nullptr;
@@ -170,6 +178,7 @@ public:
     UIntGauge* stream_load_pipe_count = nullptr;
     UIntGauge* new_stream_load_pipe_count = nullptr;
     UIntGauge* brpc_endpoint_stub_count = nullptr;
+    UIntGauge* brpc_stream_endpoint_stub_count = nullptr;
     UIntGauge* brpc_function_endpoint_stub_count = nullptr;
     UIntGauge* tablet_writer_count = nullptr;
 
@@ -188,14 +197,6 @@ public:
     UIntGauge* query_cache_sql_total_count = nullptr;
     UIntGauge* query_cache_partition_total_count = nullptr;
 
-    IntGauge* lru_cache_memory_bytes = nullptr;
-
-    UIntGauge* scanner_thread_pool_queue_size = nullptr;
-    UIntGauge* add_batch_task_queue_size = nullptr;
-    UIntGauge* send_batch_thread_pool_thread_num = nullptr;
-    UIntGauge* send_batch_thread_pool_queue_size = nullptr;
-    UIntGauge* fragment_thread_pool_queue_size = nullptr;
-
     // Upload metrics
     UIntGauge* upload_total_byte = nullptr;
     IntCounter* upload_rowset_count = nullptr;
@@ -211,17 +212,19 @@ public:
     UIntGauge* heavy_work_max_threads = nullptr;
     UIntGauge* light_work_max_threads = nullptr;
 
-    UIntGauge* flush_thread_pool_queue_size = nullptr;
-    UIntGauge* flush_thread_pool_thread_num = nullptr;
+    UIntGauge* arrow_flight_work_pool_queue_size = nullptr;
+    UIntGauge* arrow_flight_work_active_threads = nullptr;
+    UIntGauge* arrow_flight_work_pool_max_queue_size = nullptr;
+    UIntGauge* arrow_flight_work_max_threads = nullptr;
 
-    UIntGauge* local_scan_thread_pool_queue_size = nullptr;
-    UIntGauge* local_scan_thread_pool_thread_num = nullptr;
-    UIntGauge* remote_scan_thread_pool_queue_size = nullptr;
-    UIntGauge* remote_scan_thread_pool_thread_num = nullptr;
-    UIntGauge* limited_scan_thread_pool_queue_size = nullptr;
-    UIntGauge* limited_scan_thread_pool_thread_num = nullptr;
-    UIntGauge* group_local_scan_thread_pool_queue_size = nullptr;
-    UIntGauge* group_local_scan_thread_pool_thread_num = nullptr;
+    IntCounter* num_io_bytes_read_total = nullptr;
+    IntCounter* num_io_bytes_read_from_cache = nullptr;
+    IntCounter* num_io_bytes_read_from_remote = nullptr;
+
+    IntCounter* query_ctx_cnt = nullptr;
+    IntCounter* scanner_ctx_cnt = nullptr;
+    IntCounter* scanner_cnt = nullptr;
+    IntCounter* scanner_task_cnt = nullptr;
 
     static DorisMetrics* instance() {
         static DorisMetrics instance;
@@ -237,6 +240,8 @@ public:
     MetricRegistry* metric_registry() { return &_metric_registry; }
     SystemMetrics* system_metrics() { return _system_metrics.get(); }
     MetricEntity* server_entity() { return _server_metric_entity.get(); }
+    JvmMetrics* jvm_metrics() { return _jvm_metrics.get(); }
+    void init_jvm_metrics(JNIEnv* env);
 
 private:
     // Don't allow constructor
@@ -253,6 +258,7 @@ private:
     MetricRegistry _metric_registry;
 
     std::unique_ptr<SystemMetrics> _system_metrics;
+    std::unique_ptr<JvmMetrics> _jvm_metrics;
 
     std::shared_ptr<MetricEntity> _server_metric_entity;
 };

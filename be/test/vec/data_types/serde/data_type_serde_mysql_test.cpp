@@ -87,8 +87,7 @@ void serialize_and_deserialize_mysql_test() {
     // make desc and generate block
     vectorized::VExprContextSPtrs _output_vexpr_ctxs;
     _output_vexpr_ctxs.resize(cols.size());
-    doris::RuntimeState runtime_stat(doris::TUniqueId(), doris::TQueryOptions(),
-                                     doris::TQueryGlobals(), nullptr);
+    doris::RuntimeState runtime_stat;
     ObjectPool object_pool;
     int col_idx = 0;
     for (auto t : cols) {
@@ -158,7 +157,7 @@ void serialize_and_deserialize_mysql_test() {
                                       decimal_column.get())
                                      ->get_data();
                 for (int i = 0; i < row_num; ++i) {
-                    __int128_t value = i * pow(10, 9) + i * pow(10, 8);
+                    auto value = __int128_t(i * pow(10, 9) + i * pow(10, 8));
                     data.push_back(value);
                 }
                 vectorized::ColumnWithTypeAndName type_and_name(decimal_column->get_ptr(),
@@ -205,7 +204,7 @@ void serialize_and_deserialize_mysql_test() {
                 auto& date_v2_data = column_vector_date_v2->get_data();
                 for (int i = 0; i < row_num; ++i) {
                     DateV2Value<DateV2ValueType> value;
-                    value.from_date((uint32_t)((2022 << 9) | (6 << 5) | 6));
+                    value.unchecked_set_time(2022, 6, 6, 0, 0, 0, 0);
                     date_v2_data.push_back(*reinterpret_cast<vectorized::UInt32*>(&value));
                 }
                 vectorized::DataTypePtr date_v2_type(
@@ -251,7 +250,7 @@ void serialize_and_deserialize_mysql_test() {
         case TYPE_IPV4:
             tslot.__set_slotType(type_desc.to_thrift());
             {
-                auto column_vector_ipv4 = vectorized::ColumnVector<vectorized::IPv4>::create();
+                auto column_vector_ipv4 = vectorized::ColumnVector<IPv4>::create();
                 auto& ipv4_data = column_vector_ipv4->get_data();
                 for (int i = 0; i < row_num; ++i) {
                     IPv4Value ipv4_value;
@@ -268,7 +267,7 @@ void serialize_and_deserialize_mysql_test() {
         case TYPE_IPV6:
             tslot.__set_slotType(type_desc.to_thrift());
             {
-                auto column_vector_ipv6 = vectorized::ColumnVector<vectorized::IPv6>::create();
+                auto column_vector_ipv6 = vectorized::ColumnVector<IPv6>::create();
                 auto& ipv6_data = column_vector_ipv6->get_data();
                 for (int i = 0; i < row_num; ++i) {
                     IPv6Value ipv6_value;
@@ -304,7 +303,6 @@ void serialize_and_deserialize_mysql_test() {
         doris::DescriptorTbl* desc_tbl = builder.build();
         auto tuple_desc = const_cast<doris::TupleDescriptor*>(desc_tbl->get_tuple_descriptor(0));
         doris::RowDescriptor row_desc(tuple_desc, false);
-        runtime_stat.init_mem_trackers();
         runtime_stat.set_desc_tbl(desc_tbl);
         st = ctx->prepare(&runtime_stat, row_desc);
         std::cout << st.to_string() << std::endl;
@@ -319,7 +317,7 @@ void serialize_and_deserialize_mysql_test() {
     // mysql_writer init
     vectorized::VMysqlResultWriter<false> mysql_writer(nullptr, _output_vexpr_ctxs, nullptr);
 
-    Status st = mysql_writer.write(block);
+    Status st = mysql_writer.write(&runtime_stat, block);
     EXPECT_TRUE(st.ok());
 }
 

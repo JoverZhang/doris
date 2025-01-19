@@ -16,6 +16,9 @@
 // under the License.
 
 suite('test_set_replica_status', 'nonConcurrent') {
+    if (isCloudMode()) {
+        return
+    }
     setFeConfigTemporary([disable_tablet_scheduler:true]) {
         def tableName = 'test_set_replica_status_table'
         sql "DROP TABLE IF EXISTS ${tableName}"
@@ -47,6 +50,7 @@ suite('test_set_replica_status', 'nonConcurrent') {
             break
         }
         sql """ADMIN SET REPLICA STATUS PROPERTIES("tablet_id" = "${tabletId}", "backend_id" = "${backendId}", "status" = "bad");"""
+        checkNereidsExecute("""SHOW REPLICA STATUS FROM ${tableName}""")
         result = sql_return_maparray """SHOW REPLICA STATUS FROM ${tableName}"""
         for (def res : result) {
             if (res.TabletId == tabletId && res.BackendId == backendId) {
@@ -55,6 +59,7 @@ suite('test_set_replica_status', 'nonConcurrent') {
             }
         }
         sql """ADMIN SET REPLICA STATUS PROPERTIES("tablet_id" = "${tabletId}", "backend_id" = "${backendId}", "status" = "ok");"""
+        checkNereidsExecute("""SHOW REPLICA STATUS FROM ${tableName}""")
         result = sql_return_maparray """SHOW REPLICA STATUS FROM ${tableName}"""
         for (def res : result) {
             if (res.TabletId == tabletId && res.BackendId == backendId) {
@@ -63,6 +68,7 @@ suite('test_set_replica_status', 'nonConcurrent') {
             }
         }
         sql """ADMIN SET REPLICA VERSION PROPERTIES("tablet_id" = "${tabletId}", "backend_id" = "${backendId}", "last_failed_version" = "10");"""
+        checkNereidsExecute("""SHOW REPLICA STATUS FROM ${tableName}""")
         result = sql_return_maparray """SHOW REPLICA STATUS FROM ${tableName}"""
         for (def res : result) {
             if (res.TabletId == tabletId && res.BackendId == backendId) {

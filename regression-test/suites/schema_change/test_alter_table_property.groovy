@@ -37,21 +37,38 @@ suite("test_alter_table_property") {
     logger.info("${showResult1}")
     assertTrue(showResult1.toString().containsIgnoreCase('"enable_single_replica_compaction" = "false"'))
 
-    sql """
-        alter table ${tableName} set ("enable_single_replica_compaction" = "true")
-        """
-    sql """sync"""
+    if (!isCloudMode()) {
+        sql """
+            alter table ${tableName} set ("enable_single_replica_compaction" = "true")
+            """
+        sql """sync"""
 
-    def showResult2 = sql """show create table ${tableName}"""
-    logger.info("${showResult2}")
-    assertTrue(showResult2.toString().containsIgnoreCase('"enable_single_replica_compaction" = "true"'))
+        def showResult2 = sql """show create table ${tableName}"""
+        logger.info("${showResult2}")
+        assertTrue(showResult2.toString().containsIgnoreCase('"enable_single_replica_compaction" = "true"'))
+
+        test {
+            sql """
+                alter table ${tableName} set ("file_cache_ttl_seconds" = "86400")
+                """
+            // exception "modifying property [file_cache_ttl_seconds] is forbidden"
+            exception "Cann't modify property 'file_cache_ttl_seconds'"
+        }
+    } else {
+        test {
+            sql """
+                alter table ${tableName} set ("enable_single_replica_compaction" = "true")
+                """
+            exception "modifying property [enable_single_replica_compaction] is forbidden"
+        }
+    }
 
     assertTrue(showResult1.toString().containsIgnoreCase('"disable_auto_compaction" = "false"'))
+
     sql """
         alter table ${tableName} set ("disable_auto_compaction" = "true")
         """
     sql """sync"""
-
     def showResult3 = sql """show create table ${tableName}"""
     logger.info("${showResult3}")
     assertTrue(showResult3.toString().containsIgnoreCase('"disable_auto_compaction" = "true"'))

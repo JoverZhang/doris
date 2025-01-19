@@ -27,6 +27,7 @@ import org.apache.doris.nereids.trees.plans.PlanType;
 import org.apache.doris.nereids.trees.plans.algebra.Sink;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
 import org.apache.doris.nereids.util.Utils;
+import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.statistics.Statistics;
 
 import com.google.common.base.Preconditions;
@@ -81,6 +82,14 @@ public class PhysicalFileSink<CHILD_TYPE extends Plan> extends PhysicalSink<CHIL
 
     public Map<String, String> getProperties() {
         return properties;
+    }
+
+    public PhysicalProperties requestProperties(ConnectContext ctx) {
+        if (!ctx.getSessionVariable().enableParallelOutfile) {
+            return PhysicalProperties.GATHER;
+        }
+        // come here means we turn on parallel output export
+        return PhysicalProperties.ANY;
     }
 
     @Override

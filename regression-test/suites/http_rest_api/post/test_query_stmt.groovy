@@ -21,7 +21,7 @@ import groovy.json.JsonSlurper
 *   @Params url is "/xxx", data is request body
 *   @Return response body
 */
-def http_post(url, data = null) {
+def http_post = { url, data = null ->
     def dst = "http://"+ context.config.feHttpAddress
     def conn = new URL(dst + url).openConnection()
     conn.setRequestMethod("POST")
@@ -102,4 +102,9 @@ suite("test_query_stmt") {
     assertEquals(obj.code, SUCCESS_CODE)
     // we can only check the number is correctly
     assertEquals(obj.data.data.size, 3)
+
+    url = "/api/query_schema/default_cluster/" + context.config.defaultDb
+    def stmt5 = " select * from ${tableName}"
+    def resValue = http_post(url, stmt5)
+    assertTrue(resValue.contains("CREATE TABLE"))
 }

@@ -17,7 +17,15 @@
 
 package org.apache.doris.mtmv;
 
+import org.apache.doris.analysis.Expr;
+import org.apache.doris.catalog.Column;
+import org.apache.doris.common.AnalysisException;
+import org.apache.doris.datasource.CatalogMgr;
+import org.apache.doris.datasource.mvcc.MvccUtil;
+
 import com.google.gson.annotations.SerializedName;
+
+import java.util.List;
 
 /**
  * MTMVPartitionInfo
@@ -26,17 +34,20 @@ public class MTMVPartitionInfo {
 
     public enum MTMVPartitionType {
         FOLLOW_BASE_TABLE,
+        EXPR,
         SELF_MANAGE
     }
 
     @SerializedName("pt")
-    MTMVPartitionType partitionType;
+    private MTMVPartitionType partitionType;
     @SerializedName("rt")
-    BaseTableInfo relatedTable;
+    private BaseTableInfo relatedTable;
     @SerializedName("rc")
-    String relatedCol;
+    private String relatedCol;
     @SerializedName("pc")
-    String partitionCol;
+    private String partitionCol;
+    @SerializedName("expr")
+    private Expr expr;
 
     public MTMVPartitionInfo() {
     }
@@ -59,8 +70,12 @@ public class MTMVPartitionInfo {
         this.partitionType = partitionType;
     }
 
-    public BaseTableInfo getRelatedTable() {
+    public BaseTableInfo getRelatedTableInfo() {
         return relatedTable;
+    }
+
+    public MTMVRelatedTableIf getRelatedTable() throws AnalysisException {
+        return (MTMVRelatedTableIf) MTMVUtil.getTable(relatedTable);
     }
 
     public void setRelatedTable(BaseTableInfo relatedTable) {
@@ -83,8 +98,39 @@ public class MTMVPartitionInfo {
         this.partitionCol = partitionCol;
     }
 
-    @Override
-    public String toString() {
+    public Expr getExpr() {
+        return expr;
+    }
+
+    public void setExpr(Expr expr) {
+        this.expr = expr;
+    }
+
+    /**
+     * Get the position of relatedCol in the relatedTable partition column
+     *
+     * @return
+     * @throws AnalysisException
+     */
+    public int getRelatedColPos() throws AnalysisException {
+        if (partitionType == MTMVPartitionType.SELF_MANAGE) {
+            throw new AnalysisException("partitionType is: " + partitionType);
+        }
+        MTMVRelatedTableIf mtmvRelatedTableIf = getRelatedTable();
+        List<Column> partitionColumns = mtmvRelatedTableIf.getPartitionColumns(
+                MvccUtil.getSnapshotFromContext(mtmvRelatedTableIf));
+        for (int i = 0; i < partitionColumns.size(); i++) {
+            if (partitionColumns.get(i).getName().equalsIgnoreCase(relatedCol)) {
+                return i;
+            }
+        }
+        throw new AnalysisException(
+                String.format("getRelatedColPos error, relatedCol: %s, partitionColumns: %s", relatedCol,
+                        partitionColumns));
+    }
+
+    // toString() is not easy to find where to call the method
+    public String toInfoString() {
         return "MTMVPartitionInfo{"
                 + "partitionType=" + partitionType
                 + ", relatedTable=" + relatedTable
@@ -106,5 +152,12 @@ public class MTMVPartitionInfo {
                     + ", partitionCol='" + partitionCol + '\''
                     + '}';
         }
+    }
+
+    public void compatible(CatalogMgr catalogMgr) {
+        if (relatedTable == null) {
+            return;
+        }
+        relatedTable.compatible(catalogMgr);
     }
 }

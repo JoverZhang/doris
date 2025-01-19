@@ -25,8 +25,10 @@ import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.Partition;
 import org.apache.doris.common.Config;
+import org.apache.doris.common.ConfigBase;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.qe.ShowResultSet;
 import org.apache.doris.tablefunction.BackendsTableValuedFunction;
 import org.apache.doris.thrift.TBackendsMetadataParams;
 import org.apache.doris.thrift.TCreatePartitionRequest;
@@ -37,9 +39,11 @@ import org.apache.doris.thrift.TGetDbsParams;
 import org.apache.doris.thrift.TGetDbsResult;
 import org.apache.doris.thrift.TMetadataTableRequestParams;
 import org.apache.doris.thrift.TMetadataType;
+import org.apache.doris.thrift.TNullableStringLiteral;
 import org.apache.doris.thrift.TSchemaTableName;
+import org.apache.doris.thrift.TShowUserRequest;
+import org.apache.doris.thrift.TShowUserResult;
 import org.apache.doris.thrift.TStatusCode;
-import org.apache.doris.thrift.TStringLiteral;
 import org.apache.doris.utframe.UtFrameUtils;
 
 import mockit.Mocked;
@@ -99,7 +103,7 @@ public class FrontendServiceImplTest {
                 + "    city_code VARCHAR(100)\n"
                 + ")\n"
                 + "DUPLICATE KEY(event_day, site_id, city_code)\n"
-                + "AUTO PARTITION BY range date_trunc( event_day,'day') (\n"
+                + "AUTO PARTITION BY range (date_trunc( event_day,'day')) (\n"
                 + "\n"
                 + ")\n"
                 + "DISTRIBUTED BY HASH(event_day, site_id) BUCKETS 2\n"
@@ -109,10 +113,10 @@ public class FrontendServiceImplTest {
         Database db = Env.getCurrentInternalCatalog().getDbOrAnalysisException("test");
         OlapTable table = (OlapTable) db.getTableOrAnalysisException("partition_range");
 
-        List<List<TStringLiteral>> partitionValues = new ArrayList<>();
-        List<TStringLiteral> values = new ArrayList<>();
+        List<List<TNullableStringLiteral>> partitionValues = new ArrayList<>();
+        List<TNullableStringLiteral> values = new ArrayList<>();
 
-        TStringLiteral start = new TStringLiteral();
+        TNullableStringLiteral start = new TNullableStringLiteral();
         start.setValue("2023-08-07 00:00:00");
         values.add(start);
 
@@ -128,6 +132,51 @@ public class FrontendServiceImplTest {
         Assert.assertEquals(partition.getStatus().getStatusCode(), TStatusCode.OK);
         Partition p20230807 = table.getPartition("p20230807000000");
         Assert.assertNotNull(p20230807);
+    }
+
+    @Test
+    public void testCreatePartitionRangeMedium() throws Exception {
+        ConfigBase.setMutableConfig("disable_storage_medium_check", "true");
+        String createOlapTblStmt = new String("CREATE TABLE test.partition_range2(\n"
+                + "    event_day DATETIME NOT NULL,\n"
+                + "    site_id INT DEFAULT '10',\n"
+                + "    city_code VARCHAR(100)\n"
+                + ")\n"
+                + "DUPLICATE KEY(event_day, site_id, city_code)\n"
+                + "AUTO PARTITION BY range (date_trunc( event_day,'day')) (\n"
+                + "\n"
+                + ")\n"
+                + "DISTRIBUTED BY HASH(event_day, site_id) BUCKETS 2\n"
+                + "PROPERTIES(\"storage_medium\" = \"ssd\",\"replication_num\" = \"1\");");
+
+        createTable(createOlapTblStmt);
+        Database db = Env.getCurrentInternalCatalog().getDbOrAnalysisException("test");
+        OlapTable table = (OlapTable) db.getTableOrAnalysisException("partition_range2");
+
+        List<List<TNullableStringLiteral>> partitionValues = new ArrayList<>();
+        List<TNullableStringLiteral> values = new ArrayList<>();
+
+        TNullableStringLiteral start = new TNullableStringLiteral();
+        start.setValue("2023-08-07 00:00:00");
+        values.add(start);
+
+        partitionValues.add(values);
+
+        FrontendServiceImpl impl = new FrontendServiceImpl(exeEnv);
+        TCreatePartitionRequest request = new TCreatePartitionRequest();
+        request.setDbId(db.getId());
+        request.setTableId(table.getId());
+        request.setPartitionValues(partitionValues);
+        TCreatePartitionResult partition = impl.createPartition(request);
+
+        Assert.assertEquals(partition.getStatus().getStatusCode(), TStatusCode.OK);
+        Partition p20230807 = table.getPartition("p20230807000000");
+        Assert.assertNotNull(p20230807);
+
+        ShowResultSet result = UtFrameUtils.showPartitionsByName(connectContext, "test.partition_range2");
+        String showCreateTableResultSql = result.getResultRows().get(0).get(10);
+        System.out.println(showCreateTableResultSql);
+        Assert.assertEquals(showCreateTableResultSql, "SSD");
     }
 
     @Test
@@ -148,10 +197,10 @@ public class FrontendServiceImplTest {
         Database db = Env.getCurrentInternalCatalog().getDbOrAnalysisException("test");
         OlapTable table = (OlapTable) db.getTableOrAnalysisException("partition_list");
 
-        List<List<TStringLiteral>> partitionValues = new ArrayList<>();
-        List<TStringLiteral> values = new ArrayList<>();
+        List<List<TNullableStringLiteral>> partitionValues = new ArrayList<>();
+        List<TNullableStringLiteral> values = new ArrayList<>();
 
-        TStringLiteral start = new TStringLiteral();
+        TNullableStringLiteral start = new TNullableStringLiteral();
         start.setValue("BEIJING");
         values.add(start);
 
@@ -183,7 +232,10 @@ public class FrontendServiceImplTest {
         TGetDbsResult dbNames = impl.getDbNames(params);
 
         Assert.assertEquals(dbNames.getDbs().size(), 2);
-        Assert.assertEquals(dbNames.getDbs(), Arrays.asList("test", "test_"));
+        List<String> expected = Arrays.asList("test", "test_");
+        dbNames.getDbs().sort(String::compareTo);
+        expected.sort(String::compareTo);
+        Assert.assertEquals(dbNames.getDbs(), expected);
     }
 
     @Test
@@ -219,5 +271,13 @@ public class FrontendServiceImplTest {
         result = impl.fetchSchemaTableData(request);
         Assert.assertEquals(result.getStatus().getStatusCode(), TStatusCode.OK);
         Assert.assertEquals(result.getDataBatchSize(), 1);
+    }
+
+    @Test
+    public void testShowUser() {
+        FrontendServiceImpl impl = new FrontendServiceImpl(exeEnv);
+        TShowUserRequest request = new TShowUserRequest();
+        TShowUserResult result = impl.showUser(request);
+        System.out.println(result);
     }
 }

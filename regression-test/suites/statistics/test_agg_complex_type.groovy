@@ -21,10 +21,10 @@ suite("test_analyze_with_agg_complex_type") {
 
     sql """create table test_agg_complex_type (
             datekey int,
-            device_id bitmap BITMAP_UNION NULL,
+            device_id bitmap BITMAP_UNION ,
                     hll_test hll hll_union,
                     qs QUANTILE_STATE QUANTILE_UNION,
-                    agg_st_1 agg_state max_by(int ,int)
+                    agg_st_1 agg_state<max_by(int, int)> GENERIC
     )
     aggregate key (datekey)
     distributed by hash(datekey) buckets 1
@@ -36,6 +36,7 @@ suite("test_analyze_with_agg_complex_type") {
     
     sql """insert into test_agg_complex_type values (2, to_bitmap(1),  hll_hash("12"), TO_QUANTILE_STATE("11", 1.0), max_by_state(1,2));"""
     
+    sql """set global force_sample_analyze=false"""
     sql """ANALYZE TABLE test_agg_complex_type WITH SYNC"""
 
     def show_result = sql """SHOW COLUMN CACHED STATS test_agg_complex_type"""
@@ -46,10 +47,10 @@ suite("test_analyze_with_agg_complex_type") {
         return (int) Double.parseDouble(r[0][idx]) == expected_value
     }
 
-    assert expected_col_stats(show_result, 2, 1)
-    assert expected_col_stats(show_result, 0, 3)
-    assert expected_col_stats(show_result, 8, 4)
-    assert expected_col_stats(show_result, 4, 5)
-    assert expected_col_stats(show_result, 1, 6)
-    assert expected_col_stats(show_result, 2, 7)
+    assert expected_col_stats(show_result, 2, 2)
+    assert expected_col_stats(show_result, 0, 4)
+    assert expected_col_stats(show_result, 8, 5)
+    assert expected_col_stats(show_result, 4, 6)
+    assert expected_col_stats(show_result, 1, 7)
+    assert expected_col_stats(show_result, 2, 8)
 }

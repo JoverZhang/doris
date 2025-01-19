@@ -357,14 +357,14 @@ public:
 
     DataTypePtr get_return_type() const override { return _return_type; }
 
-    void add(AggregateDataPtr __restrict place, const IColumn** columns, size_t row_num,
+    void add(AggregateDataPtr __restrict place, const IColumn** columns, ssize_t row_num,
              Arena*) const override {
         static_cast<void>(
                 this->data(place).buffer_add(columns, row_num, row_num + 1, argument_types));
     }
 
     void add_batch_single_place(size_t batch_size, AggregateDataPtr place, const IColumn** columns,
-                                Arena* arena) const override {
+                                Arena*) const override {
         static_cast<void>(this->data(place).add(columns, 0, batch_size, argument_types));
     }
 

@@ -70,6 +70,7 @@ import java.util.stream.Stream;
  *
  * DROP RESOURCE "spark0";
  */
+@Deprecated
 public class SparkResource extends Resource {
     private static final Logger LOG = LogManager.getLogger(SparkResource.class);
 
@@ -116,6 +117,11 @@ public class SparkResource extends Resource {
     private Map<String, String> brokerProperties;
     @SerializedName(value = "envConfigs")
     private Map<String, String> envConfigs;
+
+
+    public SparkResource() {
+        super();
+    }
 
     public SparkResource(String name) {
         this(name, Maps.newHashMap(), null, null, Maps.newHashMap(), Maps.newHashMap());

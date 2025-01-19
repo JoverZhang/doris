@@ -152,7 +152,7 @@ public class RebalanceTest {
 
         olapTable = new OlapTable(2, "fake table", new ArrayList<>(), KeysType.DUP_KEYS, new RangePartitionInfo(),
                 new HashDistributionInfo());
-        db.createTable(olapTable);
+        db.registerTable(olapTable);
 
         // 1 table, 3 partitions p0,p1,p2
         MaterializedIndex materializedIndex = new MaterializedIndex(olapTable.getId(), null);
@@ -177,7 +177,7 @@ public class RebalanceTest {
 
     private void generateStatisticMap() {
         LoadStatisticForTag loadStatistic = new LoadStatisticForTag(
-                Tag.DEFAULT_BACKEND_TAG, systemInfoService, invertedIndex);
+                Tag.DEFAULT_BACKEND_TAG, systemInfoService, invertedIndex, null);
         loadStatistic.init();
         statisticMap = Maps.newHashMap();
         statisticMap.put(Tag.DEFAULT_BACKEND_TAG, loadStatistic);

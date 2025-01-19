@@ -24,25 +24,17 @@
 // IWYU pragma: no_include <bits/chrono.h>
 #include <chrono> // IWYU pragma: keep
 #include <ctime>
-#include <functional>
-#include <map>
 #include <memory>
 #include <ostream>
-#include <queue>
 #include <string>
-#include <tuple>
 #include <vector>
 
 #include "common/config.h"
 #include "common/logging.h"
 #include "runtime/exec_env.h"
 #include "runtime/load_channel.h"
-#include "runtime/memory/mem_tracker.h"
 #include "util/doris_metrics.h"
-#include "util/mem_info.h"
 #include "util/metrics.h"
-#include "util/perf_counters.h"
-#include "util/pretty_printer.h"
 #include "util/thread.h"
 
 namespace doris {
@@ -102,9 +94,13 @@ Status LoadChannelMgr::open(const PTabletWriterOpenRequest& params) {
             int64_t channel_timeout_s = calc_channel_timeout_s(timeout_in_req_s);
             bool is_high_priority = (params.has_is_high_priority() && params.is_high_priority());
 
+            int64_t wg_id = -1;
+            if (params.has_workload_group_id()) {
+                wg_id = params.workload_group_id();
+            }
             channel.reset(new LoadChannel(load_id, channel_timeout_s, is_high_priority,
                                           params.sender_ip(), params.backend_id(),
-                                          params.enable_profile()));
+                                          params.enable_profile(), wg_id));
             _load_channels.insert({load_id, channel});
         }
     }
@@ -114,8 +110,6 @@ Status LoadChannelMgr::open(const PTabletWriterOpenRequest& params) {
     return Status::OK();
 }
 
-static void dummy_deleter(const CacheKey& key, void* value) {}
-
 Status LoadChannelMgr::_get_load_channel(std::shared_ptr<LoadChannel>& channel, bool& is_eof,
                                          const UniqueId& load_id,
                                          const PTabletWriterAddBlockRequest& request) {
@@ -123,10 +117,10 @@ Status LoadChannelMgr::_get_load_channel(std::shared_ptr<LoadChannel>& channel, 
     std::lock_guard<std::mutex> l(_lock);
     auto it = _load_channels.find(load_id);
     if (it == _load_channels.end()) {
-        auto handle = _last_success_channels->cache()->lookup(load_id.to_string());
+        auto* handle = _last_success_channels->lookup(load_id.to_string());
         // success only when eos be true
         if (handle != nullptr) {
-            _last_success_channels->cache()->release(handle);
+            _last_success_channels->release(handle);
             if (request.has_eos() && request.eos()) {
                 is_eof = true;
                 return Status::OK();
@@ -164,7 +158,7 @@ Status LoadChannelMgr::add_batch(const PTabletWriterAddBlockRequest& request,
     // this case will be handled in load channel's add batch method.
     Status st = channel->add_batch(request, response);
     if (UNLIKELY(!st.ok())) {
-        static_cast<void>(channel->cancel());
+        RETURN_IF_ERROR(channel->cancel());
         return st;
     }
 
@@ -182,9 +176,8 @@ void LoadChannelMgr::_finish_load_channel(const UniqueId load_id) {
         if (_load_channels.find(load_id) != _load_channels.end()) {
             _load_channels.erase(load_id);
         }
-        auto handle = _last_success_channels->cache()->insert(load_id.to_string(), nullptr, 1,
-                                                              dummy_deleter);
-        _last_success_channels->cache()->release(handle);
+        auto* handle = _last_success_channels->insert(load_id.to_string(), nullptr, 1, 1);
+        _last_success_channels->release(handle);
     }
     VLOG_CRITICAL << "removed load channel " << load_id;
 }
@@ -201,7 +194,7 @@ Status LoadChannelMgr::cancel(const PTabletWriterCancelRequest& params) {
     }
 
     if (cancelled_channel != nullptr) {
-        static_cast<void>(cancelled_channel->cancel());
+        RETURN_IF_ERROR(cancelled_channel->cancel());
         LOG(INFO) << "load channel has been cancelled: " << load_id;
     }
 
@@ -249,7 +242,7 @@ Status LoadChannelMgr::_start_load_channels_clean() {
     // otherwise some object may be invalid before trying to visit it.
     // eg: MemTracker in load channel
     for (auto& channel : need_delete_channels) {
-        static_cast<void>(channel->cancel());
+        RETURN_IF_ERROR(channel->cancel());
         LOG(INFO) << "load channel has been safely deleted: " << channel->load_id()
                   << ", timeout(s): " << channel->timeout();
     }

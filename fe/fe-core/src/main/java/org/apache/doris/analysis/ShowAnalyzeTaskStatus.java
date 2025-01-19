@@ -26,12 +26,13 @@ import org.apache.doris.qe.ShowResultSetMetaData;
 /**
  * SHOW ANALYZE TASK STATUS [JOB_ID]
  */
-public class ShowAnalyzeTaskStatus extends ShowStmt {
+public class ShowAnalyzeTaskStatus extends ShowStmt implements NotFallbackInParser {
 
     private static final ShowResultSetMetaData ROW_META_DATA =
             ShowResultSetMetaData.builder()
                     .addColumn(new Column("task_id", ScalarType.createVarchar(100)))
                     .addColumn(new Column("col_name", ScalarType.createVarchar(1000)))
+                    .addColumn(new Column("index_name", ScalarType.createVarchar(1000)))
                     .addColumn(new Column("message", ScalarType.createVarchar(1000)))
                     .addColumn(new Column("last_state_change_time", ScalarType.createVarchar(1000)))
                     .addColumn(new Column("time_cost_in_ms", ScalarType.createVarchar(1000)))

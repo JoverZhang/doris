@@ -85,7 +85,7 @@ public:
 
     virtual void direct_copy(void* dest, const void* src) const = 0;
 
-    // Use only in zone map to cut data.StringParser::string_to_unsigned_int<uint32_t>
+    // Use only in zone map to cut data.
     virtual void direct_copy_may_cut(void* dest, const void* src) const = 0;
 
     virtual Status from_string(void* buf, const std::string& scan_key, const int precision = 0,
@@ -730,7 +730,7 @@ struct CppTypeTraits<FieldType::OLAP_FIELD_TYPE_IPV4> {
 };
 template <>
 struct CppTypeTraits<FieldType::OLAP_FIELD_TYPE_IPV6> {
-    using CppType = int128_t;
+    using CppType = uint128_t;
     using UnsignedCppType = uint128_t;
 };
 template <>
@@ -789,8 +789,6 @@ struct BaseFieldTypeTraits : public CppTypeTraits<field_type> {
 
     static inline CppType get_cpp_type_value(const void* address) {
         if constexpr (field_type == FieldType::OLAP_FIELD_TYPE_LARGEINT) {
-            return get_int128_from_unalign(address);
-        } else if constexpr (field_type == FieldType::OLAP_FIELD_TYPE_IPV6) {
             return get_int128_from_unalign(address);
         }
         return *reinterpret_cast<const CppType*>(address);
@@ -1011,27 +1009,27 @@ struct FieldTypeTraits<FieldType::OLAP_FIELD_TYPE_IPV6>
         : public BaseFieldTypeTraits<FieldType::OLAP_FIELD_TYPE_IPV6> {
     static Status from_string(void* buf, const std::string& scan_key, const int precision,
                               const int scale) {
-        int128_t value;
+        uint128_t value;
         if (!IPv6Value::from_string(value, scan_key)) {
             return Status::Error<ErrorCode::INVALID_ARGUMENT>(
                     "FieldTypeTraits<OLAP_FIELD_TYPE_IPV6>::from_string meet PARSE_FAILURE");
         }
-        memcpy(buf, &value, sizeof(int128_t));
+        memcpy(buf, &value, sizeof(uint128_t));
         return Status::OK();
     }
 
     static std::string to_string(const void* src) {
-        int128_t value = *reinterpret_cast<const int128_t*>(src);
+        uint128_t value = *reinterpret_cast<const uint128_t*>(src);
         IPv6Value ipv6_value(value);
         return ipv6_value.to_string();
     }
 
     static void set_to_max(void* buf) {
-        *reinterpret_cast<int128_t*>(buf) = -1; // ::1
+        *reinterpret_cast<int128_t*>(buf) = -1; // ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
     }
 
     static void set_to_min(void* buf) {
-        *reinterpret_cast<int128_t*>(buf) = 0; // ::
+        *reinterpret_cast<uint128_t*>(buf) = 0; // ::
     }
 };
 
@@ -1238,11 +1236,11 @@ struct FieldTypeTraits<FieldType::OLAP_FIELD_TYPE_DATEV2>
         CppType tmp = *reinterpret_cast<const CppType*>(src);
         DateV2Value<DateV2ValueType> value =
                 binary_cast<CppType, DateV2Value<DateV2ValueType>>(tmp);
-        string format = "%Y-%m-%d";
-        string res;
-        res.resize(12);
-        res.reserve(12);
-        value.to_format_string(format.c_str(), format.size(), res.data());
+        std::string format = "%Y-%m-%d";
+        std::string res;
+        res.resize(12 + SAFE_FORMAT_STRING_MARGIN);
+        value.to_format_string_conservative(format.c_str(), format.size(), res.data(),
+                                            12 + SAFE_FORMAT_STRING_MARGIN);
         return res;
     }
 
@@ -1279,9 +1277,9 @@ struct FieldTypeTraits<FieldType::OLAP_FIELD_TYPE_DATETIMEV2>
                 binary_cast<CppType, DateV2Value<DateTimeV2ValueType>>(tmp);
         string format = "%Y-%m-%d %H:%i:%s.%f";
         string res;
-        res.resize(30);
-        res.reserve(30);
-        value.to_format_string(format.c_str(), format.size(), res.data());
+        res.resize(30 + SAFE_FORMAT_STRING_MARGIN);
+        value.to_format_string_conservative(format.c_str(), format.size(), res.data(),
+                                            30 + SAFE_FORMAT_STRING_MARGIN);
         return res;
     }
 

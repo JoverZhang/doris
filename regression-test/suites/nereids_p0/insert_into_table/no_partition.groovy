@@ -26,17 +26,6 @@ suite('nereids_insert_no_partition') {
     sql 'set enable_nereids_dml=true'
     sql 'set enable_strict_consistency_dml=true'
 
-    explain {
-        // TODO: test turn off pipeline when dml, remove it if pipeline sink is ok
-        sql '''
-            insert into uni_light_sc_mow_not_null_nop_t with t as(
-            select * except(kaint, kmintint, kjson) from src where id is not null)
-            select * from t left semi join t t2 on t.id = t2.id;
-        '''
-
-        notContains("MultiCastDataSinks")
-    }
-
     sql '''insert into agg_nop_t
             select * except(kaint, kmintint, kjson) from src'''
     sql 'sync'
@@ -292,17 +281,10 @@ suite('nereids_insert_no_partition') {
     sql '''delete from uni_light_sc_mow_nop_t where id is not null'''
     sql '''delete from uni_light_sc_mow_nop_t where id is null'''
 
-    // TODO turn off fallback when storage layer support true predicate
-    sql '''set enable_fallback_to_original_planner=true'''
     sql '''delete from uni_mow_not_null_nop_t where id is not null'''
-    sql '''set enable_fallback_to_original_planner=false'''
-
     sql '''delete from uni_mow_not_null_nop_t where id is null'''
 
-    // TODO turn off fallback when storage layer support true predicate
-    sql '''set enable_fallback_to_original_planner=true'''
     sql '''delete from uni_light_sc_mow_not_null_nop_t where id is not null'''
-    sql '''set enable_fallback_to_original_planner=false'''
 
     sql '''delete from uni_light_sc_mow_not_null_nop_t where id is null'''
     sql 'alter table agg_light_sc_nop_t rename column ktinyint ktint'

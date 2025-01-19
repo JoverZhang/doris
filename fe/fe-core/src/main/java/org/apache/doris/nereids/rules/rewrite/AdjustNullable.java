@@ -26,7 +26,6 @@ import org.apache.doris.nereids.trees.expressions.NamedExpression;
 import org.apache.doris.nereids.trees.expressions.OrderExpression;
 import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.expressions.SlotReference;
-import org.apache.doris.nereids.trees.expressions.functions.ExpressionTrait;
 import org.apache.doris.nereids.trees.expressions.functions.Function;
 import org.apache.doris.nereids.trees.expressions.visitor.DefaultExpressionRewriter;
 import org.apache.doris.nereids.trees.plans.Plan;
@@ -40,6 +39,7 @@ import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalProject;
 import org.apache.doris.nereids.trees.plans.logical.LogicalRepeat;
 import org.apache.doris.nereids.trees.plans.logical.LogicalSetOperation;
+import org.apache.doris.nereids.trees.plans.logical.LogicalSink;
 import org.apache.doris.nereids.trees.plans.logical.LogicalSort;
 import org.apache.doris.nereids.trees.plans.logical.LogicalTopN;
 import org.apache.doris.nereids.trees.plans.logical.LogicalUnion;
@@ -48,16 +48,18 @@ import org.apache.doris.nereids.trees.plans.visitor.CustomRewriter;
 import org.apache.doris.nereids.trees.plans.visitor.DefaultPlanRewriter;
 import org.apache.doris.nereids.util.ExpressionUtils;
 
+import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.LinkedHashMultimap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import com.google.common.collect.Multimap;
 
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.stream.Collectors;
 
 /**
  * because some rule could change output's nullable.
@@ -76,6 +78,13 @@ public class AdjustNullable extends DefaultPlanRewriter<Map<ExprId, Slot>> imple
         logicalPlan = logicalPlan.recomputeLogicalProperties();
         logicalPlan.getOutputSet().forEach(s -> replaceMap.put(s.getExprId(), s));
         return logicalPlan;
+    }
+
+    @Override
+    public Plan visitLogicalSink(LogicalSink<? extends Plan> logicalSink, Map<ExprId, Slot> replaceMap) {
+        logicalSink = (LogicalSink<? extends Plan>) super.visit(logicalSink, replaceMap);
+        List<NamedExpression> newOutputExprs = updateExpressions(logicalSink.getOutputExprs(), replaceMap);
+        return logicalSink.withOutputExprs(newOutputExprs);
     }
 
     @Override
@@ -109,9 +118,23 @@ public class AdjustNullable extends DefaultPlanRewriter<Map<ExprId, Slot>> imple
     public Plan visitLogicalJoin(LogicalJoin<? extends Plan, ? extends Plan> join, Map<ExprId, Slot> replaceMap) {
         join = (LogicalJoin<? extends Plan, ? extends Plan>) super.visit(join, replaceMap);
         List<Expression> hashConjuncts = updateExpressions(join.getHashJoinConjuncts(), replaceMap);
+        List<Expression> markConjuncts;
+        if (hashConjuncts.isEmpty()) {
+            // if hashConjuncts is empty, mark join conjuncts may used to build hash table
+            // so need call updateExpressions for mark join conjuncts before adjust nullable by output slot
+            markConjuncts = updateExpressions(join.getMarkJoinConjuncts(), replaceMap);
+        } else {
+            markConjuncts = null;
+        }
         join.getOutputSet().forEach(o -> replaceMap.put(o.getExprId(), o));
+        if (markConjuncts == null) {
+            // hashConjuncts is not empty, mark join conjuncts are processed like other join conjuncts
+            Preconditions.checkState(!hashConjuncts.isEmpty(), "hash conjuncts should not be empty");
+            markConjuncts = updateExpressions(join.getMarkJoinConjuncts(), replaceMap);
+        }
         List<Expression> otherConjuncts = updateExpressions(join.getOtherJoinConjuncts(), replaceMap);
-        return join.withJoinConjuncts(hashConjuncts, otherConjuncts).recomputeLogicalProperties();
+        return join.withJoinConjuncts(hashConjuncts, otherConjuncts, markConjuncts,
+                    join.getJoinReorderContext()).recomputeLogicalProperties();
     }
 
     @Override
@@ -142,45 +165,57 @@ public class AdjustNullable extends DefaultPlanRewriter<Map<ExprId, Slot>> imple
     @Override
     public Plan visitLogicalSetOperation(LogicalSetOperation setOperation, Map<ExprId, Slot> replaceMap) {
         setOperation = (LogicalSetOperation) super.visit(setOperation, replaceMap);
-        if (setOperation.children().isEmpty()) {
-            return setOperation;
-        }
-        List<Boolean> inputNullable = setOperation.child(0).getOutput().stream()
-                .map(ExpressionTrait::nullable).collect(Collectors.toList());
         ImmutableList.Builder<List<SlotReference>> newChildrenOutputs = ImmutableList.builder();
-        for (int i = 0; i < setOperation.arity(); i++) {
-            List<Slot> childOutput = setOperation.child(i).getOutput();
-            List<SlotReference> setChildOutput = setOperation.getRegularChildOutput(i);
-            ImmutableList.Builder<SlotReference> newChildOutputs = ImmutableList.builder();
-            for (int j = 0; j < setChildOutput.size(); j++) {
-                for (Slot slot : childOutput) {
-                    if (slot.getExprId().equals(setChildOutput.get(j).getExprId())) {
-                        inputNullable.set(j, slot.nullable() || inputNullable.get(j));
-                        newChildOutputs.add((SlotReference) slot);
-                        break;
+        List<Boolean> inputNullable = null;
+        if (!setOperation.children().isEmpty()) {
+            inputNullable = Lists.newArrayListWithCapacity(setOperation.getOutputs().size());
+            for (int i = 0; i < setOperation.getOutputs().size(); i++) {
+                inputNullable.add(false);
+            }
+            for (int i = 0; i < setOperation.arity(); i++) {
+                List<Slot> childOutput = setOperation.child(i).getOutput();
+                List<SlotReference> setChildOutput = setOperation.getRegularChildOutput(i);
+                ImmutableList.Builder<SlotReference> newChildOutputs = ImmutableList.builder();
+                for (int j = 0; j < setChildOutput.size(); j++) {
+                    for (Slot slot : childOutput) {
+                        if (slot.getExprId().equals(setChildOutput.get(j).getExprId())) {
+                            inputNullable.set(j, slot.nullable() || inputNullable.get(j));
+                            newChildOutputs.add((SlotReference) slot);
+                            break;
+                        }
                     }
                 }
+                newChildrenOutputs.add(newChildOutputs.build());
             }
-            newChildrenOutputs.add(newChildOutputs.build());
         }
         if (setOperation instanceof LogicalUnion) {
             LogicalUnion logicalUnion = (LogicalUnion) setOperation;
-            for (List<NamedExpression> constantExprs : logicalUnion.getConstantExprsList()) {
-                for (int j = 0; j < constantExprs.size(); j++) {
-                    if (constantExprs.get(j).nullable()) {
-                        inputNullable.set(j, true);
-                    }
+            if (!logicalUnion.getConstantExprsList().isEmpty() && setOperation.children().isEmpty()) {
+                int outputSize = logicalUnion.getConstantExprsList().get(0).size();
+                // create the inputNullable list and fill it with all FALSE values
+                inputNullable = Lists.newArrayListWithCapacity(outputSize);
+                for (int i = 0; i < outputSize; i++) {
+                    inputNullable.add(false);
                 }
             }
+            for (List<NamedExpression> constantExprs : logicalUnion.getConstantExprsList()) {
+                for (int j = 0; j < constantExprs.size(); j++) {
+                    inputNullable.set(j, inputNullable.get(j) || constantExprs.get(j).nullable());
+                }
+            }
+        }
+        if (inputNullable == null) {
+            // this is a fail-safe
+            // means there is no children and having no getConstantExprsList
+            // no way to update the nullable flag, so just do nothing
+            return setOperation;
         }
         List<NamedExpression> outputs = setOperation.getOutputs();
         List<NamedExpression> newOutputs = Lists.newArrayListWithCapacity(outputs.size());
         for (int i = 0; i < inputNullable.size(); i++) {
             NamedExpression ne = outputs.get(i);
             Slot slot = ne instanceof Alias ? (Slot) ((Alias) ne).child() : (Slot) ne;
-            if (inputNullable.get(i)) {
-                slot = slot.withNullable(true);
-            }
+            slot = slot.withNullable(inputNullable.get(i));
             newOutputs.add(ne instanceof Alias ? (NamedExpression) ne.withChildren(slot) : slot);
         }
         newOutputs.forEach(o -> replaceMap.put(o.getExprId(), o.toSlot()));
@@ -213,7 +248,7 @@ public class AdjustNullable extends DefaultPlanRewriter<Map<ExprId, Slot>> imple
         List<NamedExpression> windowExpressions =
                 updateExpressions(window.getWindowExpressions(), replaceMap);
         windowExpressions.forEach(w -> replaceMap.put(w.getExprId(), w.toSlot()));
-        return window.withExpression(windowExpressions, window.child());
+        return window.withExpressionsAndChild(windowExpressions, window.child());
     }
 
     @Override
@@ -228,14 +263,15 @@ public class AdjustNullable extends DefaultPlanRewriter<Map<ExprId, Slot>> imple
     @Override
     public Plan visitLogicalCTEConsumer(LogicalCTEConsumer cteConsumer, Map<ExprId, Slot> replaceMap) {
         Map<Slot, Slot> consumerToProducerOutputMap = new LinkedHashMap<>();
-        Map<Slot, Slot> producerToConsumerOutputMap = new LinkedHashMap<>();
+        Multimap<Slot, Slot> producerToConsumerOutputMap = LinkedHashMultimap.create();
         for (Slot producerOutputSlot : cteConsumer.getConsumerToProducerOutputMap().values()) {
             Slot newProducerOutputSlot = updateExpression(producerOutputSlot, replaceMap);
-            Slot newConsumerOutputSlot = cteConsumer.getProducerToConsumerOutputMap().get(producerOutputSlot)
-                    .withNullable(newProducerOutputSlot.nullable());
-            producerToConsumerOutputMap.put(newProducerOutputSlot, newConsumerOutputSlot);
-            consumerToProducerOutputMap.put(newConsumerOutputSlot, newProducerOutputSlot);
-            replaceMap.put(newConsumerOutputSlot.getExprId(), newConsumerOutputSlot);
+            for (Slot consumerOutputSlot : cteConsumer.getProducerToConsumerOutputMap().get(producerOutputSlot)) {
+                Slot newConsumerOutputSlot = consumerOutputSlot.withNullable(newProducerOutputSlot.nullable());
+                producerToConsumerOutputMap.put(newProducerOutputSlot, newConsumerOutputSlot);
+                consumerToProducerOutputMap.put(newConsumerOutputSlot, newProducerOutputSlot);
+                replaceMap.put(newConsumerOutputSlot.getExprId(), newConsumerOutputSlot);
+            }
         }
         return cteConsumer.withTwoMaps(consumerToProducerOutputMap, producerToConsumerOutputMap);
     }
@@ -245,18 +281,19 @@ public class AdjustNullable extends DefaultPlanRewriter<Map<ExprId, Slot>> imple
     }
 
     private <T extends Expression> List<T> updateExpressions(List<T> inputs, Map<ExprId, Slot> replaceMap) {
-        return inputs.stream().map(i -> updateExpression(i, replaceMap)).collect(ImmutableList.toImmutableList());
+        ImmutableList.Builder<T> result = ImmutableList.builderWithExpectedSize(inputs.size());
+        for (T input : inputs) {
+            result.add(updateExpression(input, replaceMap));
+        }
+        return result.build();
     }
 
     private <T extends Expression> Set<T> updateExpressions(Set<T> inputs, Map<ExprId, Slot> replaceMap) {
-        return inputs.stream().map(i -> updateExpression(i, replaceMap)).collect(ImmutableSet.toImmutableSet());
-    }
-
-    private Map<ExprId, Slot> collectChildrenOutputMap(LogicalPlan plan) {
-        return plan.children().stream()
-                .map(Plan::getOutputSet)
-                .flatMap(Set::stream)
-                .collect(Collectors.toMap(NamedExpression::getExprId, s -> s));
+        ImmutableSet.Builder<T> result = ImmutableSet.builderWithExpectedSize(inputs.size());
+        for (T input : inputs) {
+            result.add(updateExpression(input, replaceMap));
+        }
+        return result.build();
     }
 
     private static class SlotReferenceReplacer extends DefaultExpressionRewriter<Map<ExprId, Slot>> {
@@ -265,7 +302,14 @@ public class AdjustNullable extends DefaultPlanRewriter<Map<ExprId, Slot>> imple
         @Override
         public Expression visitSlotReference(SlotReference slotReference, Map<ExprId, Slot> context) {
             if (context.containsKey(slotReference.getExprId())) {
-                return slotReference.withNullable(context.get(slotReference.getExprId()).nullable());
+                Slot slot = context.get(slotReference.getExprId());
+                if (slot.getDataType().isAggStateType()) {
+                    // we must replace data type, because nested type and agg state contains nullable of their children.
+                    // TODO: remove if statement after we ensure be constant folding do not change expr type at all.
+                    return slotReference.withNullableAndDataType(slot.nullable(), slot.getDataType());
+                } else {
+                    return slotReference.withNullable(slot.nullable());
+                }
             } else {
                 return slotReference;
             }

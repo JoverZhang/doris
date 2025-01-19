@@ -23,19 +23,12 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
+import java.time.DateTimeException;
 import java.util.function.Consumer;
 
 class DateLiteralTest {
     @Test
     void reject() {
-        // TODO: reject them.
-        // Now parse them as date + offset.
-        // PG parse them as date + offset, MySQL parse them as date + time (rubbish behavior!)
-        // So strange! reject these strange case.
-        // Assertions.assertThrows(AnalysisException.class, () -> new DateLiteral("2022-01-01-01"));
-        // Assertions.assertThrows(AnalysisException.class, () -> new DateLiteral("2022-01-01-1"));
-        // Assertions.assertThrows(AnalysisException.class, () -> new DateLiteral("2022-01-01+01"));
-        // Assertions.assertThrows(AnalysisException.class, () -> new DateLiteral("2022-01-01+1"));
         Assertions.assertThrows(AnalysisException.class, () -> new DateLiteral("2022-01-01 01:00:00.000000"));
         Assertions.assertThrows(AnalysisException.class, () -> new DateLiteral("2022-01-01 00:01:00.000000"));
         Assertions.assertThrows(AnalysisException.class, () -> new DateLiteral("2022-01-01 00:00:01.000000"));
@@ -44,17 +37,23 @@ class DateLiteralTest {
 
     @Test
     void testNormalize() {
-        String s = DateLiteral.normalize("2021-5");
+        String s = DateLiteral.normalize("2021-5").get();
         Assertions.assertEquals("2021-05", s);
-        s = DateLiteral.normalize("2021-5-1");
+        s = DateLiteral.normalize("2021-5-1").get();
         Assertions.assertEquals("2021-05-01", s);
-        s = DateLiteral.normalize("2021-5-01");
+        s = DateLiteral.normalize("2021-5-01").get();
         Assertions.assertEquals("2021-05-01", s);
 
-        s = DateLiteral.normalize("2021-5-01 0:0:0");
+        s = DateLiteral.normalize("2021-5-01 0:0:0").get();
         Assertions.assertEquals("2021-05-01 00:00:00", s);
-        s = DateLiteral.normalize("2021-5-01 0:0:0.001");
+        s = DateLiteral.normalize("2021-5-01 0:0:0.001").get();
         Assertions.assertEquals("2021-05-01 00:00:00.001", s);
+        s = DateLiteral.normalize("2021-5-01 0:0:0.12345678").get();
+        Assertions.assertEquals("2021-05-01 00:00:00.1234567", s);
+        s = DateLiteral.normalize("2021-5-1    Asia/Shanghai").get();
+        Assertions.assertEquals("2021-05-01Asia/Shanghai", s);
+        s = DateLiteral.normalize("2021-5-1 0:0:0.12345678   Asia/Shanghai").get();
+        Assertions.assertEquals("2021-05-01 00:00:00.1234567Asia/Shanghai", s);
     }
 
     @Test
@@ -69,7 +68,7 @@ class DateLiteralTest {
         new DateLiteral("2022-1-1");
         new DateLiteral("20220101");
 
-        Assertions.assertThrows(AnalysisException.class, () -> new DateLiteral("-01-01"));
+        Assertions.assertThrows(DateTimeException.class, () -> new DateLiteral("-01-01"));
     }
 
     @Test
@@ -130,8 +129,8 @@ class DateLiteralTest {
 
     @Test
     void testWrongPunctuationDate() {
-        Assertions.assertThrows(AnalysisException.class, () -> new DateTimeV2Literal("2020€02€01"));
-        Assertions.assertThrows(AnalysisException.class, () -> new DateTimeV2Literal("2020【02】01"));
+        Assertions.assertThrows(DateTimeException.class, () -> new DateTimeV2Literal("2020€02€01"));
+        Assertions.assertThrows(DateTimeException.class, () -> new DateTimeV2Literal("2020【02】01"));
     }
 
     @Test
@@ -212,6 +211,12 @@ class DateLiteralTest {
         new DateLiteral("2020.02.01 00.00.00");
         new DateTimeV2Literal("2020.02.01 00.00.00.1");
         new DateTimeV2Literal("2020.02.01 00.00.00.000001");
-        Assertions.assertThrows(AnalysisException.class, () -> new DateTimeV2Literal("2020.02.01 00.00.00.0000001"));
+        new DateTimeV2Literal("2020.02.01 00.00.00.0000001");
+    }
+
+    @Test
+    void testSuffixSpace() {
+        new DateLiteral("2016-07-02  ");
+        new DateLiteral("2016-07-02 00:00:00  ");
     }
 }

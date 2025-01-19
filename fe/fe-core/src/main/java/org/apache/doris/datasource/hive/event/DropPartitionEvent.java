@@ -20,8 +20,10 @@ package org.apache.doris.datasource.hive.event;
 
 import org.apache.doris.catalog.Env;
 import org.apache.doris.common.DdlException;
+import org.apache.doris.datasource.MetaIdMappingsLog;
 
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
@@ -55,7 +57,7 @@ public class DropPartitionEvent extends MetastorePartitionEvent {
         super(event, catalogName);
         Preconditions.checkArgument(getEventType().equals(MetastoreEventType.DROP_PARTITION));
         Preconditions
-                .checkNotNull(event.getMessage(), debugString("Event message is null"));
+                .checkNotNull(event.getMessage(), getMsgWithEventInfo("Event message is null"));
         try {
             DropPartitionMessage dropPartitionMessage =
                     MetastoreEventsProcessor.getMessageDeserializer(event.getMessageFormat())
@@ -95,11 +97,11 @@ public class DropPartitionEvent extends MetastorePartitionEvent {
     @Override
     protected void process() throws MetastoreNotificationException {
         try {
-            infoLog("catalogName:[{}],dbName:[{}],tableName:[{}],partitionNames:[{}]", catalogName, dbName, tblName,
+            logInfo("catalogName:[{}],dbName:[{}],tableName:[{}],partitionNames:[{}]", catalogName, dbName, tblName,
                     partitionNames.toString());
             // bail out early if there are not partitions to process
             if (partitionNames.isEmpty()) {
-                infoLog("Partition list is empty. Ignoring this event.");
+                logInfo("Partition list is empty. Ignoring this event.");
                 return;
             }
             Env.getCurrentEnv().getCatalogMgr()
@@ -107,7 +109,7 @@ public class DropPartitionEvent extends MetastorePartitionEvent {
                                 partitionNames, eventTime, true);
         } catch (DdlException e) {
             throw new MetastoreNotificationException(
-                    debugString("Failed to process event"), e);
+                    getMsgWithEventInfo("Failed to process event"), e);
         }
     }
 
@@ -124,7 +126,7 @@ public class DropPartitionEvent extends MetastorePartitionEvent {
             return false;
         }
 
-        // `that` event can be batched if this event's partitions contains all of the partitions which `that` event has
+        // `that` event can be batched if this event's partitions contains all the partitions which `that` event has
         // else just remove `that` event's relevant partitions
         for (String partitionName : getAllPartitionNames()) {
             if (thatPartitionEvent instanceof AddPartitionEvent) {
@@ -135,5 +137,18 @@ public class DropPartitionEvent extends MetastorePartitionEvent {
         }
 
         return getAllPartitionNames().containsAll(thatPartitionEvent.getAllPartitionNames());
+    }
+
+    @Override
+    protected List<MetaIdMappingsLog.MetaIdMapping> transferToMetaIdMappings() {
+        List<MetaIdMappingsLog.MetaIdMapping> metaIdMappings = Lists.newArrayList();
+        for (String partitionName : this.getAllPartitionNames()) {
+            MetaIdMappingsLog.MetaIdMapping metaIdMapping = new MetaIdMappingsLog.MetaIdMapping(
+                        MetaIdMappingsLog.OPERATION_TYPE_DELETE,
+                        MetaIdMappingsLog.META_OBJECT_TYPE_DATABASE,
+                        dbName, tblName, partitionName);
+            metaIdMappings.add(metaIdMapping);
+        }
+        return ImmutableList.copyOf(metaIdMappings);
     }
 }

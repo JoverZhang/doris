@@ -40,18 +40,21 @@ import org.apache.doris.nereids.trees.expressions.Cast;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.IsNull;
 import org.apache.doris.nereids.trees.expressions.NamedExpression;
+import org.apache.doris.nereids.trees.expressions.Or;
+import org.apache.doris.nereids.trees.expressions.OrderExpression;
 import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.expressions.SlotReference;
 import org.apache.doris.nereids.trees.expressions.functions.ExpressionTrait;
 import org.apache.doris.nereids.trees.expressions.functions.agg.AggregateFunction;
 import org.apache.doris.nereids.trees.expressions.functions.agg.AggregateParam;
+import org.apache.doris.nereids.trees.expressions.functions.agg.AggregatePhase;
 import org.apache.doris.nereids.trees.expressions.functions.agg.Count;
 import org.apache.doris.nereids.trees.expressions.functions.agg.GroupConcat;
 import org.apache.doris.nereids.trees.expressions.functions.agg.Max;
 import org.apache.doris.nereids.trees.expressions.functions.agg.Min;
-import org.apache.doris.nereids.trees.expressions.functions.agg.MultiDistinctCount;
-import org.apache.doris.nereids.trees.expressions.functions.agg.MultiDistinctSum;
 import org.apache.doris.nereids.trees.expressions.functions.agg.Sum;
+import org.apache.doris.nereids.trees.expressions.functions.agg.Sum0;
+import org.apache.doris.nereids.trees.expressions.functions.agg.SupportMultiDistinct;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.If;
 import org.apache.doris.nereids.trees.expressions.literal.Literal;
 import org.apache.doris.nereids.trees.expressions.literal.NullLiteral;
@@ -63,6 +66,7 @@ import org.apache.doris.nereids.trees.plans.algebra.Project;
 import org.apache.doris.nereids.trees.plans.logical.LogicalAggregate;
 import org.apache.doris.nereids.trees.plans.logical.LogicalFileScan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalFilter;
+import org.apache.doris.nereids.trees.plans.logical.LogicalHudiScan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalOlapScan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalProject;
 import org.apache.doris.nereids.trees.plans.logical.LogicalRelation;
@@ -71,10 +75,12 @@ import org.apache.doris.nereids.trees.plans.physical.PhysicalHashAggregate;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalOlapScan;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalStorageLayerAggregate;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalStorageLayerAggregate.PushDownAggOp;
+import org.apache.doris.nereids.types.TinyIntType;
 import org.apache.doris.nereids.util.ExpressionUtils;
 import org.apache.doris.nereids.util.TypeCoercionUtils;
 import org.apache.doris.qe.ConnectContext;
 
+import com.google.common.base.Function;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
@@ -108,40 +114,68 @@ public class AggregateStrategies implements ImplementationRuleFactory {
                 logicalAggregate(
                     logicalFilter(
                         logicalOlapScan().when(this::isDupOrMowKeyTable).when(this::isInvertedIndexEnabledOnTable)
-                    ).when(filter -> filter.getConjuncts().size() > 0))
-                    .when(agg -> enablePushDownCountOnIndex())
-                    .when(agg -> agg.getGroupByExpressions().size() == 0)
-                    .when(agg -> {
-                        Set<AggregateFunction> funcs = agg.getAggregateFunctions();
-                        return !funcs.isEmpty() && funcs.stream()
-                                .allMatch(f -> f instanceof Count && !f.isDistinct());
-                    })
-                    .thenApply(ctx -> {
-                        LogicalAggregate<LogicalFilter<LogicalOlapScan>> agg = ctx.root;
-                        LogicalFilter<LogicalOlapScan> filter = agg.child();
-                        LogicalOlapScan olapScan = filter.child();
-                        return pushdownCountOnIndex(agg, null, filter, olapScan, ctx.cascadesContext);
-                    })
+                    )
+                )
+                .when(agg -> enablePushDownCountOnIndex())
+                .when(agg -> agg.getGroupByExpressions().isEmpty())
+                .when(agg -> {
+                    Set<AggregateFunction> funcs = agg.getAggregateFunctions();
+                    if (funcs.isEmpty() || !funcs.stream().allMatch(f -> f instanceof Count && !f.isDistinct()
+                            && (((Count) f).isCountStar() || f.child(0) instanceof Slot))) {
+                        return false;
+                    }
+                    Set<Expression> conjuncts = agg.child().getConjuncts();
+                    if (conjuncts.isEmpty()) {
+                        return false;
+                    }
+
+                    Set<Slot> aggSlots = funcs.stream()
+                            .flatMap(f -> f.getInputSlots().stream())
+                            .collect(Collectors.toSet());
+                    return aggSlots.isEmpty() || conjuncts.stream().allMatch(expr ->
+                                checkSlotInOrExpression(expr, aggSlots) && checkIsNullExpr(expr, aggSlots));
+                })
+                .thenApply(ctx -> {
+                    LogicalAggregate<LogicalFilter<LogicalOlapScan>> agg = ctx.root;
+                    LogicalFilter<LogicalOlapScan> filter = agg.child();
+                    LogicalOlapScan olapScan = filter.child();
+                    return pushdownCountOnIndex(agg, null, filter, olapScan, ctx.cascadesContext);
+                })
             ),
             RuleType.COUNT_ON_INDEX.build(
                 logicalAggregate(
                     logicalProject(
                         logicalFilter(
                             logicalOlapScan().when(this::isDupOrMowKeyTable).when(this::isInvertedIndexEnabledOnTable)
-                        ).when(filter -> filter.getConjuncts().size() > 0)))
-                    .when(agg -> enablePushDownCountOnIndex())
-                    .when(agg -> agg.getGroupByExpressions().size() == 0)
-                    .when(agg -> {
-                        Set<AggregateFunction> funcs = agg.getAggregateFunctions();
-                        return !funcs.isEmpty() && funcs.stream().allMatch(f -> f instanceof Count && !f.isDistinct());
-                    })
-                    .thenApply(ctx -> {
-                        LogicalAggregate<LogicalProject<LogicalFilter<LogicalOlapScan>>> agg = ctx.root;
-                        LogicalProject<LogicalFilter<LogicalOlapScan>> project = agg.child();
-                        LogicalFilter<LogicalOlapScan> filter = project.child();
-                        LogicalOlapScan olapScan = filter.child();
-                        return pushdownCountOnIndex(agg, project, filter, olapScan, ctx.cascadesContext);
-                    })
+                        )
+                    )
+                )
+                .when(agg -> enablePushDownCountOnIndex())
+                .when(agg -> agg.getGroupByExpressions().isEmpty())
+                .when(agg -> {
+                    Set<AggregateFunction> funcs = agg.getAggregateFunctions();
+                    if (funcs.isEmpty() || !funcs.stream().allMatch(f -> f instanceof Count && !f.isDistinct()
+                            && (((Count) f).isCountStar() || f.child(0) instanceof Slot))) {
+                        return false;
+                    }
+                    Set<Expression> conjuncts = agg.child().child().getConjuncts();
+                    if (conjuncts.isEmpty()) {
+                        return false;
+                    }
+
+                    Set<Slot> aggSlots = funcs.stream()
+                            .flatMap(f -> f.getInputSlots().stream())
+                            .collect(Collectors.toSet());
+                    return aggSlots.isEmpty() || conjuncts.stream().allMatch(expr ->
+                                checkSlotInOrExpression(expr, aggSlots) && checkIsNullExpr(expr, aggSlots));
+                })
+                .thenApply(ctx -> {
+                    LogicalAggregate<LogicalProject<LogicalFilter<LogicalOlapScan>>> agg = ctx.root;
+                    LogicalProject<LogicalFilter<LogicalOlapScan>> project = agg.child();
+                    LogicalFilter<LogicalOlapScan> filter = project.child();
+                    LogicalOlapScan olapScan = filter.child();
+                    return pushdownCountOnIndex(agg, project, filter, olapScan, ctx.cascadesContext);
+                })
             ),
             RuleType.STORAGE_LAYER_AGGREGATE_MINMAX_ON_UNIQUE_WITHOUT_PROJECT.build(
                 logicalAggregate(
@@ -154,7 +188,7 @@ public class AggregateStrategies implements ImplementationRuleFactory {
                                     Expression childExpr = filter.getConjuncts().iterator().next().children().get(0);
                                     if (childExpr instanceof SlotReference) {
                                         Optional<Column> column = ((SlotReference) childExpr).getColumn();
-                                        return column.isPresent() ? column.get().isDeleteSignColumn() : false;
+                                        return column.map(Column::isDeleteSignColumn).orElse(false);
                                     }
                                     return false;
                                 })
@@ -187,8 +221,7 @@ public class AggregateStrategies implements ImplementationRuleFactory {
                                                         .children().get(0);
                                                 if (childExpr instanceof SlotReference) {
                                                     Optional<Column> column = ((SlotReference) childExpr).getColumn();
-                                                    return column.isPresent() ? column.get().isDeleteSignColumn()
-                                                            : false;
+                                                    return column.map(Column::isDeleteSignColumn).orElse(false);
                                                 }
                                                 return false;
                                             }))
@@ -216,6 +249,16 @@ public class AggregateStrategies implements ImplementationRuleFactory {
                 .when(agg -> agg.isNormalized() && enablePushDownNoGroupAgg())
                 .thenApply(ctx -> storageLayerAggregate(ctx.root, null, ctx.root.child(), ctx.cascadesContext))
             ),
+            RuleType.STORAGE_LAYER_WITH_PROJECT_NO_SLOT_REF.build(
+                    logicalProject(
+                            logicalOlapScan()
+                    )
+                    .thenApply(ctx -> {
+                        LogicalProject<LogicalOlapScan> project = ctx.root;
+                        LogicalOlapScan olapScan = project.child();
+                        return pushDownCountWithoutSlotRef(project, olapScan, ctx.cascadesContext);
+                    })
+            ),
             RuleType.STORAGE_LAYER_AGGREGATE_WITH_PROJECT.build(
                 logicalAggregate(
                     logicalProject(
@@ -242,8 +285,7 @@ public class AggregateStrategies implements ImplementationRuleFactory {
                     logicalProject(
                         logicalFileScan()
                     )
-                )
-                    .when(agg -> agg.isNormalized() && enablePushDownNoGroupAgg())
+                ).when(agg -> agg.isNormalized() && enablePushDownNoGroupAgg())
                     .thenApply(ctx -> {
                         LogicalAggregate<LogicalProject<LogicalFileScan>> agg = ctx.root;
                         LogicalProject<LogicalFileScan> project = agg.child();
@@ -253,32 +295,38 @@ public class AggregateStrategies implements ImplementationRuleFactory {
             ),
             RuleType.ONE_PHASE_AGGREGATE_WITHOUT_DISTINCT.build(
                 basePattern
-                    .when(agg -> agg.getDistinctArguments().size() == 0)
+                    .when(agg -> agg.getDistinctArguments().isEmpty())
+                    .when(agg -> agg.supportAggregatePhase(AggregatePhase.ONE))
                     .thenApplyMulti(ctx -> onePhaseAggregateWithoutDistinct(ctx.root, ctx.connectContext))
             ),
             RuleType.TWO_PHASE_AGGREGATE_WITHOUT_DISTINCT.build(
                 basePattern
-                    .when(agg -> agg.getDistinctArguments().size() == 0)
+                    .when(agg -> agg.getDistinctArguments().isEmpty())
+                    .when(agg -> agg.supportAggregatePhase(AggregatePhase.TWO))
                     .thenApplyMulti(ctx -> twoPhaseAggregateWithoutDistinct(ctx.root, ctx.connectContext))
             ),
             // RuleType.TWO_PHASE_AGGREGATE_WITH_COUNT_DISTINCT_MULTI.build(
             //     basePattern
             //         .when(this::containsCountDistinctMultiExpr)
+            //         .when(agg -> agg.supportAggregatePhase(AggregatePhase.TWO))
             //         .thenApplyMulti(ctx -> twoPhaseAggregateWithCountDistinctMulti(ctx.root, ctx.cascadesContext))
             // ),
             RuleType.THREE_PHASE_AGGREGATE_WITH_COUNT_DISTINCT_MULTI.build(
                 basePattern
                     .when(this::containsCountDistinctMultiExpr)
+                    .when(agg -> agg.supportAggregatePhase(AggregatePhase.THREE))
                     .thenApplyMulti(ctx -> threePhaseAggregateWithCountDistinctMulti(ctx.root, ctx.cascadesContext))
             ),
             RuleType.ONE_PHASE_AGGREGATE_SINGLE_DISTINCT_TO_MULTI.build(
                 basePattern
                     .when(agg -> agg.getDistinctArguments().size() == 1 && couldConvertToMulti(agg))
+                    .when(agg -> agg.supportAggregatePhase(AggregatePhase.ONE))
                     .thenApplyMulti(ctx -> onePhaseAggregateWithMultiDistinct(ctx.root, ctx.connectContext))
             ),
             RuleType.TWO_PHASE_AGGREGATE_SINGLE_DISTINCT_TO_MULTI.build(
                 basePattern
                     .when(agg -> agg.getDistinctArguments().size() == 1 && couldConvertToMulti(agg))
+                    .when(agg -> agg.supportAggregatePhase(AggregatePhase.TWO))
                     .thenApplyMulti(ctx -> twoPhaseAggregateWithMultiDistinct(ctx.root, ctx.connectContext))
             ),
             RuleType.TWO_PHASE_AGGREGATE_WITH_MULTI_DISTINCT.build(
@@ -286,25 +334,143 @@ public class AggregateStrategies implements ImplementationRuleFactory {
                     .when(agg -> agg.getDistinctArguments().size() > 1
                             && !containsCountDistinctMultiExpr(agg)
                             && couldConvertToMulti(agg))
+                    .when(agg -> agg.supportAggregatePhase(AggregatePhase.TWO))
                     .thenApplyMulti(ctx -> twoPhaseAggregateWithMultiDistinct(ctx.root, ctx.connectContext))
             ),
             // RuleType.TWO_PHASE_AGGREGATE_WITH_DISTINCT.build(
             //     basePattern
             //         .when(agg -> agg.getDistinctArguments().size() == 1)
+            //         .when(agg -> agg.supportAggregatePhase(AggregatePhase.TWO))
             //         .thenApplyMulti(ctx -> twoPhaseAggregateWithDistinct(ctx.root, ctx.connectContext))
             // ),
             RuleType.THREE_PHASE_AGGREGATE_WITH_DISTINCT.build(
-                    basePattern
-                            .when(agg -> agg.getDistinctArguments().size() == 1)
-                            .thenApplyMulti(ctx -> threePhaseAggregateWithDistinct(ctx.root, ctx.connectContext))
+                basePattern
+                    .when(agg -> agg.getDistinctArguments().size() == 1)
+                    .whenNot(agg -> agg.mustUseMultiDistinctAgg())
+                    .when(agg -> agg.supportAggregatePhase(AggregatePhase.THREE))
+                    .thenApplyMulti(ctx -> threePhaseAggregateWithDistinct(ctx.root, ctx.connectContext))
             ),
+            /*
+             * sql:
+             * select count(distinct name), sum(age) from student;
+             * <p>
+             * 4 phase plan
+             * DISTINCT_GLOBAL(BUFFER_TO_RESULT, groupBy(),
+             *          output[count(partial_count(name)), sum(partial_sum(partial_sum(age)))],
+             *          GATHER)
+             * +--DISTINCT_LOCAL(INPUT_TO_BUFFER, groupBy(),
+             *          output(partial_count(name), partial_sum(partial_sum(age))),
+             *          hash distribute by name)
+             *    +--GLOBAL(BUFFER_TO_BUFFER, groupBy(name),
+             *          output(name, partial_sum(age)),
+             *          hash_distribute by name)
+             *       +--LOCAL(INPUT_TO_BUFFER, groupBy(name), output(name, partial_sum(age)))
+             *          +--scan(name, age)
+             */
             RuleType.FOUR_PHASE_AGGREGATE_WITH_DISTINCT.build(
-                    basePattern
-                            .when(agg -> agg.getDistinctArguments().size() == 1)
-                            .when(agg -> agg.getGroupByExpressions().isEmpty())
-                            .thenApplyMulti(ctx -> fourPhaseAggregateWithDistinct(ctx.root, ctx.connectContext))
+                basePattern
+                    .when(agg -> agg.getDistinctArguments().size() == 1)
+                    .when(agg -> agg.getGroupByExpressions().isEmpty())
+                    .whenNot(agg -> agg.mustUseMultiDistinctAgg())
+                    .when(agg -> agg.supportAggregatePhase(AggregatePhase.FOUR))
+                    .thenApplyMulti(ctx -> {
+                        Function<List<Expression>, RequireProperties> secondPhaseRequireDistinctHash =
+                                groupByAndDistinct -> RequireProperties.of(
+                                        PhysicalProperties.createHash(
+                                                ctx.root.getDistinctArguments(), ShuffleType.REQUIRE
+                                        )
+                                );
+                        Function<LogicalAggregate<? extends Plan>, RequireProperties> fourPhaseRequireGather =
+                                agg -> RequireProperties.of(PhysicalProperties.GATHER);
+                        return fourPhaseAggregateWithDistinct(
+                                ctx.root, ctx.connectContext,
+                                secondPhaseRequireDistinctHash, fourPhaseRequireGather
+                        );
+                    })
+            ),
+            /*
+             * sql:
+             * select age, count(distinct name) from student group by age;
+             * <p>
+             * 4 phase plan
+             * DISTINCT_GLOBAL(BUFFER_TO_RESULT, groupBy(age),
+             *          output[age, sum(partial_count(name))],
+             *          hash distribute by name)
+             * +--DISTINCT_LOCAL(INPUT_TO_BUFFER, groupBy(age),
+             *          output(age, partial_count(name)),
+             *          hash distribute by age, name)
+             *    +--GLOBAL(BUFFER_TO_BUFFER, groupBy(age, name),
+             *          output(age, name),
+             *          hash_distribute by age, name)
+             *       +--LOCAL(INPUT_TO_BUFFER, groupBy(age, name), output(age, name))
+             *          +--scan(age, name)
+             */
+            RuleType.FOUR_PHASE_AGGREGATE_WITH_DISTINCT_WITH_FULL_DISTRIBUTE.build(
+                basePattern
+                    .when(agg -> agg.everyDistinctArgumentNumIsOne() && !agg.getGroupByExpressions().isEmpty())
+                    .when(agg ->
+                        ImmutableSet.builder()
+                            .addAll(agg.getGroupByExpressions())
+                            .addAll(agg.getDistinctArguments())
+                            .build().size() > agg.getGroupByExpressions().size()
+                    )
+                    .when(agg -> {
+                        if (agg.getDistinctArguments().size() == 1) {
+                            return true;
+                        }
+                        return couldConvertToMulti(agg);
+                    })
+                    .when(agg -> agg.supportAggregatePhase(AggregatePhase.FOUR))
+                    .thenApplyMulti(ctx -> {
+                        Function<List<Expression>, RequireProperties> secondPhaseRequireGroupByAndDistinctHash =
+                                groupByAndDistinct -> RequireProperties.of(
+                                        PhysicalProperties.createHash(groupByAndDistinct, ShuffleType.REQUIRE)
+                                );
+
+                        Function<LogicalAggregate<? extends Plan>, RequireProperties> fourPhaseRequireGroupByHash =
+                                agg -> RequireProperties.of(
+                                        PhysicalProperties.createHash(
+                                                agg.getGroupByExpressions(), ShuffleType.REQUIRE
+                                        )
+                                );
+                        return fourPhaseAggregateWithDistinct(
+                                ctx.root, ctx.connectContext,
+                                secondPhaseRequireGroupByAndDistinctHash, fourPhaseRequireGroupByHash
+                        );
+                    })
             )
         );
+    }
+
+    /*
+     *  select 66 from baseall_dup; could use pushAggOp=COUNT to not scan real data.
+     */
+    private LogicalProject<? extends Plan> pushDownCountWithoutSlotRef(
+            LogicalProject<? extends Plan> project,
+            LogicalOlapScan logicalScan,
+            CascadesContext cascadesContext) {
+        final LogicalProject<? extends Plan> canNotPush = project;
+        if (!enablePushDownNoGroupAgg()) {
+            return canNotPush;
+        }
+        if (logicalScan != null) {
+            KeysType keysType = logicalScan.getTable().getKeysType();
+            if (keysType != KeysType.DUP_KEYS) {
+                return canNotPush;
+            }
+        }
+        for (Expression e : project.getProjects()) {
+            if (e.anyMatch(SlotReference.class::isInstance)) {
+                return canNotPush;
+            }
+        }
+        PhysicalOlapScan physicalOlapScan
+                = (PhysicalOlapScan) new LogicalOlapScanToPhysicalOlapScan()
+                .build()
+                .transform(logicalScan, cascadesContext)
+                .get(0);
+        return project.withChildren(ImmutableList.of(new PhysicalStorageLayerAggregate(
+                physicalOlapScan, PushDownAggOp.COUNT)));
     }
 
     private boolean enablePushDownMinMaxOnUnique() {
@@ -323,6 +489,38 @@ public class AggregateStrategies implements ImplementationRuleFactory {
     private boolean enablePushDownCountOnIndex() {
         ConnectContext connectContext = ConnectContext.get();
         return connectContext != null && connectContext.getSessionVariable().isEnablePushDownCountOnIndex();
+    }
+
+    private boolean checkSlotInOrExpression(Expression expr, Set<Slot> aggSlots) {
+        if (expr instanceof Or) {
+            Set<Slot> slots = expr.getInputSlots();
+            if (!slots.stream().allMatch(aggSlots::contains)) {
+                return false;
+            }
+        } else {
+            for (Expression child : expr.children()) {
+                if (!checkSlotInOrExpression(child, aggSlots)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    private boolean checkIsNullExpr(Expression expr, Set<Slot> aggSlots) {
+        if (expr instanceof IsNull) {
+            Set<Slot> slots = expr.getInputSlots();
+            if (slots.stream().anyMatch(aggSlots::contains)) {
+                return false;
+            }
+        } else {
+            for (Expression child : expr.children()) {
+                if (!checkIsNullExpr(child, aggSlots)) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     private boolean isDupOrMowKeyTable(LogicalOlapScan logicalScan) {
@@ -374,26 +572,53 @@ public class AggregateStrategies implements ImplementationRuleFactory {
             LogicalFilter<? extends Plan> filter,
             LogicalOlapScan olapScan,
             CascadesContext cascadesContext) {
-        PhysicalOlapScan physicalOlapScan
-                = (PhysicalOlapScan) new LogicalOlapScanToPhysicalOlapScan()
+
+        PhysicalOlapScan physicalOlapScan = (PhysicalOlapScan) new LogicalOlapScanToPhysicalOlapScan()
                 .build()
                 .transform(olapScan, cascadesContext)
                 .get(0);
-        if (project != null) {
-            return agg.withChildren(ImmutableList.of(
-                    project.withChildren(ImmutableList.of(
-                            filter.withChildren(ImmutableList.of(
-                                    new PhysicalStorageLayerAggregate(
-                                            physicalOlapScan,
-                                            PushDownAggOp.COUNT_ON_MATCH)))))
-            ));
-        } else {
-            return agg.withChildren(ImmutableList.of(
-                            filter.withChildren(ImmutableList.of(
-                                    new PhysicalStorageLayerAggregate(
-                                            physicalOlapScan,
-                                            PushDownAggOp.COUNT_ON_MATCH)))));
+
+        List<Expression> argumentsOfAggregateFunction = normalizeArguments(agg.getAggregateFunctions(), project);
+
+        if (!onlyContainsSlot(argumentsOfAggregateFunction)) {
+            return agg;
         }
+
+        return agg.withChildren(ImmutableList.of(
+                project != null
+                        ? project.withChildren(ImmutableList.of(
+                        filter.withChildren(ImmutableList.of(
+                                new PhysicalStorageLayerAggregate(
+                                        physicalOlapScan, PushDownAggOp.COUNT_ON_MATCH)))))
+                        : filter.withChildren(ImmutableList.of(
+                                new PhysicalStorageLayerAggregate(
+                                        physicalOlapScan, PushDownAggOp.COUNT_ON_MATCH)))
+        ));
+    }
+
+    private List<Expression> normalizeArguments(Set<AggregateFunction> aggregateFunctions,
+            @Nullable LogicalProject<? extends Plan> project) {
+        List<Expression> arguments = aggregateFunctions.stream()
+                .flatMap(aggregateFunction -> aggregateFunction.getArguments().stream())
+                .collect(ImmutableList.toImmutableList());
+
+        if (project != null) {
+            arguments = Project.findProject(arguments, project.getProjects())
+                    .stream()
+                    .map(p -> p instanceof Alias ? p.child(0) : p)
+                    .collect(ImmutableList.toImmutableList());
+        }
+
+        return arguments;
+    }
+
+    private boolean onlyContainsSlot(List<Expression> arguments) {
+        return arguments.stream().allMatch(argument -> {
+            if (argument instanceof SlotReference) {
+                return true;
+            }
+            return false;
+        });
     }
 
     //select /*+SET_VAR(enable_pushdown_minmax_on_unique=true) */min(user_id) from table_unique;
@@ -435,12 +660,7 @@ public class AggregateStrategies implements ImplementationRuleFactory {
         boolean onlyContainsSlotOrNumericCastSlot = aggregateFunctions.stream()
                 .map(ExpressionTrait::getArguments)
                 .flatMap(List::stream)
-                .allMatch(argument -> {
-                    if (argument instanceof SlotReference) {
-                        return true;
-                    }
-                    return false;
-                });
+                .allMatch(argument -> argument instanceof SlotReference);
         if (!onlyContainsSlotOrNumericCastSlot) {
             return false;
         }
@@ -457,19 +677,13 @@ public class AggregateStrategies implements ImplementationRuleFactory {
         }
         onlyContainsSlotOrNumericCastSlot = argumentsOfAggregateFunction
                 .stream()
-                .allMatch(argument -> {
-                    if (argument instanceof SlotReference) {
-                        return true;
-                    }
-                    return false;
-                });
+                .allMatch(argument -> argument instanceof SlotReference);
         if (!onlyContainsSlotOrNumericCastSlot) {
             return false;
         }
         Set<SlotReference> aggUsedSlots = ExpressionUtils.collect(argumentsOfAggregateFunction,
                 SlotReference.class::isInstance);
-        List<SlotReference> usedSlotInTable = (List<SlotReference>) Project.findProject(aggUsedSlots,
-                outPutSlots);
+        List<SlotReference> usedSlotInTable = (List<SlotReference>) Project.findProject(aggUsedSlots, outPutSlots);
         for (SlotReference slot : usedSlotInTable) {
             Column column = slot.getColumn().get();
             PrimitiveType colType = column.getType().getPrimitiveType();
@@ -528,8 +742,12 @@ public class AggregateStrategies implements ImplementationRuleFactory {
             return canNotPush;
         }
         if (logicalScan instanceof LogicalOlapScan) {
-            KeysType keysType = ((LogicalOlapScan) logicalScan).getTable().getKeysType();
+            LogicalOlapScan logicalOlapScan = (LogicalOlapScan) logicalScan;
+            KeysType keysType = logicalOlapScan.getTable().getKeysType();
             if (functionClasses.contains(Count.class) && keysType != KeysType.DUP_KEYS) {
+                return canNotPush;
+            }
+            if (functionClasses.contains(Count.class) && logicalOlapScan.isDirectMvScan()) {
                 return canNotPush;
             }
         }
@@ -630,7 +848,7 @@ public class AggregateStrategies implements ImplementationRuleFactory {
         if (logicalScan instanceof LogicalOlapScan) {
             PhysicalOlapScan physicalScan = (PhysicalOlapScan) new LogicalOlapScanToPhysicalOlapScan()
                     .build()
-                    .transform((LogicalOlapScan) logicalScan, cascadesContext)
+                    .transform(logicalScan, cascadesContext)
                     .get(0);
 
             if (project != null) {
@@ -645,9 +863,9 @@ public class AggregateStrategies implements ImplementationRuleFactory {
             }
 
         } else if (logicalScan instanceof LogicalFileScan) {
-            PhysicalFileScan physicalScan = (PhysicalFileScan) new LogicalFileScanToPhysicalFileScan()
-                    .build()
-                    .transform((LogicalFileScan) logicalScan, cascadesContext)
+            Rule rule = (logicalScan instanceof LogicalHudiScan) ? new LogicalHudiScanToPhysicalHudiScan().build()
+                    : new LogicalFileScanToPhysicalFileScan().build();
+            PhysicalFileScan physicalScan = (PhysicalFileScan) rule.transform(logicalScan, cascadesContext)
                     .get(0);
             if (project != null) {
                 return aggregate.withChildren(ImmutableList.of(
@@ -1117,7 +1335,7 @@ public class AggregateStrategies implements ImplementationRuleFactory {
      * <p>
      *  single node aggregate:
      * <p>
-     *     PhysicalHashAggregate(groupBy=[name], output=[name, count(distinct(id)], mode=BUFFER_TO_RESULT)
+     *     PhysicalHashAggregate(groupBy=[name], output=[name, count(distinct(id))], mode=BUFFER_TO_RESULT)
      *                                          |
      *     PhysicalHashAggregate(groupBy=[name, id], output=[name, id], mode=INPUT_TO_BUFFER)
      *                                          |
@@ -1127,11 +1345,9 @@ public class AggregateStrategies implements ImplementationRuleFactory {
      * <p>
      * distribute node aggregate:
      * <p>
-     *     PhysicalHashAggregate(groupBy=[name], output=[name, count(distinct(id)], mode=BUFFER_TO_RESULT)
+     *     PhysicalHashAggregate(groupBy=[name], output=[name, count(distinct(id))], mode=BUFFER_TO_RESULT)
      *                                          |
      *     PhysicalHashAggregate(groupBy=[name, id], output=[name, id], mode=INPUT_TO_BUFFER)
-     *                                          |
-     *                 PhysicalDistribute(distributionSpec=HASH(name))
      *                                          |
      *                LogicalOlapScan(table=tbl, **if distribute by name**)
      *
@@ -1184,8 +1400,9 @@ public class AggregateStrategies implements ImplementationRuleFactory {
                     if (outputChild instanceof AggregateFunction) {
                         AggregateFunction aggregateFunction = (AggregateFunction) outputChild;
                         if (aggregateFunction.isDistinct()) {
-                            Set<Expression> aggChild = Sets.newHashSet(aggregateFunction.children());
-                            Preconditions.checkArgument(aggChild.size() == 1,
+                            Set<Expression> aggChild = Sets.newLinkedHashSet(aggregateFunction.children());
+                            Preconditions.checkArgument(aggChild.size() == 1
+                                            || aggregateFunction.getDistinctArguments().size() == 1,
                                     "cannot process more than one child in aggregate distinct function: "
                                             + aggregateFunction);
                             AggregateFunction nonDistinct = aggregateFunction
@@ -1193,8 +1410,7 @@ public class AggregateStrategies implements ImplementationRuleFactory {
                             return new AggregateExpression(nonDistinct, AggregateParam.LOCAL_RESULT);
                         } else {
                             Alias alias = nonDistinctAggFunctionToAliasPhase1.get(outputChild);
-                            return new AggregateExpression(
-                                    aggregateFunction, bufferToResultParam, alias.toSlot());
+                            return new AggregateExpression(aggregateFunction, bufferToResultParam, alias.toSlot());
                         }
                     } else {
                         return outputChild;
@@ -1246,7 +1462,7 @@ public class AggregateStrategies implements ImplementationRuleFactory {
      * after:
      *  single node aggregate:
      * <p>
-     *     PhysicalHashAggregate(groupBy=[name], output=[name, count(distinct(id)], mode=BUFFER_TO_RESULT)
+     *     PhysicalHashAggregate(groupBy=[name], output=[name, count(distinct(id))], mode=BUFFER_TO_RESULT)
      *                                          |
      *     PhysicalHashAggregate(groupBy=[name, id], output=[name, id], mode=BUFFER_TO_BUFFER)
      *                                          |
@@ -1258,7 +1474,7 @@ public class AggregateStrategies implements ImplementationRuleFactory {
      * <p>
      *  distribute node aggregate:
      * <p>
-     *     PhysicalHashAggregate(groupBy=[name], output=[name, count(distinct(id)], mode=BUFFER_TO_RESULT)
+     *     PhysicalHashAggregate(groupBy=[name], output=[name, count(distinct(id))], mode=BUFFER_TO_RESULT)
      *                                          |
      *     PhysicalHashAggregate(groupBy=[name, id], output=[name, id], mode=BUFFER_TO_BUFFER)
      *                                          |
@@ -1303,6 +1519,15 @@ public class AggregateStrategies implements ImplementationRuleFactory {
                 .build();
 
         List<Expression> localAggGroupBy = ImmutableList.copyOf(localAggGroupBySet);
+        boolean isGroupByEmptySelectEmpty = localAggGroupBy.isEmpty() && localAggOutput.isEmpty();
+
+        // be not recommend generate an aggregate node with empty group by and empty output,
+        // so add a null int slot to group by slot and output
+        if (isGroupByEmptySelectEmpty) {
+            localAggGroupBy = ImmutableList.of(new NullLiteral(TinyIntType.INSTANCE));
+            localAggOutput = ImmutableList.of(new Alias(new NullLiteral(TinyIntType.INSTANCE)));
+        }
+
         boolean maybeUsingStreamAgg = maybeUsingStreamAgg(connectContext, localAggGroupBy);
         List<Expression> partitionExpressions = getHashAggregatePartitionExpressions(logicalAgg);
         RequireProperties requireAny = RequireProperties.of(PhysicalProperties.ANY);
@@ -1328,6 +1553,12 @@ public class AggregateStrategies implements ImplementationRuleFactory {
                 .addAll(nonDistinctAggFunctionToAliasPhase2.values())
                 .build();
 
+        // be not recommend generate an aggregate node with empty group by and empty output,
+        // so add a null int slot to group by slot and output
+        if (isGroupByEmptySelectEmpty) {
+            globalAggOutput = ImmutableList.of(new Alias(new NullLiteral(TinyIntType.INSTANCE)));
+        }
+
         RequireProperties requireGather = RequireProperties.of(PhysicalProperties.GATHER);
         PhysicalHashAggregate<Plan> anyLocalGatherGlobalAgg = new PhysicalHashAggregate<>(
                 localAggGroupBy, globalAggOutput, Optional.of(partitionExpressions),
@@ -1341,14 +1572,14 @@ public class AggregateStrategies implements ImplementationRuleFactory {
                     if (expr instanceof AggregateFunction) {
                         AggregateFunction aggregateFunction = (AggregateFunction) expr;
                         if (aggregateFunction.isDistinct()) {
-                            Set<Expression> aggChild = Sets.newHashSet(aggregateFunction.children());
-                            Preconditions.checkArgument(aggChild.size() == 1,
+                            Set<Expression> aggChild = Sets.newLinkedHashSet(aggregateFunction.children());
+                            Preconditions.checkArgument(aggChild.size() == 1
+                                            || aggregateFunction.getDistinctArguments().size() == 1,
                                     "cannot process more than one child in aggregate distinct function: "
                                             + aggregateFunction);
                             AggregateFunction nonDistinct = aggregateFunction
                                     .withDistinctAndChildren(false, ImmutableList.copyOf(aggChild));
-                            return new AggregateExpression(nonDistinct,
-                                    bufferToResultParam, aggregateFunction.child(0));
+                            return new AggregateExpression(nonDistinct, bufferToResultParam, aggregateFunction);
                         } else {
                             Alias alias = nonDistinctAggFunctionToAliasPhase2.get(expr);
                             return new AggregateExpression(aggregateFunction,
@@ -1578,13 +1809,8 @@ public class AggregateStrategies implements ImplementationRuleFactory {
     }
 
     private AggregateFunction tryConvertToMultiDistinct(AggregateFunction function) {
-        if (function instanceof Count && function.isDistinct()) {
-            return new MultiDistinctCount(function.getArgument(0),
-                    function.getArguments().subList(1, function.arity()).toArray(new Expression[0]));
-        } else if (function instanceof Sum && function.isDistinct()) {
-            return new MultiDistinctSum(function.getArgument(0));
-        } else if (function instanceof GroupConcat && function.isDistinct()) {
-            return ((GroupConcat) function).convertToMultiDistinct();
+        if (function instanceof SupportMultiDistinct && function.isDistinct()) {
+            return ((SupportMultiDistinct) function).convertToMultiDistinct();
         }
         return function;
     }
@@ -1622,7 +1848,7 @@ public class AggregateStrategies implements ImplementationRuleFactory {
     }
 
     private boolean containsCountDistinctMultiExpr(LogicalAggregate<? extends Plan> aggregate) {
-        return ExpressionUtils.anyMatch(aggregate.getOutputExpressions(), expr ->
+        return ExpressionUtils.deapAnyMatch(aggregate.getOutputExpressions(), expr ->
                 expr instanceof Count && ((Count) expr).isDistinct() && expr.arity() > 1);
     }
 
@@ -1644,19 +1870,10 @@ public class AggregateStrategies implements ImplementationRuleFactory {
         return connectContext == null || connectContext.getSessionVariable().enablePushDownNoGroupAgg();
     }
 
-    /**
-     * sql:
-     * select count(distinct name), sum(age) from student;
-     * <p>
-     * 4 phase plan
-     * DISTINCT_GLOBAL, BUFFER_TO_RESULT groupBy(), output[count(name), sum(age#5)], [GATHER]
-     * +--DISTINCT_LOCAL, INPUT_TO_BUFFER, groupBy()), output(count(name), partial_sum(age)), hash distribute by name
-     *    +--GLOBAL, BUFFER_TO_BUFFER, groupBy(name), output(name, partial_sum(age)), hash_distribute by name
-     *       +--LOCAL, INPUT_TO_BUFFER, groupBy(name), output(name, partial_sum(age))
-     *          +--scan(name, age)
-     */
     private List<PhysicalHashAggregate<? extends Plan>> fourPhaseAggregateWithDistinct(
-            LogicalAggregate<? extends Plan> logicalAgg, ConnectContext connectContext) {
+            LogicalAggregate<? extends Plan> logicalAgg, ConnectContext connectContext,
+            Function<List<Expression>, RequireProperties> secondPhaseRequireSupplier,
+            Function<LogicalAggregate<? extends Plan>, RequireProperties> fourPhaseRequireSupplier) {
         boolean couldBanned = couldConvertToMulti(logicalAgg);
 
         Set<AggregateFunction> aggregateFunctions = logicalAgg.getAggregateFunctions();
@@ -1691,6 +1908,16 @@ public class AggregateStrategies implements ImplementationRuleFactory {
         boolean maybeUsingStreamAgg = maybeUsingStreamAgg(connectContext, localAggGroupBy);
         List<Expression> partitionExpressions = getHashAggregatePartitionExpressions(logicalAgg);
         RequireProperties requireAny = RequireProperties.of(PhysicalProperties.ANY);
+
+        boolean isGroupByEmptySelectEmpty = localAggGroupBy.isEmpty() && localAggOutput.isEmpty();
+
+        // be not recommend generate an aggregate node with empty group by and empty output,
+        // so add a null int slot to group by slot and output
+        if (isGroupByEmptySelectEmpty) {
+            localAggGroupBy = ImmutableList.of(new NullLiteral(TinyIntType.INSTANCE));
+            localAggOutput = ImmutableList.of(new Alias(new NullLiteral(TinyIntType.INSTANCE)));
+        }
+
         PhysicalHashAggregate<Plan> anyLocalAgg = new PhysicalHashAggregate<>(localAggGroupBy,
                 localAggOutput, Optional.of(partitionExpressions), inputToBufferParam,
                 maybeUsingStreamAgg, Optional.empty(), logicalAgg.getLogicalProperties(),
@@ -1713,16 +1940,21 @@ public class AggregateStrategies implements ImplementationRuleFactory {
                 .addAll(nonDistinctAggFunctionToAliasPhase2.values())
                 .build();
 
-        RequireProperties requireGather = RequireProperties.of(PhysicalProperties.GATHER);
+        // be not recommend generate an aggregate node with empty group by and empty output,
+        // so add a null int slot to group by slot and output
+        if (isGroupByEmptySelectEmpty) {
+            globalAggOutput = ImmutableList.of(new Alias(new NullLiteral(TinyIntType.INSTANCE)));
+        }
 
-        RequireProperties requireDistinctHash = RequireProperties.of(
-                PhysicalProperties.createHash(logicalAgg.getDistinctArguments(), ShuffleType.REQUIRE));
+        RequireProperties secondPhaseRequire = secondPhaseRequireSupplier.apply(localAggGroupBy);
 
         //phase 2
         PhysicalHashAggregate<? extends Plan> anyLocalHashGlobalAgg = new PhysicalHashAggregate<>(
                 localAggGroupBy, globalAggOutput, Optional.of(ImmutableList.copyOf(logicalAgg.getDistinctArguments())),
                 bufferToBufferParam, false, logicalAgg.getLogicalProperties(),
-                requireDistinctHash, anyLocalAgg);
+                secondPhaseRequire, anyLocalAgg);
+
+        boolean shouldDistinctAfterPhase2 = distinctArguments.size() > 1;
 
         // phase 3
         AggregateParam distinctLocalParam = new AggregateParam(
@@ -1737,15 +1969,30 @@ public class AggregateStrategies implements ImplementationRuleFactory {
                         if (expr instanceof AggregateFunction) {
                             AggregateFunction aggregateFunction = (AggregateFunction) expr;
                             if (aggregateFunction.isDistinct()) {
-                                Set<Expression> aggChild = Sets.newHashSet(aggregateFunction.children());
-                                Preconditions.checkArgument(aggChild.size() == 1,
+                                Set<Expression> aggChild = Sets.newLinkedHashSet(aggregateFunction.children());
+                                Preconditions.checkArgument(aggChild.size() == 1
+                                                || aggregateFunction.getDistinctArguments().size() == 1,
                                         "cannot process more than one child in aggregate distinct function: "
                                                 + aggregateFunction);
-                                AggregateFunction nonDistinct = aggregateFunction
-                                        .withDistinctAndChildren(false, ImmutableList.copyOf(aggChild));
-                                AggregateExpression nonDistinctAggExpr = new AggregateExpression(nonDistinct,
-                                        distinctLocalParam, aggregateFunction.child(0));
-                                return nonDistinctAggExpr;
+
+                                AggregateFunction newDistinct;
+                                if (shouldDistinctAfterPhase2) {
+                                    // we use aggregate function to process distinct,
+                                    // so need to change to multi distinct function
+                                    newDistinct = tryConvertToMultiDistinct(
+                                            aggregateFunction.withDistinctAndChildren(
+                                                    true, ImmutableList.copyOf(aggChild))
+                                    );
+                                } else {
+                                    // we use group by to process distinct,
+                                    // so no distinct param in the aggregate function
+                                    newDistinct = aggregateFunction.withDistinctAndChildren(
+                                            false, ImmutableList.copyOf(aggChild));
+                                }
+
+                                AggregateExpression newDistinctAggExpr = new AggregateExpression(
+                                        newDistinct, distinctLocalParam, newDistinct);
+                                return newDistinctAggExpr;
                             } else {
                                 needUpdateSlot.add(aggregateFunction);
                                 Alias alias = nonDistinctAggFunctionToAliasPhase2.get(expr);
@@ -1765,7 +2012,7 @@ public class AggregateStrategies implements ImplementationRuleFactory {
         PhysicalHashAggregate<? extends Plan> distinctLocal = new PhysicalHashAggregate<>(
                 logicalAgg.getGroupByExpressions(), localDistinctOutput, Optional.empty(),
                 distinctLocalParam, false, logicalAgg.getLogicalProperties(),
-                requireDistinctHash, anyLocalHashGlobalAgg);
+                secondPhaseRequire, anyLocalHashGlobalAgg);
 
         //phase 4
         AggregateParam distinctGlobalParam = new AggregateParam(
@@ -1777,15 +2024,24 @@ public class AggregateStrategies implements ImplementationRuleFactory {
                 if (expr instanceof AggregateFunction) {
                     AggregateFunction aggregateFunction = (AggregateFunction) expr;
                     if (aggregateFunction.isDistinct()) {
-                        Set<Expression> aggChild = Sets.newHashSet(aggregateFunction.children());
-                        Preconditions.checkArgument(aggChild.size() == 1,
+                        Set<Expression> aggChild = Sets.newLinkedHashSet(aggregateFunction.children());
+                        Preconditions.checkArgument(aggChild.size() == 1
+                                        || aggregateFunction.getDistinctArguments().size() == 1,
                                 "cannot process more than one child in aggregate distinct function: "
                                         + aggregateFunction);
-                        AggregateFunction nonDistinct = aggregateFunction
-                                .withDistinctAndChildren(false, ImmutableList.copyOf(aggChild));
+                        AggregateFunction newDistinct;
+                        if (shouldDistinctAfterPhase2) {
+                            newDistinct = tryConvertToMultiDistinct(
+                                    aggregateFunction.withDistinctAndChildren(
+                                            true, ImmutableList.copyOf(aggChild))
+                            );
+                        } else {
+                            newDistinct = aggregateFunction
+                                    .withDistinctAndChildren(false, ImmutableList.copyOf(aggChild));
+                        }
                         int idx = logicalAgg.getOutputExpressions().indexOf(outputExpr);
                         Alias localDistinctAlias = (Alias) (localDistinctOutput.get(idx));
-                        return new AggregateExpression(nonDistinct,
+                        return new AggregateExpression(newDistinct,
                                 distinctGlobalParam, localDistinctAlias.toSlot());
                     } else {
                         Alias alias = nonDistinctAggFunctionToAliasPhase3.get(expr);
@@ -1798,10 +2054,12 @@ public class AggregateStrategies implements ImplementationRuleFactory {
             });
             globalDistinctOutput.add(outputExprPhase4);
         }
+
+        RequireProperties fourPhaseRequire = fourPhaseRequireSupplier.apply(logicalAgg);
         PhysicalHashAggregate<? extends Plan> distinctGlobal = new PhysicalHashAggregate<>(
                 logicalAgg.getGroupByExpressions(), globalDistinctOutput, Optional.empty(),
                 distinctGlobalParam, false, logicalAgg.getLogicalProperties(),
-                requireGather, distinctLocal);
+                fourPhaseRequire, distinctLocal);
 
         return ImmutableList.<PhysicalHashAggregate<? extends Plan>>builder()
                 .add(distinctGlobal)
@@ -1814,7 +2072,8 @@ public class AggregateStrategies implements ImplementationRuleFactory {
             if (!func.isDistinct()) {
                 continue;
             }
-            if (!(func instanceof Count || func instanceof Sum || func instanceof GroupConcat)) {
+            if (!(func instanceof Count || func instanceof Sum || func instanceof GroupConcat
+                    || func instanceof Sum0)) {
                 return false;
             }
             if (func.arity() <= 1) {
@@ -1822,7 +2081,7 @@ public class AggregateStrategies implements ImplementationRuleFactory {
             }
             for (int i = 1; i < func.arity(); i++) {
                 // think about group_concat(distinct col_1, ',')
-                if (!func.child(i).getInputSlots().isEmpty()) {
+                if (!(func.child(i) instanceof OrderExpression) && !func.child(i).getInputSlots().isEmpty()) {
                     return false;
                 }
             }

@@ -31,10 +31,17 @@ build_version_prefix="doris"
 build_version_major=0
 build_version_minor=0
 build_version_patch=0
-build_version_rc_version="trunk"
+build_version_hotfix=0
+build_version_rc_version=""
 
-build_version="${build_version_prefix}-${build_version_major}.${build_version_minor}.${build_version_patch}-${build_version_rc_version}"
+build_version="${build_version_prefix}-${build_version_major}.${build_version_minor}.${build_version_patch}"
+if [[ ${build_version_hotfix} -gt 0 ]]; then
+    build_version+=".${build_version_hotfix}"
+fi
+build_version+="-${build_version_rc_version}"
 
+# This version is used to check FeMetaVersion is not changed during release
+build_fe_meta_version=0
 unset LANG
 unset LC_CTYPE
 
@@ -123,6 +130,7 @@ public class Version {
   public static final int DORIS_BUILD_VERSION_MAJOR = ${build_version_major};
   public static final int DORIS_BUILD_VERSION_MINOR = ${build_version_minor};
   public static final int DORIS_BUILD_VERSION_PATCH = ${build_version_patch};
+  public static final int DORIS_BUILD_VERSION_HOTFIX = ${build_version_hotfix};
   public static final String DORIS_BUILD_VERSION_RC_VERSION = "${build_version_rc_version}";
 
   public static final String DORIS_BUILD_VERSION = "${build_version}";
@@ -131,6 +139,7 @@ public class Version {
   public static final String DORIS_BUILD_TIME = "${build_time}";
   public static final String DORIS_BUILD_INFO = "${build_info}";
   public static final String DORIS_JAVA_COMPILE_VERSION = "${java_version_str}";
+  public static final int DORIS_FE_META_VERSION = ${build_fe_meta_version};
 
   public static void main(String[] args) {
     System.out.println("doris_build_version_prefix: " + DORIS_BUILD_VERSION_PREFIX);
@@ -183,6 +192,7 @@ namespace doris {
 #define DORIS_BUILD_VERSION_MAJOR       ${build_version_major};
 #define DORIS_BUILD_VERSION_MINOR       ${build_version_minor};
 #define DORIS_BUILD_VERSION_PATCH       ${build_version_patch};
+#define DORIS_BUILD_VERSION_HOTFIX      ${build_version_hotfix};
 #define DORIS_BUILD_VERSION_RC_VERSION  "${build_version_rc_version}";
 
 #define DORIS_BUILD_VERSION             "${build_version}"
@@ -200,11 +210,12 @@ EOF
 #                      doris cloud version info
 ################################################################################
 
-build_version_prefix="doris_cloud"
-build_version_major=0
-build_version_minor=0
-build_version_patch=0
-build_version_rc_version=""
+# build_version_prefix="doris_cloud"
+# build_version_major=0
+# build_version_minor=0
+# build_version_patch=0
+# build_version_hotfix=0
+# build_version_rc_version=""
 
 if [[ -f /etc/os-release ]]; then
     build_os_version=$(head -n2 </etc/os-release | tr '\n' ' ')
@@ -213,6 +224,10 @@ else
 fi
 
 build_version="${build_version_prefix}-${build_version_major}.${build_version_minor}.${build_version_patch}"
+
+if [[ ${build_version_hotfix} -gt 0 ]]; then
+    build_version+=".${build_version_hotfix}"
+fi
 
 if [[ "${build_version_rc_version}" != "" ]]; then
     build_version=${build_version}"-${build_version_rc_version}"
@@ -244,6 +259,7 @@ namespace doris::cloud {
 #define DORIS_CLOUD_BUILD_VERSION_MAJOR       ${build_version_major}
 #define DORIS_CLOUD_BUILD_VERSION_MINOR       ${build_version_minor}
 #define DORIS_CLOUD_BUILD_VERSION_PATCH       ${build_version_patch}
+#define DORIS_CLOUD_BUILD_VERSION_HOTFIX      ${build_version_hotfix}
 #define DORIS_CLOUD_BUILD_VERSION_RC_VERSION  R"(${build_version_rc_version})"
 
 #define DORIS_CLOUD_BUILD_VERSION             R"(${build_version})"

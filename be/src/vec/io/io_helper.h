@@ -22,6 +22,7 @@
 #include <snappy/snappy.h>
 
 #include <iostream>
+#include <type_traits>
 
 #include "common/exception.h"
 #include "util/binary_cast.hpp"
@@ -45,7 +46,11 @@ static constexpr size_t DEFAULT_MAX_STRING_SIZE = 1073741824; // 1GB
 static constexpr size_t DEFAULT_MAX_JSON_SIZE = 1073741824;   // 1GB
 static constexpr auto WRITE_HELPERS_MAX_INT_WIDTH = 40U;
 
-inline std::string int128_to_string(__int128_t value) {
+inline std::string int128_to_string(int128_t value) {
+    return fmt::format(FMT_COMPILE("{}"), value);
+}
+
+inline std::string int128_to_string(uint128_t value) {
     return fmt::format(FMT_COMPILE("{}"), value);
 }
 
@@ -164,7 +169,9 @@ void read_float_binary(Type& x, BufferReadable& buf) {
     read_pod_binary(x, buf);
 }
 
-inline void read_string_binary(std::string& s, BufferReadable& buf,
+template <typename Type>
+    requires(std::is_same_v<Type, String> || std::is_same_v<Type, PaddedPODArray<UInt8>>)
+inline void read_string_binary(Type& s, BufferReadable& buf,
                                size_t MAX_STRING_SIZE = DEFAULT_MAX_STRING_SIZE) {
     UInt64 size = 0;
     read_var_uint(size, buf);
@@ -174,7 +181,7 @@ inline void read_string_binary(std::string& s, BufferReadable& buf,
     }
 
     s.resize(size);
-    buf.read(s.data(), size);
+    buf.read((char*)s.data(), size);
 }
 
 inline void read_string_binary(StringRef& s, BufferReadable& buf,
@@ -221,7 +228,9 @@ void read_vector_binary(std::vector<Type>& v, BufferReadable& buf,
     }
 }
 
-inline void read_binary(String& x, BufferReadable& buf) {
+template <typename Type>
+    requires(std::is_same_v<Type, String> || std::is_same_v<Type, PaddedPODArray<UInt8>>)
+inline void read_binary(Type& x, BufferReadable& buf) {
     read_string_binary(x, buf);
 }
 
@@ -339,7 +348,7 @@ template <typename T>
 bool read_date_v2_text_impl(T& x, ReadBuffer& buf) {
     static_assert(std::is_same_v<UInt32, T>);
     auto dv = binary_cast<UInt32, DateV2Value<DateV2ValueType>>(x);
-    auto ans = dv.from_date_str(buf.position(), buf.count());
+    auto ans = dv.from_date_str(buf.position(), buf.count(), config::allow_zero_date);
 
     // only to match the is_all_read() check to prevent return null
     buf.position() = buf.end();
@@ -351,7 +360,8 @@ template <typename T>
 bool read_date_v2_text_impl(T& x, ReadBuffer& buf, const cctz::time_zone& local_time_zone) {
     static_assert(std::is_same_v<UInt32, T>);
     auto dv = binary_cast<UInt32, DateV2Value<DateV2ValueType>>(x);
-    auto ans = dv.from_date_str(buf.position(), buf.count(), local_time_zone);
+    auto ans =
+            dv.from_date_str(buf.position(), buf.count(), local_time_zone, config::allow_zero_date);
 
     // only to match the is_all_read() check to prevent return null
     buf.position() = buf.end();
@@ -363,7 +373,7 @@ template <typename T>
 bool read_datetime_v2_text_impl(T& x, ReadBuffer& buf, UInt32 scale = -1) {
     static_assert(std::is_same_v<UInt64, T>);
     auto dv = binary_cast<UInt64, DateV2Value<DateTimeV2ValueType>>(x);
-    auto ans = dv.from_date_str(buf.position(), buf.count(), scale);
+    auto ans = dv.from_date_str(buf.position(), buf.count(), scale, config::allow_zero_date);
 
     // only to match the is_all_read() check to prevent return null
     buf.position() = buf.end();
@@ -376,7 +386,8 @@ bool read_datetime_v2_text_impl(T& x, ReadBuffer& buf, const cctz::time_zone& lo
                                 UInt32 scale = -1) {
     static_assert(std::is_same_v<UInt64, T>);
     auto dv = binary_cast<UInt64, DateV2Value<DateTimeV2ValueType>>(x);
-    auto ans = dv.from_date_str(buf.position(), buf.count(), local_time_zone, scale);
+    auto ans = dv.from_date_str(buf.position(), buf.count(), local_time_zone, scale,
+                                config::allow_zero_date);
 
     // only to match the is_all_read() check to prevent return null
     buf.position() = buf.end();

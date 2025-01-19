@@ -34,15 +34,16 @@
 #include <new>
 #include <queue>
 #include <shared_mutex>
+#include <type_traits>
 
 #include "common/compiler_util.h" // IWYU pragma: keep
 #include "common/config.h"
 #include "common/logging.h"
 #include "common/status.h"
+#include "io/hdfs_builder.h"
 #include "olap/delete_handler.h"
 #include "olap/olap_define.h"
 #include "olap/rowset/pending_rowset_helper.h"
-#include "olap/rowset/rowset_meta.h"
 #include "olap/rowset/rowset_writer.h"
 #include "olap/rowset/rowset_writer_context.h"
 #include "olap/schema.h"
@@ -53,10 +54,11 @@
 #include "olap/txn_manager.h"
 #include "runtime/descriptors.h"
 #include "runtime/exec_env.h"
-#include "util/runtime_profile.h"
 #include "util/time.h"
 #include "vec/core/block.h"
+#include "vec/core/column_with_type_and_name.h"
 #include "vec/data_types/data_type_factory.hpp"
+#include "vec/data_types/data_type_nullable.h"
 #include "vec/exec/format/parquet/vparquet_reader.h"
 #include "vec/exprs/vexpr_context.h"
 #include "vec/functions/simple_function_factory.h"
@@ -95,8 +97,7 @@ Status PushHandler::process_streaming_ingestion(TabletSharedPtr tablet, const TP
             TTabletInfo tablet_info;
             tablet_info.tablet_id = tablet->tablet_id();
             tablet_info.schema_hash = tablet->schema_hash();
-            RETURN_IF_ERROR(
-                    StorageEngine::instance()->tablet_manager()->report_tablet_info(&tablet_info));
+            RETURN_IF_ERROR(_engine.tablet_manager()->report_tablet_info(&tablet_info));
             tablet_info_vec->push_back(tablet_info);
         }
         LOG(INFO) << "process realtime push successfully. "
@@ -118,6 +119,10 @@ Status PushHandler::_do_streaming_ingestion(TabletSharedPtr tablet, const TPushR
     }
 
     std::shared_lock base_migration_rlock(tablet->get_migration_lock(), std::try_to_lock);
+    DBUG_EXECUTE_IF("PushHandler::_do_streaming_ingestion.try_lock_fail", {
+        return Status::Error<TRY_LOCK_FAILED>(
+                "PushHandler::_do_streaming_ingestion get lock failed");
+    })
     if (!base_migration_rlock.owns_lock()) {
         return Status::Error<TRY_LOCK_FAILED>(
                 "PushHandler::_do_streaming_ingestion get lock failed");
@@ -127,8 +132,8 @@ Status PushHandler::_do_streaming_ingestion(TabletSharedPtr tablet, const TPushR
     load_id.set_lo(0);
     {
         std::lock_guard<std::mutex> push_lock(tablet->get_push_lock());
-        RETURN_IF_ERROR(StorageEngine::instance()->txn_manager()->prepare_txn(
-                request.partition_id, *tablet, request.transaction_id, load_id));
+        RETURN_IF_ERROR(_engine.txn_manager()->prepare_txn(request.partition_id, *tablet,
+                                                           request.transaction_id, load_id));
     }
 
     // not call validate request here, because realtime load does not
@@ -160,9 +165,23 @@ Status PushHandler::_do_streaming_ingestion(TabletSharedPtr tablet, const TPushR
     // check if version number exceed limit
     if (tablet->exceed_version_limit(config::max_tablet_version_num)) {
         return Status::Status::Error<TOO_MANY_VERSION>(
-                "failed to push data. version count: {}, exceed limit: {}, tablet: {}",
+                "failed to push data. version count: {}, exceed limit: {}, tablet: {}. Please "
+                "reduce the frequency of loading data or adjust the max_tablet_version_num in "
+                "be.conf to a larger value.",
                 tablet->version_count(), config::max_tablet_version_num, tablet->tablet_id());
     }
+
+    int version_count = tablet->version_count() + tablet->stale_version_count();
+    if (tablet->avg_rs_meta_serialize_size() * version_count >
+        config::tablet_meta_serialize_size_limit) {
+        return Status::Error<TOO_MANY_VERSION>(
+                "failed to init rowset builder. meta serialize size : {}, exceed limit: {}, "
+                "tablet: {}. Please reduce the frequency of loading data or adjust the "
+                "max_tablet_version_num in be.conf to a larger value.",
+                tablet->avg_rs_meta_serialize_size() * version_count,
+                config::tablet_meta_serialize_size_limit, tablet->tablet_id());
+    }
+
     auto tablet_schema = std::make_shared<TabletSchema>();
     tablet_schema->copy_from(*tablet->tablet_schema());
     if (!request.columns_desc.empty() && request.columns_desc[0].col_unique_id >= 0) {
@@ -181,11 +200,11 @@ Status PushHandler::_do_streaming_ingestion(TabletSharedPtr tablet, const TPushR
                      << ", tablet=" << tablet->tablet_id()
                      << ", transaction_id=" << request.transaction_id;
 
-        Status rollback_status = StorageEngine::instance()->txn_manager()->rollback_txn(
-                request.partition_id, *tablet, request.transaction_id);
+        Status rollback_status = _engine.txn_manager()->rollback_txn(request.partition_id, *tablet,
+                                                                     request.transaction_id);
         // has to check rollback status to ensure not delete a committed rowset
         if (rollback_status.ok()) {
-            StorageEngine::instance()->add_unused_rowset(rowset_to_add);
+            _engine.add_unused_rowset(rowset_to_add);
         }
         return res;
     }
@@ -197,7 +216,7 @@ Status PushHandler::_do_streaming_ingestion(TabletSharedPtr tablet, const TPushR
         del_preds.pop();
     }
     // Transfer ownership of `PendingRowsetGuard` to `TxnManager`
-    Status commit_status = StorageEngine::instance()->txn_manager()->commit_txn(
+    Status commit_status = _engine.txn_manager()->commit_txn(
             request.partition_id, *tablet, request.transaction_id, load_id, rowset_to_add,
             std::move(_pending_rs_guard), false);
     if (!commit_status.ok() && !commit_status.is<PUSH_TRANSACTION_ALREADY_EXIST>()) {
@@ -229,11 +248,9 @@ Status PushHandler::_convert_v2(TabletSharedPtr cur_tablet, RowsetSharedPtr* cur
         context.rowset_state = PREPARED;
         context.segments_overlap = OVERLAP_UNKNOWN;
         context.tablet_schema = tablet_schema;
-        context.original_tablet_schema = tablet_schema;
         context.newest_write_timestamp = UnixSeconds();
         auto rowset_writer = DORIS_TRY(cur_tablet->create_rowset_writer(context, false));
-        _pending_rs_guard =
-                StorageEngine::instance()->pending_local_rowsets().add(context.rowset_id);
+        _pending_rs_guard = _engine.pending_local_rowsets().add(context.rowset_id);
 
         // 2. Init PushBrokerReader to read broker file if exist,
         //    in case of empty push this will be skipped.
@@ -326,7 +343,7 @@ PushBrokerReader::PushBrokerReader(const Schema* schema, const TBrokerScanRange&
           _params(t_scan_range.params),
           _ranges(t_scan_range.ranges) {
     // change broker params to file params
-    if (0 == _ranges.size()) {
+    if (_ranges.empty()) {
         return;
     }
     _file_params.format_type = _ranges[0].format_type;
@@ -337,10 +354,14 @@ PushBrokerReader::PushBrokerReader(const Schema* schema, const TBrokerScanRange&
     _file_params.expr_of_dest_slot = _params.expr_of_dest_slot;
     _file_params.dest_sid_to_src_sid_without_trans = _params.dest_sid_to_src_sid_without_trans;
     _file_params.strict_mode = _params.strict_mode;
-    _file_params.__isset.broker_addresses = true;
-    _file_params.broker_addresses = t_scan_range.broker_addresses;
+    if (_ranges[0].file_type == TFileType::FILE_HDFS) {
+        _file_params.hdfs_params = parse_properties(_params.properties);
+    } else {
+        _file_params.__isset.broker_addresses = true;
+        _file_params.broker_addresses = t_scan_range.broker_addresses;
+    }
 
-    for (int i = 0; i < _ranges.size(); ++i) {
+    for (const auto& range : _ranges) {
         TFileRangeDesc file_range;
         // TODO(cmy): in previous implementation, the file_type is set in _file_params
         // and it use _ranges[0].file_type.
@@ -348,12 +369,12 @@ PushBrokerReader::PushBrokerReader(const Schema* schema, const TBrokerScanRange&
         // file_type.
         // Because I don't know if other range has this field, so just keep it same as before.
         file_range.__set_file_type(_ranges[0].file_type);
-        file_range.__set_load_id(_ranges[i].load_id);
-        file_range.__set_path(_ranges[i].path);
-        file_range.__set_start_offset(_ranges[i].start_offset);
-        file_range.__set_size(_ranges[i].size);
-        file_range.__set_file_size(_ranges[i].file_size);
-        file_range.__set_columns_from_path(_ranges[i].columns_from_path);
+        file_range.__set_load_id(range.load_id);
+        file_range.__set_path(range.path);
+        file_range.__set_start_offset(range.start_offset);
+        file_range.__set_size(range.size);
+        file_range.__set_file_size(range.file_size);
+        file_range.__set_columns_from_path(range.columns_from_path);
 
         _file_ranges.push_back(file_range);
     }
@@ -372,15 +393,17 @@ Status PushBrokerReader::init() {
     fragment_params.protocol_version = PaloInternalServiceVersion::V1;
     TQueryOptions query_options;
     TQueryGlobals query_globals;
+    std::shared_ptr<MemTrackerLimiter> tracker = MemTrackerLimiter::create_shared(
+            MemTrackerLimiter::Type::LOAD,
+            fmt::format("PushBrokerReader:dummy_id={}", print_id(dummy_id)));
     _runtime_state = RuntimeState::create_unique(params, query_options, query_globals,
-                                                 ExecEnv::GetInstance());
+                                                 ExecEnv::GetInstance(), nullptr, tracker);
     DescriptorTbl* desc_tbl = nullptr;
     Status status = DescriptorTbl::create(_runtime_state->obj_pool(), _t_desc_tbl, &desc_tbl);
     if (UNLIKELY(!status.ok())) {
         return Status::Error<PUSH_INIT_ERROR>("Failed to create descriptor table, msg: {}", status);
     }
     _runtime_state->set_desc_tbl(desc_tbl);
-    _runtime_state->init_mem_trackers(dummy_id, "PushBrokerReader");
     _runtime_profile = _runtime_state->runtime_profile();
     _runtime_profile->set_name("PushBrokerReader");
 
@@ -390,8 +413,8 @@ Status PushBrokerReader::init() {
     _io_ctx->query_id = &_runtime_state->query_id();
 
     auto slot_descs = desc_tbl->get_tuple_descriptor(0)->slots();
-    for (int i = 0; i < slot_descs.size(); i++) {
-        _all_col_names.push_back(to_lower((slot_descs[i]->col_name())));
+    for (auto& slot_desc : slot_descs) {
+        _all_col_names.push_back(to_lower((slot_desc->col_name())));
     }
 
     RETURN_IF_ERROR(_init_expr_ctxes());
@@ -454,7 +477,7 @@ Status PushBrokerReader::_init_src_block() {
 }
 
 Status PushBrokerReader::_cast_to_input_block() {
-    size_t idx = 0;
+    uint32_t idx = 0;
     for (auto& slot_desc : _src_slot_descs) {
         if (_name_to_col_type.find(slot_desc->col_name()) == _name_to_col_type.end()) {
             continue;
@@ -465,17 +488,36 @@ Status PushBrokerReader::_cast_to_input_block() {
         auto& arg = _src_block_ptr->get_by_name(slot_desc->col_name());
         // remove nullable here, let the get_function decide whether nullable
         auto return_type = slot_desc->get_data_type_ptr();
-        vectorized::ColumnsWithTypeAndName arguments {
-                arg,
-                {vectorized::DataTypeString().create_column_const(
-                         arg.column->size(), remove_nullable(return_type)->get_family_name()),
-                 std::make_shared<vectorized::DataTypeString>(), ""}};
-        auto func_cast = vectorized::SimpleFunctionFactory::instance().get_function(
-                "CAST", arguments, return_type);
         idx = _src_block_name_to_idx[slot_desc->col_name()];
-        RETURN_IF_ERROR(
-                func_cast->execute(nullptr, *_src_block_ptr, {idx}, idx, arg.column->size()));
-        _src_block_ptr->get_by_position(idx).type = std::move(return_type);
+        // bitmap convert：src -> to_base64 -> bitmap_from_base64
+        if (slot_desc->type().is_bitmap_type()) {
+            auto base64_return_type = vectorized::DataTypeFactory::instance().create_data_type(
+                    vectorized::DataTypeString().get_type_as_type_descriptor(),
+                    slot_desc->is_nullable());
+            auto func_to_base64 = vectorized::SimpleFunctionFactory::instance().get_function(
+                    "to_base64", {arg}, base64_return_type);
+            RETURN_IF_ERROR(func_to_base64->execute(nullptr, *_src_block_ptr, {idx}, idx,
+                                                    arg.column->size()));
+            _src_block_ptr->get_by_position(idx).type = std::move(base64_return_type);
+            auto& arg_base64 = _src_block_ptr->get_by_name(slot_desc->col_name());
+            auto func_bitmap_from_base64 =
+                    vectorized::SimpleFunctionFactory::instance().get_function(
+                            "bitmap_from_base64", {arg_base64}, return_type);
+            RETURN_IF_ERROR(func_bitmap_from_base64->execute(nullptr, *_src_block_ptr, {idx}, idx,
+                                                             arg_base64.column->size()));
+            _src_block_ptr->get_by_position(idx).type = std::move(return_type);
+        } else {
+            vectorized::ColumnsWithTypeAndName arguments {
+                    arg,
+                    {vectorized::DataTypeString().create_column_const(
+                             arg.column->size(), remove_nullable(return_type)->get_family_name()),
+                     std::make_shared<vectorized::DataTypeString>(), ""}};
+            auto func_cast = vectorized::SimpleFunctionFactory::instance().get_function(
+                    "CAST", arguments, return_type);
+            RETURN_IF_ERROR(
+                    func_cast->execute(nullptr, *_src_block_ptr, {idx}, idx, arg.column->size()));
+            _src_block_ptr->get_by_position(idx).type = std::move(return_type);
+        }
     }
     return Status::OK();
 }
@@ -501,7 +543,7 @@ Status PushBrokerReader::_convert_to_output_block(vectorized::Block* block) {
         column_ptr = _src_block.get_by_position(result_column_id).column;
         // column_ptr maybe a ColumnConst, convert it to a normal column
         column_ptr = column_ptr->convert_to_full_column_if_const();
-        DCHECK(column_ptr != nullptr);
+        DCHECK(column_ptr);
 
         // because of src_slot_desc is always be nullable, so the column_ptr after do dest_expr
         // is likely to be nullable
@@ -648,17 +690,6 @@ Status PushBrokerReader::_get_next_reader() {
     _cur_reader_eof = false;
 
     return Status::OK();
-}
-
-std::string PushHandler::_debug_version_list(const Versions& versions) const {
-    std::ostringstream txt;
-    txt << "Versions: ";
-
-    for (Versions::const_iterator it = versions.begin(); it != versions.end(); ++it) {
-        txt << "[" << it->first << "~" << it->second << "],";
-    }
-
-    return txt.str();
 }
 
 } // namespace doris

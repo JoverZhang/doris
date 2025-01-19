@@ -61,7 +61,9 @@ import org.apache.doris.nereids.trees.plans.physical.PhysicalWindow;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
 import org.apache.doris.nereids.types.DataType;
 import org.apache.doris.nereids.util.JoinUtils;
+import org.apache.doris.nereids.util.Utils;
 import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.qe.SessionVariable;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
@@ -69,6 +71,7 @@ import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -97,7 +100,16 @@ public class ChildOutputPropertyDeriver extends PlanVisitor<PhysicalProperties, 
 
     @Override
     public PhysicalProperties visit(Plan plan, PlanContext context) {
-        return PhysicalProperties.ANY;
+        if (childrenOutputProperties.isEmpty()) {
+            return PhysicalProperties.ANY;
+        } else {
+            DistributionSpec firstChildSpec = childrenOutputProperties.get(0).getDistributionSpec();
+            if (firstChildSpec instanceof DistributionSpecHash) {
+                return PhysicalProperties.createAnyFromHash((DistributionSpecHash) firstChildSpec);
+            } else {
+                return PhysicalProperties.ANY;
+            }
+        }
     }
 
     /* ********************************************************************************************
@@ -116,7 +128,7 @@ public class ChildOutputPropertyDeriver extends PlanVisitor<PhysicalProperties, 
     @Override
     public PhysicalProperties visitPhysicalCTEConsumer(
             PhysicalCTEConsumer cteConsumer, PlanContext context) {
-        Preconditions.checkState(childrenOutputProperties.size() == 0);
+        Preconditions.checkState(childrenOutputProperties.isEmpty(), "cte consumer should be leaf node");
         return PhysicalProperties.MUST_SHUFFLE;
     }
 
@@ -247,8 +259,30 @@ public class ChildOutputPropertyDeriver extends PlanVisitor<PhysicalProperties, 
 
         // broadcast
         if (rightOutputProperty.getDistributionSpec() instanceof DistributionSpecReplicated) {
-            DistributionSpec parentDistributionSpec = leftOutputProperty.getDistributionSpec();
-            return new PhysicalProperties(parentDistributionSpec);
+            DistributionSpec leftDistributionSpec = leftOutputProperty.getDistributionSpec();
+            // if left side is hash distribute and the key can satisfy the join keys, then mock
+            // a right side hash spec with the corresponding join keys, to filling the returning spec
+            // with refined EquivalenceExprIds.
+            if (leftDistributionSpec instanceof DistributionSpecHash
+                    && !(hashJoin.isMarkJoin() && hashJoin.getHashJoinConjuncts().isEmpty())
+                    && !hashJoin.getHashConjunctsExprIds().first.isEmpty()
+                    && !hashJoin.getHashConjunctsExprIds().second.isEmpty()
+                    && hashJoin.getHashConjunctsExprIds().first.size()
+                        == hashJoin.getHashConjunctsExprIds().second.size()
+                    && leftDistributionSpec.satisfy(
+                            new DistributionSpecHash(hashJoin.getHashConjunctsExprIds().first, ShuffleType.REQUIRE))) {
+                DistributionSpecHash mockedRightHashSpec = mockAnotherSideSpecFromConjuncts(
+                        hashJoin, (DistributionSpecHash) leftDistributionSpec);
+                if (SessionVariable.canUseNereidsDistributePlanner()) {
+                    return computeShuffleJoinOutputProperties(hashJoin,
+                            (DistributionSpecHash) leftDistributionSpec, mockedRightHashSpec);
+                } else {
+                    return legacyComputeShuffleJoinOutputProperties(hashJoin,
+                            (DistributionSpecHash) leftDistributionSpec, mockedRightHashSpec);
+                }
+            } else {
+                return new PhysicalProperties(leftDistributionSpec);
+            }
         }
 
         // shuffle
@@ -256,32 +290,10 @@ public class ChildOutputPropertyDeriver extends PlanVisitor<PhysicalProperties, 
                 && rightOutputProperty.getDistributionSpec() instanceof DistributionSpecHash) {
             DistributionSpecHash leftHashSpec = (DistributionSpecHash) leftOutputProperty.getDistributionSpec();
             DistributionSpecHash rightHashSpec = (DistributionSpecHash) rightOutputProperty.getDistributionSpec();
-
-            switch (hashJoin.getJoinType()) {
-                case INNER_JOIN:
-                case CROSS_JOIN:
-                    return new PhysicalProperties(DistributionSpecHash.merge(
-                            leftHashSpec, rightHashSpec, leftHashSpec.getShuffleType()));
-                case LEFT_SEMI_JOIN:
-                case LEFT_ANTI_JOIN:
-                case NULL_AWARE_LEFT_ANTI_JOIN:
-                case LEFT_OUTER_JOIN:
-                    return new PhysicalProperties(leftHashSpec);
-                case RIGHT_SEMI_JOIN:
-                case RIGHT_ANTI_JOIN:
-                case RIGHT_OUTER_JOIN:
-                    if (JoinUtils.couldColocateJoin(leftHashSpec, rightHashSpec)) {
-                        return new PhysicalProperties(rightHashSpec);
-                    } else {
-                        // retain left shuffle type, since coordinator use left most node to schedule fragment
-                        // forbid colocate join, since right table already shuffle
-                        return new PhysicalProperties(rightHashSpec.withShuffleTypeAndForbidColocateJoin(
-                                leftHashSpec.getShuffleType()));
-                    }
-                case FULL_OUTER_JOIN:
-                    return PhysicalProperties.ANY;
-                default:
-                    throw new AnalysisException("unknown join type " + hashJoin.getJoinType());
+            if (SessionVariable.canUseNereidsDistributePlanner()) {
+                return computeShuffleJoinOutputProperties(hashJoin, leftHashSpec, rightHashSpec);
+            } else {
+                return legacyComputeShuffleJoinOutputProperties(hashJoin, leftHashSpec, rightHashSpec);
             }
         }
 
@@ -348,7 +360,33 @@ public class ChildOutputPropertyDeriver extends PlanVisitor<PhysicalProperties, 
     @Override
     public PhysicalProperties visitPhysicalRepeat(PhysicalRepeat<? extends Plan> repeat, PlanContext context) {
         Preconditions.checkState(childrenOutputProperties.size() == 1);
-        return PhysicalProperties.ANY.withOrderSpec(childrenOutputProperties.get(0).getOrderSpec());
+        DistributionSpec childDistributionSpec = childrenOutputProperties.get(0).getDistributionSpec();
+        PhysicalProperties output = childrenOutputProperties.get(0);
+        if (childDistributionSpec instanceof DistributionSpecHash) {
+            DistributionSpecHash distributionSpecHash = (DistributionSpecHash) childDistributionSpec;
+            List<List<Expression>> groupingSets = repeat.getGroupingSets();
+            if (!groupingSets.isEmpty()) {
+                Set<Expression> intersectGroupingKeys = Utils.fastToImmutableSet(groupingSets.get(0));
+                for (int i = 1; i < groupingSets.size() && !intersectGroupingKeys.isEmpty(); i++) {
+                    intersectGroupingKeys = Sets.intersection(
+                            intersectGroupingKeys, Utils.fastToImmutableSet(groupingSets.get(i))
+                    );
+                }
+                List<ExprId> orderedShuffledColumns = distributionSpecHash.getOrderedShuffledColumns();
+                Set<ExprId> intersectGroupingKeysId = new HashSet<>();
+                for (Expression key : intersectGroupingKeys) {
+                    if (!(key instanceof SlotReference)) {
+                        break;
+                    }
+                    intersectGroupingKeysId.add(((SlotReference) key).getExprId());
+                }
+                if (intersectGroupingKeysId.containsAll(orderedShuffledColumns)) {
+                    return childrenOutputProperties.get(0);
+                }
+            }
+            output = PhysicalProperties.createAnyFromHash((DistributionSpecHash) childDistributionSpec);
+        }
+        return output.withOrderSpec(childrenOutputProperties.get(0).getOrderSpec());
     }
 
     @Override
@@ -386,7 +424,12 @@ public class ChildOutputPropertyDeriver extends PlanVisitor<PhysicalProperties, 
         for (int i = 0; i < childrenDistribution.size(); i++) {
             DistributionSpec childDistribution = childrenDistribution.get(i);
             if (!(childDistribution instanceof DistributionSpecHash)) {
-                return PhysicalProperties.ANY;
+                if (i != 0) {
+                    // NOTICE: if come here, the first child output must be DistributionSpecHash
+                    return PhysicalProperties.createAnyFromHash((DistributionSpecHash) childrenDistribution.get(0));
+                } else {
+                    return new PhysicalProperties(childDistribution);
+                }
             }
             DistributionSpecHash distributionSpecHash = (DistributionSpecHash) childDistribution;
             int[] offsetsOfCurrentChild = new int[distributionSpecHash.getOrderedShuffledColumns().size()];
@@ -396,7 +439,8 @@ public class ChildOutputPropertyDeriver extends PlanVisitor<PhysicalProperties, 
                 if (offset >= 0) {
                     offsetsOfCurrentChild[offset] = j;
                 } else {
-                    return PhysicalProperties.ANY;
+                    // NOTICE: if come here, the first child output must be DistributionSpecHash
+                    return PhysicalProperties.createAnyFromHash((DistributionSpecHash) childrenDistribution.get(0));
                 }
             }
             if (offsetsOfFirstChild == null) {
@@ -404,7 +448,8 @@ public class ChildOutputPropertyDeriver extends PlanVisitor<PhysicalProperties, 
                 offsetsOfFirstChild = offsetsOfCurrentChild;
             } else if (!Arrays.equals(offsetsOfFirstChild, offsetsOfCurrentChild)
                     || firstType != ((DistributionSpecHash) childDistribution).getShuffleType()) {
-                return PhysicalProperties.ANY;
+                // NOTICE: if come here, the first child output must be DistributionSpecHash
+                return PhysicalProperties.createAnyFromHash((DistributionSpecHash) childrenDistribution.get(0));
             }
         }
         // bucket
@@ -422,7 +467,7 @@ public class ChildOutputPropertyDeriver extends PlanVisitor<PhysicalProperties, 
         } else {
             // current be could not run const expr on appropriate node,
             // so if we have constant exprs on union, the output of union always any
-            return PhysicalProperties.ANY;
+            return visit(union, context);
         }
     }
 
@@ -444,6 +489,126 @@ public class ChildOutputPropertyDeriver extends PlanVisitor<PhysicalProperties, 
         return childrenOutputProperties.get(0);
     }
 
+    private PhysicalProperties computeShuffleJoinOutputProperties(
+            PhysicalHashJoin<? extends Plan, ? extends Plan> hashJoin,
+            DistributionSpecHash leftHashSpec, DistributionSpecHash rightHashSpec) {
+
+        ShuffleSide shuffleSide = computeShuffleSide(leftHashSpec, rightHashSpec);
+
+        ShuffleType outputShuffleType = shuffleSide == ShuffleSide.LEFT
+                ? rightHashSpec.getShuffleType() : leftHashSpec.getShuffleType();
+
+        switch (hashJoin.getJoinType()) {
+            case INNER_JOIN:
+            case CROSS_JOIN:
+                if (shuffleSide == ShuffleSide.LEFT) {
+                    return new PhysicalProperties(
+                            DistributionSpecHash.merge(rightHashSpec, leftHashSpec, outputShuffleType)
+                    );
+                } else {
+                    return new PhysicalProperties(
+                            DistributionSpecHash.merge(leftHashSpec, rightHashSpec, outputShuffleType)
+                    );
+                }
+            case LEFT_SEMI_JOIN:
+            case LEFT_ANTI_JOIN:
+            case NULL_AWARE_LEFT_ANTI_JOIN:
+            case LEFT_OUTER_JOIN:
+                if (shuffleSide == ShuffleSide.LEFT) {
+                    return new PhysicalProperties(
+                            leftHashSpec.withShuffleTypeAndForbidColocateJoin(outputShuffleType)
+                    );
+                } else {
+                    return new PhysicalProperties(leftHashSpec);
+                }
+            case RIGHT_SEMI_JOIN:
+            case RIGHT_ANTI_JOIN:
+            case RIGHT_OUTER_JOIN:
+                if (JoinUtils.couldColocateJoin(leftHashSpec, rightHashSpec, hashJoin.getHashJoinConjuncts())) {
+                    return new PhysicalProperties(rightHashSpec);
+                } else {
+                    // retain left shuffle type, since coordinator use left most node to schedule fragment
+                    // forbid colocate join, since right table already shuffle
+                    return new PhysicalProperties(rightHashSpec.withShuffleTypeAndForbidColocateJoin(
+                            leftHashSpec.getShuffleType()));
+                }
+            case FULL_OUTER_JOIN:
+                return PhysicalProperties.createAnyFromHash(leftHashSpec, rightHashSpec);
+            default:
+                throw new AnalysisException("unknown join type " + hashJoin.getJoinType());
+        }
+    }
+
+    private ShuffleSide computeShuffleSide(DistributionSpecHash leftHashSpec, DistributionSpecHash rightHashSpec) {
+        ShuffleType leftShuffleType = leftHashSpec.getShuffleType();
+        ShuffleType rightShuffleType = rightHashSpec.getShuffleType();
+        switch (leftShuffleType) {
+            case EXECUTION_BUCKETED:
+            case STORAGE_BUCKETED:
+                return rightShuffleType == ShuffleType.NATURAL ? ShuffleSide.LEFT : ShuffleSide.BOTH;
+            case NATURAL:
+                return rightShuffleType == ShuffleType.NATURAL ? ShuffleSide.NONE : ShuffleSide.RIGHT;
+            default:
+        }
+        throw new IllegalStateException(
+                "Illegal join with wrong distribution, left: " + leftShuffleType + ", right: " + rightShuffleType);
+    }
+
+    private PhysicalProperties legacyComputeShuffleJoinOutputProperties(
+            PhysicalHashJoin<? extends Plan, ? extends Plan> hashJoin,
+            DistributionSpecHash leftHashSpec, DistributionSpecHash rightHashSpec) {
+        switch (hashJoin.getJoinType()) {
+            case INNER_JOIN:
+            case CROSS_JOIN:
+                return new PhysicalProperties(DistributionSpecHash.merge(
+                        leftHashSpec, rightHashSpec, leftHashSpec.getShuffleType()));
+            case LEFT_SEMI_JOIN:
+            case LEFT_ANTI_JOIN:
+            case NULL_AWARE_LEFT_ANTI_JOIN:
+            case LEFT_OUTER_JOIN:
+                return new PhysicalProperties(leftHashSpec);
+            case RIGHT_SEMI_JOIN:
+            case RIGHT_ANTI_JOIN:
+            case RIGHT_OUTER_JOIN:
+                if (JoinUtils.couldColocateJoin(leftHashSpec, rightHashSpec, hashJoin.getHashJoinConjuncts())) {
+                    return new PhysicalProperties(rightHashSpec);
+                } else {
+                    // retain left shuffle type, since coordinator use left most node to schedule fragment
+                    // forbid colocate join, since right table already shuffle
+                    return new PhysicalProperties(rightHashSpec.withShuffleTypeAndForbidColocateJoin(
+                            leftHashSpec.getShuffleType()));
+                }
+            case FULL_OUTER_JOIN:
+                return PhysicalProperties.createAnyFromHash(leftHashSpec);
+            default:
+                throw new AnalysisException("unknown join type " + hashJoin.getJoinType());
+        }
+    }
+
+    private DistributionSpecHash mockAnotherSideSpecFromConjuncts(
+            PhysicalHashJoin<? extends Plan, ? extends Plan> hashJoin, DistributionSpecHash oneSideSpec) {
+        List<ExprId> leftExprIds = hashJoin.getHashConjunctsExprIds().first;
+        List<ExprId> rightExprIds = hashJoin.getHashConjunctsExprIds().second;
+        Preconditions.checkState(!leftExprIds.isEmpty() && !rightExprIds.isEmpty()
+                && leftExprIds.size() == rightExprIds.size(), "invalid hash join conjuncts");
+        List<ExprId> anotherSideOrderedExprIds = Lists.newArrayList();
+        for (ExprId exprId : oneSideSpec.getOrderedShuffledColumns()) {
+            int index = leftExprIds.indexOf(exprId);
+            if (index == -1) {
+                Set<ExprId> equivalentExprIds = oneSideSpec.getEquivalenceExprIdsOf(exprId);
+                for (ExprId id : equivalentExprIds) {
+                    index = leftExprIds.indexOf(id);
+                    if (index >= 0) {
+                        break;
+                    }
+                }
+                Preconditions.checkState(index >= 0, "can't find exprId in equivalence set");
+            }
+            anotherSideOrderedExprIds.add(rightExprIds.get(index));
+        }
+        return new DistributionSpecHash(anotherSideOrderedExprIds, oneSideSpec.getShuffleType());
+    }
+
     private boolean isSameHashValue(DataType originType, DataType castType) {
         if (originType.isStringLikeType() && (castType.isVarcharType() || castType.isStringType())
                 && (castType.width() >= originType.width() || castType.width() < 0)) {
@@ -451,5 +616,9 @@ public class ChildOutputPropertyDeriver extends PlanVisitor<PhysicalProperties, 
         } else {
             return false;
         }
+    }
+
+    private enum ShuffleSide {
+        LEFT, RIGHT, BOTH, NONE
     }
 }

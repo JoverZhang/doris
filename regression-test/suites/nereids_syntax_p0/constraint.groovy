@@ -61,21 +61,55 @@ suite("show_constraint") {
     alter table t2 add constraint pk primary key (id)
     """
 
+    order_qt_add_primary """
+    show constraints from t1;
+    """
+
     sql """
     alter table t1 add constraint uk unique (id)
     """
 
-    sql """
-    alter table t1 add constraint fk1 foreign key (id) references t1(id)
-    """
-    sql """
-    alter table t1 add constraint fk2 foreign key (id) references t2(id)
-    """
-
-    qt_show_constrait """
+    order_qt_add_unique """
     show constraints from t1;
     """
-    qt_show_constrait """
+
+    sql """
+    alter table t1 add constraint fk1 foreign key (id) references t2(id)
+    """
+    sql """
+    alter table t2 add constraint fk2 foreign key (id) references t1(id)
+    """
+
+    order_qt_add_foreign """
+    show constraints from t1;
+    """
+
+    sql """
+    alter table t1 drop constraint uk
+    """
+
+    order_qt_drop_uk """
+    show constraints from t1;
+    """
+
+    sql """
+    alter table t1 drop constraint fk1
+    """
+
+    order_qt_drop_fk """
+    show constraints from t1;
+    """
+
+    sql """
+    alter table t1 drop constraint pk
+    """
+
+    order_qt_drop_pk """
+    show constraints from t1;
+    """
+
+    order_qt_drop_fk_cascades """
     show constraints from t2;
     """
+
 }

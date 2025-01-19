@@ -17,54 +17,24 @@
 
 #pragma once
 
-#include <stdint.h>
-
 #include <cstdint>
 
 #include "operator.h"
-#include "pipeline/pipeline_x/operator.h"
+#include "pipeline/common/partition_sort_utils.h"
 #include "vec/common/sort/partition_sorter.h"
-#include "vec/exec/vpartition_sort_node.h"
 
-namespace doris {
-class ExecNode;
-
-namespace pipeline {
-
-class PartitionSortSinkOperatorBuilder final
-        : public OperatorBuilder<vectorized::VPartitionSortNode> {
-public:
-    PartitionSortSinkOperatorBuilder(int32_t id, ExecNode* sort_node)
-            : OperatorBuilder(id, "PartitionSortSinkOperator", sort_node) {}
-
-    bool is_sink() const override { return true; }
-
-    OperatorPtr build_operator() override;
-};
-
-class PartitionSortSinkOperator final : public StreamingOperator<vectorized::VPartitionSortNode> {
-public:
-    PartitionSortSinkOperator(OperatorBuilderBase* operator_builder, ExecNode* sort_node)
-            : StreamingOperator(operator_builder, sort_node) {};
-
-    bool can_write() override { return true; }
-};
-
-class PartitionSortSinkDependency final : public Dependency {
-public:
-    using SharedState = PartitionSortNodeSharedState;
-    PartitionSortSinkDependency(int id, int node_id, QueryContext* query_ctx)
-            : Dependency(id, node_id, "PartitionSortSinkDependency", true, query_ctx) {}
-    ~PartitionSortSinkDependency() override = default;
-};
+namespace doris::pipeline {
+#include "common/compile_check_begin.h"
 
 class PartitionSortSinkOperatorX;
-class PartitionSortSinkLocalState : public PipelineXSinkLocalState<PartitionSortSinkDependency> {
+class PartitionSortSinkLocalState : public PipelineXSinkLocalState<PartitionSortNodeSharedState> {
     ENABLE_FACTORY_CREATOR(PartitionSortSinkLocalState);
 
 public:
     PartitionSortSinkLocalState(DataSinkOperatorXBase* parent, RuntimeState* state)
-            : PipelineXSinkLocalState<PartitionSortSinkDependency>(parent, state) {}
+            : PipelineXSinkLocalState<PartitionSortNodeSharedState>(parent, state),
+              _partitioned_data(std::make_unique<PartitionedHashMapVariants>()),
+              _agg_arena_pool(std::make_unique<vectorized::Arena>()) {}
 
     Status init(RuntimeState* state, LocalSinkStateInfo& info) override;
 
@@ -74,26 +44,34 @@ private:
     // Expressions and parameters used for build _sort_description
     vectorized::VSortExecExprs _vsort_exec_exprs;
     vectorized::VExprContextSPtrs _partition_expr_ctxs;
-    int64_t child_input_rows = 0;
-    std::vector<vectorized::PartitionDataPtr> _value_places;
+    int64_t _sorted_partition_input_rows = 0;
+    std::vector<PartitionDataPtr> _value_places;
     int _num_partition = 0;
     std::vector<const vectorized::IColumn*> _partition_columns;
-    std::unique_ptr<vectorized::PartitionedHashMapVariants> _partitioned_data;
+    std::unique_ptr<PartitionedHashMapVariants> _partitioned_data;
     std::unique_ptr<vectorized::Arena> _agg_arena_pool;
     int _partition_exprs_num = 0;
+    std::shared_ptr<PartitionSortInfo> _partition_sort_info = nullptr;
+    TPartTopNPhase::type _topn_phase;
+    bool _is_need_passthrough = false;
 
     RuntimeProfile::Counter* _build_timer = nullptr;
     RuntimeProfile::Counter* _emplace_key_timer = nullptr;
     RuntimeProfile::Counter* _selector_block_timer = nullptr;
-
+    RuntimeProfile::Counter* _sorted_data_timer = nullptr;
     RuntimeProfile::Counter* _hash_table_size_counter = nullptr;
-    void _init_hash_method();
+    RuntimeProfile::Counter* _passthrough_rows_counter = nullptr;
+    RuntimeProfile::Counter* _sorted_partition_input_rows_counter = nullptr;
+    RuntimeProfile::Counter* _hash_table_memory_usage = nullptr;
+    RuntimeProfile::HighWaterMarkCounter* _serialize_key_arena_memory_usage = nullptr;
+    Status _init_hash_method();
+    bool check_whether_need_passthrough();
 };
 
 class PartitionSortSinkOperatorX final : public DataSinkOperatorX<PartitionSortSinkLocalState> {
 public:
-    PartitionSortSinkOperatorX(ObjectPool* pool, int operator_id, const TPlanNode& tnode,
-                               const DescriptorTbl& descs);
+    PartitionSortSinkOperatorX(ObjectPool* pool, int operator_id, int dest_id,
+                               const TPlanNode& tnode, const DescriptorTbl& descs);
     Status init(const TDataSink& tsink) override {
         return Status::InternalError("{} should not init with TPlanNode",
                                      DataSinkOperatorX<PartitionSortSinkLocalState>::_name);
@@ -101,10 +79,8 @@ public:
 
     Status init(const TPlanNode& tnode, RuntimeState* state) override;
 
-    Status prepare(RuntimeState* state) override;
     Status open(RuntimeState* state) override;
-    Status sink(RuntimeState* state, vectorized::Block* in_block,
-                SourceState source_state) override;
+    Status sink(RuntimeState* state, vectorized::Block* in_block, bool eos) override;
     DataDistribution required_data_distribution() const override {
         if (_topn_phase == TPartTopNPhase::TWO_PHASE_GLOBAL) {
             return DataSinkOperatorX<PartitionSortSinkLocalState>::required_data_distribution();
@@ -116,26 +92,25 @@ private:
     friend class PartitionSortSinkLocalState;
     ObjectPool* _pool = nullptr;
     const RowDescriptor _row_descriptor;
-    int64_t _limit = -1;
-    int _partition_exprs_num = 0;
+    const int64_t _limit = -1;
+    const int _partition_exprs_num = 0;
+    const TPartTopNPhase::type _topn_phase;
+    const bool _has_global_limit = false;
+    const TopNAlgorithm::type _top_n_algorithm = TopNAlgorithm::ROW_NUMBER;
+    const int64_t _partition_inner_limit = 0;
+
     vectorized::VExprContextSPtrs _partition_expr_ctxs;
-
-    TPartTopNPhase::type _topn_phase;
-
     // Expressions and parameters used for build _sort_description
     vectorized::VSortExecExprs _vsort_exec_exprs;
     std::vector<bool> _is_asc_order;
     std::vector<bool> _nulls_first;
-    TopNAlgorithm::type _top_n_algorithm = TopNAlgorithm::ROW_NUMBER;
-    bool _has_global_limit = false;
-    int64_t _partition_inner_limit = 0;
 
-    Status _split_block_by_partition(vectorized::Block* input_block, int batch_size,
-                                     PartitionSortSinkLocalState& local_state);
-    void _emplace_into_hash_table(const vectorized::ColumnRawPtrs& key_columns,
-                                  const vectorized::Block* input_block, int batch_size,
-                                  PartitionSortSinkLocalState& local_state);
+    Status _split_block_by_partition(vectorized::Block* input_block,
+                                     PartitionSortSinkLocalState& local_state, bool eos);
+    Status _emplace_into_hash_table(const vectorized::ColumnRawPtrs& key_columns,
+                                    vectorized::Block* input_block,
+                                    PartitionSortSinkLocalState& local_state, bool eos);
 };
 
-} // namespace pipeline
-} // namespace doris
+#include "common/compile_check_end.h"
+} // namespace doris::pipeline

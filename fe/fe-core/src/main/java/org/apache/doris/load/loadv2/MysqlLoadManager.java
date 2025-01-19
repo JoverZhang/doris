@@ -32,6 +32,7 @@ import org.apache.doris.common.ThreadPoolManager;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.io.ByteBufferNetworkInputStream;
 import org.apache.doris.load.LoadJobRowResult;
+import org.apache.doris.load.StreamLoadHandler;
 import org.apache.doris.mysql.MysqlSerializer;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.SessionVariable;
@@ -41,6 +42,7 @@ import org.apache.doris.system.BeSelectionPolicy;
 import org.apache.doris.system.SystemInfoService;
 
 import com.google.common.base.Joiner;
+import com.google.common.base.Strings;
 import com.google.common.collect.EvictingQueue;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
@@ -74,7 +76,6 @@ public class MysqlLoadManager {
     private static final Logger LOG = LogManager.getLogger(MysqlLoadManager.class);
 
     private  ThreadPoolExecutor mysqlLoadPool;
-    private final TokenManager tokenManager;
 
     private static class MySqlLoadContext {
         private boolean finished;
@@ -141,8 +142,7 @@ public class MysqlLoadManager {
     private  EvictingQueue<MySqlLoadFailRecord> failedRecords;
     private ScheduledExecutorService periodScheduler;
 
-    public MysqlLoadManager(TokenManager tokenManager) {
-        this.tokenManager = tokenManager;
+    public MysqlLoadManager() {
     }
 
     public void start() {
@@ -176,7 +176,7 @@ public class MysqlLoadManager {
             VariableMgr.setVar(sessionVariable,
                     new SetVar(SessionVariable.QUERY_TIMEOUT, new StringLiteral(String.valueOf(newTimeOut))));
         }
-        String token = tokenManager.acquireToken();
+        String token = Env.getCurrentEnv().getTokenManager().acquireToken();
         boolean clientLocal = dataDesc.isClientLocal();
         MySqlLoadContext loadContext = new MySqlLoadContext();
         loadContextMap.put(loadId, loadContext);
@@ -211,7 +211,9 @@ public class MysqlLoadManager {
                 while (buffer != null && buffer.limit() != 0) {
                     buffer = context.getMysqlChannel().fetchOnePacket();
                 }
-                LOG.debug("Finished reading the left bytes.");
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("Finished reading the left bytes.");
+                }
             }
             // make cancel message to user
             if (loadContextMap.containsKey(loadId) && loadContextMap.get(loadId).isCancelled()) {
@@ -426,21 +428,49 @@ public class MysqlLoadManager {
                 httpPut.addHeader(LoadStmt.KEY_IN_PARAM_PARTITIONS, pNames);
             }
         }
+
+        // cloud cluster
+        if (Config.isCloudMode()) {
+            String clusterName = "";
+            try {
+                clusterName = ConnectContext.get().getCloudCluster();
+            } catch (Exception e) {
+                LOG.warn("failed to get compute group: " + e.getMessage());
+                throw new LoadException("failed to get compute group: " + e.getMessage());
+            }
+            if (Strings.isNullOrEmpty(clusterName)) {
+                throw new LoadException("cloud compute group is empty");
+            }
+            httpPut.addHeader(LoadStmt.KEY_CLOUD_CLUSTER, clusterName);
+        }
+
         httpPut.setEntity(entity);
         return httpPut;
     }
 
     private String selectBackendForMySqlLoad(String database, String table) throws LoadException {
-        BeSelectionPolicy policy = new BeSelectionPolicy.Builder().needLoadAvailable().build();
-        List<Long> backendIds = Env.getCurrentSystemInfo().selectBackendIdsByPolicy(policy, 1);
-        if (backendIds.isEmpty()) {
-            throw new LoadException(SystemInfoService.NO_BACKEND_LOAD_AVAILABLE_MSG + ", policy: " + policy);
+        Backend backend = null;
+        if (Config.isCloudMode()) {
+            String clusterName = "";
+            try {
+                clusterName = ConnectContext.get().getCloudCluster();
+            } catch (Exception e) {
+                LOG.warn("failed to get cloud cluster: " + e.getMessage());
+                throw new LoadException("failed to get cloud cluster: " + e);
+            }
+            backend = StreamLoadHandler.selectBackend(clusterName);
+        } else {
+            BeSelectionPolicy policy = new BeSelectionPolicy.Builder().needLoadAvailable().build();
+            List<Long> backendIds = Env.getCurrentSystemInfo().selectBackendIdsByPolicy(policy, 1);
+            if (backendIds.isEmpty()) {
+                throw new LoadException(SystemInfoService.NO_BACKEND_LOAD_AVAILABLE_MSG + ", policy: " + policy);
+            }
+            backend = Env.getCurrentSystemInfo().getBackend(backendIds.get(0));
+            if (backend == null) {
+                throw new LoadException(SystemInfoService.NO_BACKEND_LOAD_AVAILABLE_MSG + ", policy: " + policy);
+            }
         }
 
-        Backend backend = Env.getCurrentSystemInfo().getBackend(backendIds.get(0));
-        if (backend == null) {
-            throw new LoadException(SystemInfoService.NO_BACKEND_LOAD_AVAILABLE_MSG + ", policy: " + policy);
-        }
         StringBuilder sb = new StringBuilder();
         sb.append("http://");
         sb.append(backend.getHost());

@@ -65,7 +65,7 @@ namespace doris {
 using namespace ErrorCode;
 
 static const uint32_t MAX_PATH_LEN = 1024;
-static StorageEngine* k_engine = nullptr;
+static StorageEngine* engine_ref = nullptr;
 
 class TestRowIdConversion : public testing::TestWithParam<std::tuple<KeysType, bool, bool, bool>> {
 protected:
@@ -81,18 +81,15 @@ protected:
                             ->create_directory(absolute_dir + "/tablet_path")
                             .ok());
         doris::EngineOptions options;
-        k_engine = new StorageEngine(options);
-        ExecEnv::GetInstance()->set_storage_engine(k_engine);
+        auto engine = std::make_unique<StorageEngine>(options);
+        engine_ref = engine.get();
+        ExecEnv::GetInstance()->set_storage_engine(std::move(engine));
     }
 
     void TearDown() override {
         EXPECT_TRUE(io::global_local_filesystem()->delete_directory(absolute_dir).ok());
-        if (k_engine != nullptr) {
-            k_engine->stop();
-            delete k_engine;
-            k_engine = nullptr;
-            ExecEnv::GetInstance()->set_storage_engine(nullptr);
-        }
+        engine_ref = nullptr;
+        ExecEnv::GetInstance()->set_storage_engine(nullptr);
     }
 
     TabletSchemaSPtr create_schema(KeysType keys_type = DUP_KEYS) {
@@ -157,7 +154,7 @@ protected:
         rowset_writer_context.rowset_type = BETA_ROWSET;
         rowset_writer_context.rowset_state = VISIBLE;
         rowset_writer_context.tablet_schema = tablet_schema;
-        rowset_writer_context.rowset_dir = absolute_dir + "/tablet_path";
+        rowset_writer_context.tablet_path = absolute_dir + "/tablet_path";
         rowset_writer_context.version = version;
         rowset_writer_context.segments_overlap = overlap;
         rowset_writer_context.max_rows_per_segment = max_rows_per_segment;
@@ -189,9 +186,9 @@ protected:
         }
         auto writer_context = create_rowset_writer_context(tablet_schema, overlap, UINT32_MAX,
                                                            {version, version});
-        std::unique_ptr<RowsetWriter> rowset_writer;
-        Status s = RowsetFactory::create_rowset_writer(writer_context, false, &rowset_writer);
-        EXPECT_TRUE(s.ok());
+        auto res = RowsetFactory::create_rowset_writer(*engine_ref, writer_context, true);
+        EXPECT_TRUE(res.has_value()) << res.error();
+        auto rowset_writer = std::move(res).value();
 
         uint32_t num_rows = 0;
         for (int i = 0; i < rowset_data.size(); ++i) {
@@ -209,7 +206,7 @@ protected:
                 }
                 num_rows++;
             }
-            s = rowset_writer->add_block(&block);
+            auto s = rowset_writer->add_block(&block);
             EXPECT_TRUE(s.ok());
             s = rowset_writer->flush();
             EXPECT_TRUE(s.ok());
@@ -248,7 +245,7 @@ protected:
         rsm->set_rowset_id(id);
         rsm->set_delete_predicate(std::move(del_pred));
         rsm->set_tablet_schema(schema);
-        return std::make_shared<BetaRowset>(schema, "", rsm);
+        return std::make_shared<BetaRowset>(schema, rsm, "");
     }
 
     TabletSharedPtr create_tablet(const TabletSchema& tablet_schema,
@@ -280,7 +277,7 @@ protected:
                                UniqueId(1, 2), TTabletType::TABLET_TYPE_DISK,
                                TCompressionType::LZ4F, 0, enable_unique_key_merge_on_write));
 
-        TabletSharedPtr tablet(new Tablet(*k_engine, tablet_meta, nullptr));
+        TabletSharedPtr tablet(new Tablet(*engine_ref, tablet_meta, nullptr));
         static_cast<void>(tablet->init());
         return tablet;
     }
@@ -329,14 +326,11 @@ protected:
         // create output rowset writer
         auto writer_context = create_rowset_writer_context(
                 tablet_schema, NONOVERLAPPING, 3456, {0, input_rowsets.back()->end_version()});
-        std::unique_ptr<RowsetWriter> output_rs_writer;
-        Status s;
-        if (is_vertical_merger) {
-            s = RowsetFactory::create_rowset_writer(writer_context, true, &output_rs_writer);
-        } else {
-            s = RowsetFactory::create_rowset_writer(writer_context, false, &output_rs_writer);
-        }
-        ASSERT_TRUE(s.ok()) << s;
+
+        auto res = RowsetFactory::create_rowset_writer(*engine_ref, writer_context,
+                                                       is_vertical_merger);
+        EXPECT_TRUE(res.has_value()) << res.error();
+        auto output_rs_writer = std::move(res).value();
 
         // merge input rowset
         TabletSharedPtr tablet = create_tablet(*tablet_schema, enable_unique_key_merge_on_write);
@@ -352,12 +346,13 @@ protected:
         Merger::Statistics stats;
         RowIdConversion rowid_conversion;
         stats.rowid_conversion = &rowid_conversion;
+        Status s;
         if (is_vertical_merger) {
-            s = Merger::vertical_merge_rowsets(tablet, ReaderType::READER_BASE_COMPACTION,
-                                               tablet_schema, input_rs_readers,
-                                               output_rs_writer.get(), 10000000, &stats);
+            s = Merger::vertical_merge_rowsets(
+                    tablet, ReaderType::READER_BASE_COMPACTION, *tablet_schema, input_rs_readers,
+                    output_rs_writer.get(), 10000000, num_segments, &stats);
         } else {
-            s = Merger::vmerge_rowsets(tablet, ReaderType::READER_BASE_COMPACTION, tablet_schema,
+            s = Merger::vmerge_rowsets(tablet, ReaderType::READER_BASE_COMPACTION, *tablet_schema,
                                        input_rs_readers, output_rs_writer.get(), &stats);
         }
         EXPECT_TRUE(s.ok());
@@ -387,8 +382,9 @@ protected:
         } while (s.ok());
         EXPECT_TRUE(s.is<END_OF_FILE>()) << s;
         EXPECT_EQ(out_rowset->rowset_meta()->num_rows(), output_data.size());
+        auto beta_rowset = std::dynamic_pointer_cast<BetaRowset>(out_rowset);
         std::vector<uint32_t> segment_num_rows;
-        EXPECT_TRUE(output_rs_reader->get_segment_num_rows(&segment_num_rows).ok());
+        EXPECT_TRUE(beta_rowset->get_segment_num_rows(&segment_num_rows).ok());
         if (has_delete_handler) {
             // All keys less than 1000 are deleted by delete handler
             for (auto& item : output_data) {
@@ -452,7 +448,12 @@ protected:
                     int64_t c1 = j * rows_per_segment + n;
                     // There are 500 rows of data overlap between rowsets
                     if (i > 0) {
-                        c1 += i * num_segments * rows_per_segment - 500;
+                        if (is_overlap) {
+                            // There are 500 rows of data overlap between rowsets
+                            c1 -= 500;
+                        } else {
+                            ++c1;
+                        }
                     }
                     if (is_overlap && j > 0) {
                         // There are 10 rows of data overlap between segments
@@ -490,10 +491,12 @@ TEST_F(TestRowIdConversion, Basic) {
     RowIdConversion rowid_conversion;
     src_rowset.init(0);
     std::vector<uint32_t> rs0_segment_num_rows = {4, 3};
-    rowid_conversion.init_segment_map(src_rowset, rs0_segment_num_rows);
+    auto st = rowid_conversion.init_segment_map(src_rowset, rs0_segment_num_rows);
+    EXPECT_EQ(st.ok(), true);
     src_rowset.init(1);
     std::vector<uint32_t> rs1_segment_num_rows = {4};
-    rowid_conversion.init_segment_map(src_rowset, rs1_segment_num_rows);
+    st = rowid_conversion.init_segment_map(src_rowset, rs1_segment_num_rows);
+    EXPECT_EQ(st.ok(), true);
     rowid_conversion.set_dst_rowset_id(dst_rowset);
 
     std::vector<uint32_t> dst_segment_num_rows = {4, 3, 4};

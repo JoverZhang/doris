@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "common/exception.h"
+#include "common/status.h"
 #include "exprs/block_bloom_filter.hpp"
 #include "exprs/runtime_filter.h"
 #include "olap/rowset/segment_v2/bloom_filter.h" // IWYU pragma: keep
@@ -24,25 +26,54 @@
 #include "vec/common/string_ref.h"
 
 namespace doris {
+// there are problems with the implementation of the old datetimev2. for compatibility reason, we will keep this code temporary.
+struct fixed_len_to_uint32 {
+    template <typename T>
+    uint32_t operator()(T value) {
+        if constexpr (sizeof(T) <= sizeof(uint32_t)) {
+            if constexpr (std::is_same_v<T, DateV2Value<DateV2ValueType>>) {
+                return (uint32_t)value.to_int64();
+            } else {
+                return (uint32_t)value;
+            }
+        }
+        return std::hash<T>()(value);
+    }
+};
+
+struct fixed_len_to_uint32_v2 {
+    template <typename T>
+    uint32_t operator()(T value) {
+        if constexpr (sizeof(T) <= sizeof(uint32_t)) {
+            if constexpr (std::is_same_v<T, DateV2Value<DateV2ValueType>>) {
+                return (uint32_t)value.to_date_int_val();
+            } else {
+                return (uint32_t)value;
+            }
+        }
+        return std::hash<T>()(value);
+    }
+};
 
 class BloomFilterAdaptor {
 public:
-    BloomFilterAdaptor() { _bloom_filter = std::make_shared<doris::BlockBloomFilter>(); }
-    static int64_t optimal_bit_num(int64_t expect_num, double fpp) {
-        return doris::segment_v2::BloomFilter::optimal_bit_num(expect_num, fpp) / 8;
+    BloomFilterAdaptor(bool null_aware) : _null_aware(null_aware) {
+        _bloom_filter = std::make_shared<doris::BlockBloomFilter>();
     }
 
-    static BloomFilterAdaptor* create() { return new BloomFilterAdaptor(); }
+    static BloomFilterAdaptor* create(bool null_aware) {
+        return new BloomFilterAdaptor(null_aware);
+    }
 
     Status merge(BloomFilterAdaptor* other) { return _bloom_filter->merge(*other->_bloom_filter); }
 
     Status init(int len) {
-        int log_space = log2(len);
+        int log_space = (int)log2(len);
         return _bloom_filter->init(log_space, /*hash_seed*/ 0);
     }
 
     Status init(butil::IOBufAsZeroCopyInputStream* data, const size_t data_size) {
-        int log_space = log2(data_size);
+        int log_space = (int)log2(data_size);
         return _bloom_filter->init_from_directory(log_space, data, data_size, false, 0);
     }
 
@@ -50,54 +81,60 @@ public:
 
     size_t size() { return _bloom_filter->directory().size; }
 
-    template <typename T>
-    bool test(T data) const {
-        return _bloom_filter->find(data);
-    }
+    bool test(uint32_t data) const { return _bloom_filter->find(data); }
 
-    // test_element/find_element only used on vectorized engine
-    template <typename T>
+    template <typename fixed_len_to_uint32_method, typename T>
     bool test_element(T element) const {
         if constexpr (std::is_same_v<T, StringRef>) {
             return _bloom_filter->find(element);
         } else {
-            return _bloom_filter->find(HashUtil::fixed_len_to_uint32(element));
+            return _bloom_filter->find(fixed_len_to_uint32_method()(element));
         }
     }
 
-    template <typename T>
+    template <typename fixed_len_to_uint32_method, typename T>
     void add_element(T element) {
         if constexpr (std::is_same_v<T, StringRef>) {
             _bloom_filter->insert(element);
         } else {
-            _bloom_filter->insert(HashUtil::fixed_len_to_uint32(element));
+            _bloom_filter->insert(fixed_len_to_uint32_method()(element));
         }
     }
 
+    void set_contain_null() { _contain_null = true; }
+
+    void set_contain_null_and_null_aware() {
+        _contain_null = true;
+        _null_aware = true;
+    }
+
+    bool contain_null() const { return _null_aware && _contain_null; }
+
 private:
+    bool _null_aware = false;
+    bool _contain_null = false;
     std::shared_ptr<doris::BlockBloomFilter> _bloom_filter;
 };
 
 // Only Used In RuntimeFilter
-class BloomFilterFuncBase : public FilterFuncBase {
+class BloomFilterFuncBase : public RuntimeFilterFuncBase {
 public:
     virtual ~BloomFilterFuncBase() = default;
 
-    Status init(int64_t expect_num, double fpp) {
-        size_t filter_size = BloomFilterAdaptor::optimal_bit_num(expect_num, fpp);
-        return init_with_fixed_length(filter_size);
+    void init_params(const RuntimeFilterParams* params) {
+        _bloom_filter_length = params->bloom_filter_size;
+
+        _build_bf_exactly = params->build_bf_exactly;
+        _runtime_bloom_filter_min_size = params->runtime_bloom_filter_min_size;
+        _runtime_bloom_filter_max_size = params->runtime_bloom_filter_max_size;
+        _null_aware = params->null_aware;
+        _bloom_filter_size_calculated_by_ndv = params->bloom_filter_size_calculated_by_ndv;
+        _limit_length();
     }
 
-    void set_length(int64_t bloom_filter_length) { _bloom_filter_length = bloom_filter_length; }
+    Status init_with_fixed_length() { return init_with_fixed_length(_bloom_filter_length); }
 
-    void set_build_bf_exactly(bool build_bf_exactly) { _build_bf_exactly = build_bf_exactly; }
-
-    Status init_with_fixed_length() {
-        if (_build_bf_exactly) {
-            return Status::OK();
-        }
-        return init_with_fixed_length(_bloom_filter_length);
-    }
+    bool get_build_bf_cardinality() const { return _build_bf_exactly; }
 
     Status init_with_cardinality(const size_t build_bf_cardinality) {
         if (_build_bf_exactly) {
@@ -109,82 +146,95 @@ public:
 
             // Handle case where ndv == 1 => ceil(log2(m/8)) < 0.
             int log_filter_size = std::max(0, (int)(std::ceil(std::log(m / 8) / std::log(2))));
-            _bloom_filter_length = std::min(((int64_t)1) << log_filter_size, _bloom_filter_length);
-            return init_with_fixed_length(_bloom_filter_length);
+            auto be_calculate_size = (((int64_t)1) << log_filter_size);
+            // if FE do use ndv stat to predict the bf size, BE only use the row count. FE have more
+            // exactly row count stat. which one is min is more correctly.
+            if (_bloom_filter_size_calculated_by_ndv) {
+                _bloom_filter_length = std::min(be_calculate_size, _bloom_filter_length);
+            } else {
+                _bloom_filter_length = be_calculate_size;
+            }
+            _limit_length();
         }
-        return Status::OK();
+        return init_with_fixed_length(_bloom_filter_length);
     }
 
     Status init_with_fixed_length(int64_t bloom_filter_length) {
         if (_inited) {
             return Status::OK();
         }
-        // TODO: really need the lock?
-        std::lock_guard<std::mutex> l(_lock);
-        if (_inited) {
-            return Status::OK();
-        }
         DCHECK(bloom_filter_length >= 0);
         DCHECK_EQ((bloom_filter_length & (bloom_filter_length - 1)), 0);
         _bloom_filter_alloced = bloom_filter_length;
-        _bloom_filter.reset(BloomFilterAdaptor::create());
+        _bloom_filter.reset(BloomFilterAdaptor::create(_null_aware));
         RETURN_IF_ERROR(_bloom_filter->init(bloom_filter_length));
         _inited = true;
         return Status::OK();
     }
 
     Status merge(BloomFilterFuncBase* bloomfilter_func) {
+        if (bloomfilter_func == nullptr) {
+            return Status::InternalError("bloomfilter_func is nullptr");
+        }
+        if (bloomfilter_func->_bloom_filter == nullptr) {
+            return Status::InternalError(
+                    "bloomfilter_func->_bloom_filter is nullptr, bloomfilter_func->inited: {}",
+                    bloomfilter_func->_inited);
+        }
         // If `_inited` is false, there is no memory allocated in bloom filter and this is the first
         // call for `merge` function. So we just reuse this bloom filter, and we don't need to
         // allocate memory again.
-        if (_inited) {
-            DCHECK(bloomfilter_func != nullptr);
-            auto* other_func = static_cast<BloomFilterFuncBase*>(bloomfilter_func);
-            if (_bloom_filter_alloced != other_func->_bloom_filter_alloced) {
-                return Status::InvalidArgument(
-                        "bloom filter size not the same: already allocated bytes {}, expected "
-                        "allocated bytes {}",
-                        _bloom_filter_alloced, other_func->_bloom_filter_alloced);
+        if (!_inited) {
+            if (_bloom_filter != nullptr) {
+                return Status::InternalError("_bloom_filter must is nullptr, inited: {}", _inited);
             }
-            return _bloom_filter->merge(other_func->_bloom_filter.get());
+            light_copy(bloomfilter_func);
+            return Status::OK();
         }
-        {
-            std::lock_guard<std::mutex> l(_lock);
-            if (!_inited) {
-                auto* other_func = static_cast<BloomFilterFuncBase*>(bloomfilter_func);
-                DCHECK(_bloom_filter == nullptr);
-                DCHECK(bloomfilter_func != nullptr);
-                _bloom_filter = bloomfilter_func->_bloom_filter;
-                _bloom_filter_alloced = other_func->_bloom_filter_alloced;
-                _inited = true;
-                return Status::OK();
-            }
-            DCHECK(bloomfilter_func != nullptr);
-            auto* other_func = static_cast<BloomFilterFuncBase*>(bloomfilter_func);
-            if (_bloom_filter_alloced != other_func->_bloom_filter_alloced) {
-                return Status::InvalidArgument(
-                        "bloom filter size not the same: already allocated bytes {}, expected "
-                        "allocated bytes {}",
-                        _bloom_filter_alloced, other_func->_bloom_filter_alloced);
-            }
-            return _bloom_filter->merge(other_func->_bloom_filter.get());
+        auto* other_func = static_cast<BloomFilterFuncBase*>(bloomfilter_func);
+        if (_bloom_filter_alloced != other_func->_bloom_filter_alloced) {
+            return Status::InternalError(
+                    "bloom filter size not the same: already allocated bytes {}, expected "
+                    "allocated bytes {}",
+                    _bloom_filter_alloced, other_func->_bloom_filter_alloced);
         }
+        if (other_func->_bloom_filter->contain_null()) {
+            _bloom_filter->set_contain_null_and_null_aware();
+        }
+        return _bloom_filter->merge(other_func->_bloom_filter.get());
     }
 
-    Status assign(butil::IOBufAsZeroCopyInputStream* data, const size_t data_size) {
+    Status assign(butil::IOBufAsZeroCopyInputStream* data, const size_t data_size,
+                  bool contain_null) {
         if (_bloom_filter == nullptr) {
-            _bloom_filter.reset(BloomFilterAdaptor::create());
+            _null_aware = contain_null;
+            _bloom_filter.reset(BloomFilterAdaptor::create(_null_aware));
+        }
+        if (contain_null) {
+            _bloom_filter->set_contain_null();
         }
 
         _bloom_filter_alloced = data_size;
+        _inited = true;
         return _bloom_filter->init(data, data_size);
     }
 
-    Status get_data(char** data, int* len) {
+    void get_data(char** data, int* len) {
         *data = _bloom_filter->data();
         *len = _bloom_filter->size();
-        return Status::OK();
     }
+
+    bool contain_null() const {
+        if (!_bloom_filter) {
+            throw Exception(ErrorCode::INTERNAL_ERROR, "_bloom_filter is nullptr, inited: {}",
+                            _inited);
+        }
+        return _bloom_filter->contain_null();
+    }
+
+    void set_contain_null_and_null_aware() { _bloom_filter->set_contain_null_and_null_aware(); }
+
+    void set_enable_fixed_len_to_uint32_v2() { _enable_fixed_len_to_uint32_v2 = true; }
 
     size_t get_size() const { return _bloom_filter ? _bloom_filter->size() : 0; }
 
@@ -193,6 +243,8 @@ public:
         _bloom_filter_alloced = other_func->_bloom_filter_alloced;
         _bloom_filter = other_func->_bloom_filter;
         _inited = other_func->_inited;
+        _enable_fixed_len_to_uint32_v2 |= other_func->_enable_fixed_len_to_uint32_v2;
+        set_filter_id(bloomfilter_func->get_filter_id());
     }
 
     virtual void insert(const void* data) = 0;
@@ -205,17 +257,32 @@ public:
                                                 uint16_t* offsets, int number,
                                                 bool is_parse_column) = 0;
 
+    bool inited() const { return _inited; }
+
+private:
+    void _limit_length() {
+        if (_runtime_bloom_filter_min_size > 0) {
+            _bloom_filter_length = std::max(_bloom_filter_length, _runtime_bloom_filter_min_size);
+        }
+        if (_runtime_bloom_filter_max_size > 0) {
+            _bloom_filter_length = std::min(_bloom_filter_length, _runtime_bloom_filter_max_size);
+        }
+    }
+
 protected:
     // bloom filter size
     int32_t _bloom_filter_alloced;
     std::shared_ptr<BloomFilterAdaptor> _bloom_filter;
-    bool _inited {};
-    std::mutex _lock;
+    bool _inited = false;
     int64_t _bloom_filter_length;
+    int64_t _runtime_bloom_filter_min_size;
+    int64_t _runtime_bloom_filter_max_size;
     bool _build_bf_exactly = false;
+    bool _bloom_filter_size_calculated_by_ndv = false;
+    bool _enable_fixed_len_to_uint32_v2 = false;
 };
 
-template <typename T, bool need_trim = false>
+template <typename fixed_len_to_uint32_method, typename T, bool need_trim = false>
 uint16_t find_batch_olap(const BloomFilterAdaptor& bloom_filter, const char* data,
                          const uint8* nullmap, uint16_t* offsets, int number,
                          const bool is_parse_column) {
@@ -239,7 +306,8 @@ uint16_t find_batch_olap(const BloomFilterAdaptor& bloom_filter, const char* dat
         if (nullmap == nullptr) {
             for (int i = 0; i < number; i++) {
                 uint16_t idx = offsets[i];
-                if (!bloom_filter.test_element(get_element(data, idx))) {
+                if (!bloom_filter.test_element<fixed_len_to_uint32_method>(
+                            get_element(data, idx))) {
                     continue;
                 }
                 offsets[new_size++] = idx;
@@ -248,10 +316,14 @@ uint16_t find_batch_olap(const BloomFilterAdaptor& bloom_filter, const char* dat
             for (int i = 0; i < number; i++) {
                 uint16_t idx = offsets[i];
                 if (nullmap[idx]) {
-                    continue;
-                }
-                if (!bloom_filter.test_element(get_element(data, idx))) {
-                    continue;
+                    if (!bloom_filter.contain_null()) {
+                        continue;
+                    }
+                } else {
+                    if (!bloom_filter.test_element<fixed_len_to_uint32_method>(
+                                get_element(data, idx))) {
+                        continue;
+                    }
                 }
                 offsets[new_size++] = idx;
             }
@@ -259,7 +331,7 @@ uint16_t find_batch_olap(const BloomFilterAdaptor& bloom_filter, const char* dat
     } else {
         if (nullmap == nullptr) {
             for (int i = 0; i < number; i++) {
-                if (!bloom_filter.test_element(get_element(data, i))) {
+                if (!bloom_filter.test_element<fixed_len_to_uint32_method>(get_element(data, i))) {
                     continue;
                 }
                 offsets[new_size++] = i;
@@ -267,10 +339,14 @@ uint16_t find_batch_olap(const BloomFilterAdaptor& bloom_filter, const char* dat
         } else {
             for (int i = 0; i < number; i++) {
                 if (nullmap[i]) {
-                    continue;
-                }
-                if (!bloom_filter.test_element(get_element(data, i))) {
-                    continue;
+                    if (!bloom_filter.contain_null()) {
+                        continue;
+                    }
+                } else {
+                    if (!bloom_filter.test_element<fixed_len_to_uint32_method>(
+                                get_element(data, i))) {
+                        continue;
+                    }
                 }
                 offsets[new_size++] = i;
             }
@@ -279,16 +355,18 @@ uint16_t find_batch_olap(const BloomFilterAdaptor& bloom_filter, const char* dat
     return new_size;
 }
 
-template <class T>
+template <typename fixed_len_to_uint32_method, class T>
 struct CommonFindOp {
-    uint16_t find_batch_olap_engine(const BloomFilterAdaptor& bloom_filter, const char* data,
-                                    const uint8* nullmap, uint16_t* offsets, int number,
-                                    const bool is_parse_column) {
-        return find_batch_olap<T>(bloom_filter, data, nullmap, offsets, number, is_parse_column);
+    static uint16_t find_batch_olap_engine(const BloomFilterAdaptor& bloom_filter, const char* data,
+                                           const uint8* nullmap, uint16_t* offsets, int number,
+                                           const bool is_parse_column) {
+        return find_batch_olap<fixed_len_to_uint32_method, T>(bloom_filter, data, nullmap, offsets,
+                                                              number, is_parse_column);
     }
 
-    void insert_batch(BloomFilterAdaptor& bloom_filter, const vectorized::ColumnPtr& column,
-                      size_t start) const {
+    static void insert_batch(BloomFilterAdaptor& bloom_filter, const vectorized::ColumnPtr& column,
+                             size_t start) {
+        const auto size = column->size();
         if (column->is_nullable()) {
             const auto* nullable = assert_cast<const vectorized::ColumnNullable*>(column.get());
             const auto& col = nullable->get_nested_column();
@@ -297,21 +375,23 @@ struct CommonFindOp {
                             .get_data();
 
             const T* data = (T*)col.get_raw_data().data;
-            for (size_t i = start; i < column->size(); i++) {
+            for (size_t i = start; i < size; i++) {
                 if (!nullmap[i]) {
-                    bloom_filter.add_element(*(data + i));
+                    bloom_filter.add_element<fixed_len_to_uint32_method>(*(data + i));
+                } else {
+                    bloom_filter.set_contain_null();
                 }
             }
         } else {
             const T* data = (T*)column->get_raw_data().data;
-            for (size_t i = start; i < column->size(); i++) {
-                bloom_filter.add_element(*(data + i));
+            for (size_t i = start; i < size; i++) {
+                bloom_filter.add_element<fixed_len_to_uint32_method>(*(data + i));
             }
         }
     }
 
-    void find_batch(const BloomFilterAdaptor& bloom_filter, const vectorized::ColumnPtr& column,
-                    uint8_t* results) const {
+    static void find_batch(const BloomFilterAdaptor& bloom_filter,
+                           const vectorized::ColumnPtr& column, uint8_t* results) {
         const T* __restrict data = nullptr;
         const uint8_t* __restrict nullmap = nullptr;
         if (column->is_nullable()) {
@@ -327,46 +407,63 @@ struct CommonFindOp {
             data = (T*)column->get_raw_data().data;
         }
 
+        const auto size = column->size();
         if (nullmap) {
-            for (size_t i = 0; i < column->size(); i++) {
+            for (size_t i = 0; i < size; i++) {
                 if (!nullmap[i]) {
-                    results[i] = bloom_filter.test_element(data[i]);
+                    results[i] = bloom_filter.test_element<fixed_len_to_uint32_method>(data[i]);
                 } else {
-                    results[i] = false;
+                    results[i] = bloom_filter.contain_null();
                 }
             }
         } else {
-            for (size_t i = 0; i < column->size(); i++) {
-                results[i] = bloom_filter.test_element(data[i]);
+            for (size_t i = 0; i < size; i++) {
+                results[i] = bloom_filter.test_element<fixed_len_to_uint32_method>(data[i]);
             }
         }
     }
 
-    void insert(BloomFilterAdaptor& bloom_filter, const void* data) const {
-        bloom_filter.add_element(*(T*)data);
+    static void insert(BloomFilterAdaptor& bloom_filter, const void* data) {
+        bloom_filter.add_element<fixed_len_to_uint32_method>(*(T*)data);
     }
 };
 
-struct StringFindOp : CommonFindOp<StringRef> {
+template <typename fixed_len_to_uint32_method>
+struct StringFindOp : CommonFindOp<fixed_len_to_uint32_method, StringRef> {
     static void insert_batch(BloomFilterAdaptor& bloom_filter, const vectorized::ColumnPtr& column,
                              size_t start) {
+        auto _insert_batch_col_str = [&](const auto& col, const uint8_t* __restrict nullmap,
+                                         size_t start, size_t size) {
+            for (size_t i = start; i < size; i++) {
+                if (nullmap == nullptr || !nullmap[i]) {
+                    bloom_filter.add_element<fixed_len_to_uint32_method>(col.get_data_at(i));
+                } else {
+                    bloom_filter.set_contain_null();
+                }
+            }
+        };
+
         if (column->is_nullable()) {
             const auto* nullable = assert_cast<const vectorized::ColumnNullable*>(column.get());
-            const auto& col =
-                    assert_cast<const vectorized::ColumnString&>(nullable->get_nested_column());
             const auto& nullmap =
                     assert_cast<const vectorized::ColumnUInt8&>(nullable->get_null_map_column())
                             .get_data();
-
-            for (size_t i = start; i < column->size(); i++) {
-                if (!nullmap[i]) {
-                    bloom_filter.add_element(col.get_data_at(i));
-                }
+            if (nullable->get_nested_column().is_column_string64()) {
+                _insert_batch_col_str(assert_cast<const vectorized::ColumnString64&>(
+                                              nullable->get_nested_column()),
+                                      nullmap.data(), start, nullmap.size());
+            } else {
+                _insert_batch_col_str(
+                        assert_cast<const vectorized::ColumnString&>(nullable->get_nested_column()),
+                        nullmap.data(), start, nullmap.size());
             }
         } else {
-            const auto& col = assert_cast<const vectorized::ColumnString*>(column.get());
-            for (size_t i = start; i < column->size(); i++) {
-                bloom_filter.add_element(col->get_data_at(i));
+            if (column->is_column_string64()) {
+                _insert_batch_col_str(assert_cast<const vectorized::ColumnString64&>(*column),
+                                      nullptr, start, column->size());
+            } else {
+                _insert_batch_col_str(assert_cast<const vectorized::ColumnString&>(*column),
+                                      nullptr, start, column->size());
             }
         }
     }
@@ -380,23 +477,27 @@ struct StringFindOp : CommonFindOp<StringRef> {
             const auto& nullmap =
                     assert_cast<const vectorized::ColumnUInt8&>(nullable->get_null_map_column())
                             .get_data();
+
             if (nullable->has_null()) {
-                for (size_t i = 0; i < column->size(); i++) {
+                for (size_t i = 0; i < col.size(); i++) {
                     if (!nullmap[i]) {
-                        results[i] = bloom_filter.test_element(col.get_data_at(i));
+                        results[i] = bloom_filter.test_element<fixed_len_to_uint32_method>(
+                                col.get_data_at(i));
                     } else {
-                        results[i] = false;
+                        results[i] = bloom_filter.contain_null();
                     }
                 }
             } else {
-                for (size_t i = 0; i < column->size(); i++) {
-                    results[i] = bloom_filter.test_element(col.get_data_at(i));
+                for (size_t i = 0; i < col.size(); i++) {
+                    results[i] = bloom_filter.test_element<fixed_len_to_uint32_method>(
+                            col.get_data_at(i));
                 }
             }
         } else {
             const auto& col = assert_cast<const vectorized::ColumnString*>(column.get());
-            for (size_t i = 0; i < column->size(); i++) {
-                results[i] = bloom_filter.test_element(col->get_data_at(i));
+            for (size_t i = 0; i < col->size(); i++) {
+                results[i] =
+                        bloom_filter.test_element<fixed_len_to_uint32_method>(col->get_data_at(i));
             }
         }
     }
@@ -404,34 +505,35 @@ struct StringFindOp : CommonFindOp<StringRef> {
 
 // We do not need to judge whether data is empty, because null will not appear
 // when filer used by the storage engine
-struct FixedStringFindOp : public StringFindOp {
+template <typename fixed_len_to_uint32_method>
+struct FixedStringFindOp : public StringFindOp<fixed_len_to_uint32_method> {
     static uint16_t find_batch_olap_engine(const BloomFilterAdaptor& bloom_filter, const char* data,
                                            const uint8* nullmap, uint16_t* offsets, int number,
                                            const bool is_parse_column) {
-        return find_batch_olap<StringRef, true>(bloom_filter, data, nullmap, offsets, number,
-                                                is_parse_column);
+        return find_batch_olap<fixed_len_to_uint32_method, StringRef, true>(
+                bloom_filter, data, nullmap, offsets, number, is_parse_column);
     }
 };
 
-template <PrimitiveType type>
+template <typename fixed_len_to_uint32_method, PrimitiveType type>
 struct BloomFilterTypeTraits {
     using T = typename PrimitiveTypeTraits<type>::CppType;
-    using FindOp = CommonFindOp<T>;
+    using FindOp = CommonFindOp<fixed_len_to_uint32_method, T>;
 };
 
-template <>
-struct BloomFilterTypeTraits<TYPE_CHAR> {
-    using FindOp = FixedStringFindOp;
+template <typename fixed_len_to_uint32_method>
+struct BloomFilterTypeTraits<fixed_len_to_uint32_method, TYPE_CHAR> {
+    using FindOp = FixedStringFindOp<fixed_len_to_uint32_method>;
 };
 
-template <>
-struct BloomFilterTypeTraits<TYPE_VARCHAR> {
-    using FindOp = StringFindOp;
+template <typename fixed_len_to_uint32_method>
+struct BloomFilterTypeTraits<fixed_len_to_uint32_method, TYPE_VARCHAR> {
+    using FindOp = StringFindOp<fixed_len_to_uint32_method>;
 };
 
-template <>
-struct BloomFilterTypeTraits<TYPE_STRING> {
-    using FindOp = StringFindOp;
+template <typename fixed_len_to_uint32_method>
+struct BloomFilterTypeTraits<fixed_len_to_uint32_method, TYPE_STRING> {
+    using FindOp = StringFindOp<fixed_len_to_uint32_method>;
 };
 
 template <PrimitiveType type>
@@ -443,16 +545,28 @@ public:
 
     void insert(const void* data) override {
         DCHECK(_bloom_filter != nullptr);
-        dummy.insert(*_bloom_filter, data);
+        if (_enable_fixed_len_to_uint32_v2) {
+            OpV2::insert(*_bloom_filter, data);
+        } else {
+            Op::insert(*_bloom_filter, data);
+        }
     }
 
     void insert_fixed_len(const vectorized::ColumnPtr& column, size_t start) override {
         DCHECK(_bloom_filter != nullptr);
-        dummy.insert_batch(*_bloom_filter, column, start);
+        if (_enable_fixed_len_to_uint32_v2) {
+            OpV2::insert_batch(*_bloom_filter, column, start);
+        } else {
+            Op::insert_batch(*_bloom_filter, column, start);
+        }
     }
 
     void find_fixed_len(const vectorized::ColumnPtr& column, uint8_t* results) override {
-        dummy.find_batch(*_bloom_filter, column, results);
+        if (_enable_fixed_len_to_uint32_v2) {
+            OpV2::find_batch(*_bloom_filter, column, results);
+        } else {
+            Op::find_batch(*_bloom_filter, column, results);
+        }
     }
 
     template <bool is_nullable>
@@ -463,6 +577,7 @@ public:
             uint16_t idx = offsets[i];
             offsets[new_size] = idx;
             if constexpr (is_nullable) {
+                new_size += nullmap[idx] && _bloom_filter->contain_null();
                 new_size += !nullmap[idx] && _bloom_filter->test(column->get_hash_value(idx));
             } else {
                 new_size += _bloom_filter->test(column->get_hash_value(idx));
@@ -473,12 +588,18 @@ public:
 
     uint16_t find_fixed_len_olap_engine(const char* data, const uint8* nullmap, uint16_t* offsets,
                                         int number, bool is_parse_column) override {
-        return dummy.find_batch_olap_engine(*_bloom_filter, data, nullmap, offsets, number,
-                                            is_parse_column);
+        if (_enable_fixed_len_to_uint32_v2) {
+            return OpV2::find_batch_olap_engine(*_bloom_filter, data, nullmap, offsets, number,
+                                                is_parse_column);
+        } else {
+            return Op::find_batch_olap_engine(*_bloom_filter, data, nullmap, offsets, number,
+                                              is_parse_column);
+        }
     }
 
 private:
-    typename BloomFilterTypeTraits<type>::FindOp dummy;
+    using Op = typename BloomFilterTypeTraits<fixed_len_to_uint32, type>::FindOp;
+    using OpV2 = typename BloomFilterTypeTraits<fixed_len_to_uint32_v2, type>::FindOp;
 };
 
 } // namespace doris

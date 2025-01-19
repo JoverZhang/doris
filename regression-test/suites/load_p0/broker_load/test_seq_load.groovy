@@ -16,7 +16,6 @@
 // under the License.
 
 suite("test_seq_load", "load_p0") {
-
     def tableName = "uniq_tbl_basic_seq"
 
     sql """ DROP TABLE IF EXISTS ${tableName} """
@@ -57,7 +56,7 @@ suite("test_seq_load", "load_p0") {
             kd12 DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
             kd13 DATEV2          NOT NULL DEFAULT "2023-08-24",
             kd14 DATETIMEV2      NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            kd15 CHAR(300)       NOT NULL DEFAULT "我能吞下玻璃而不伤身体",
+            kd15 CHAR(255)       NOT NULL DEFAULT "我能吞下玻璃而不伤身体",
             kd16 VARCHAR(300)    NOT NULL DEFAULT "我能吞下玻璃而不伤身体",
             kd17 STRING          NOT NULL DEFAULT "我能吞下玻璃而不伤身体",
             kd18 JSON            NULL,
@@ -83,7 +82,7 @@ suite("test_seq_load", "load_p0") {
     """
 
     def label = UUID.randomUUID().toString().replace("-", "0")
-    def path = "s3://doris-build-1308700295/regression/load/data/basic_data.csv"
+    def path = "s3://${getS3BucketName()}/regression/load/data/basic_data.csv"
     def format_str = "CSV"
     def ak = getS3AK()
     def sk = getS3SK()
@@ -101,11 +100,8 @@ suite("test_seq_load", "load_p0") {
             WITH S3 (
                 "AWS_ACCESS_KEY" = "$ak",
                 "AWS_SECRET_KEY" = "$sk",
-                "AWS_ENDPOINT" = "cos.ap-beijing.myqcloud.com",
-                "AWS_REGION" = "ap-beijing"
-            )
-            properties(
-                "use_new_load_scan_node" = "true"
+                "AWS_ENDPOINT" = "${getS3Endpoint()}",
+                "AWS_REGION" = "${getS3Region()}"
             )
             """
     logger.info("submit sql: ${sql_str}");

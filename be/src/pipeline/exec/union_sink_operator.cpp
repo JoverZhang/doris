@@ -19,6 +19,7 @@
 
 #include <utility>
 
+#include "common/cast_set.h"
 #include "common/compiler_util.h" // IWYU pragma: keep
 #include "common/status.h"
 #include "pipeline/exec/data_queue.h"
@@ -26,90 +27,37 @@
 #include "runtime/runtime_state.h"
 #include "util/runtime_profile.h"
 
-namespace doris {
-class ExecNode;
-} // namespace doris
-
 namespace doris::pipeline {
-
-UnionSinkOperatorBuilder::UnionSinkOperatorBuilder(int32_t id, int child_id, ExecNode* node,
-                                                   std::shared_ptr<DataQueue> queue)
-        : OperatorBuilder(id, "UnionSinkOperator", node),
-          _cur_child_id(child_id),
-          _data_queue(queue) {};
-
-UnionSinkOperator::UnionSinkOperator(OperatorBuilderBase* operator_builder, int child_id,
-                                     ExecNode* node, std::shared_ptr<DataQueue> queue)
-        : StreamingOperator(operator_builder, node), _cur_child_id(child_id), _data_queue(queue) {};
-
-OperatorPtr UnionSinkOperatorBuilder::build_operator() {
-    return std::make_shared<UnionSinkOperator>(this, _cur_child_id, _node, _data_queue);
-}
-
-Status UnionSinkOperator::sink(RuntimeState* state, vectorized::Block* in_block,
-                               SourceState source_state) {
-    if (_output_block == nullptr) {
-        _output_block = _data_queue->get_free_block(_cur_child_id);
-    }
-
-    if (_cur_child_id < _node->get_first_materialized_child_idx()) { //pass_through
-        if (in_block->rows() > 0) {
-            _output_block->swap(*in_block);
-            _data_queue->push_block(std::move(_output_block), _cur_child_id);
-        }
-    } else if (_node->get_first_materialized_child_idx() != _node->children_count() &&
-               _cur_child_id < _node->children_count()) { //need materialized
-        RETURN_IF_ERROR(this->_node->materialize_child_block(state, _cur_child_id, in_block,
-                                                             _output_block.get()));
-    } else {
-        return Status::InternalError("maybe can't reach here, execute const expr: {}, {}, {}",
-                                     _cur_child_id, _node->get_first_materialized_child_idx(),
-                                     _node->children_count());
-    }
-
-    if (UNLIKELY(source_state == SourceState::FINISHED)) {
-        //if _cur_child_id eos, need check to push block
-        //Now here can't check _output_block rows, even it's row==0, also need push block
-        //because maybe sink is eos and queue have none data, if not push block
-        //the source can't can_read again and can't set source finished
-        if (_output_block) {
-            _data_queue->push_block(std::move(_output_block), _cur_child_id);
-        }
-        _data_queue->set_finish(_cur_child_id);
-        return Status::OK();
-    }
-    // not eos and block rows is enough to output,so push block
-    if (_output_block && (_output_block->rows() >= state->batch_size())) {
-        _data_queue->push_block(std::move(_output_block), _cur_child_id);
-    }
-    return Status::OK();
-}
-
-Status UnionSinkOperator::close(RuntimeState* state) {
-    if (_data_queue && !_data_queue->is_finish(_cur_child_id)) {
-        // finish should be set, if not set here means error.
-        _data_queue->set_canceled(_cur_child_id);
-    }
-    return StreamingOperator::close(state);
-}
+#include "common/compile_check_begin.h"
 
 Status UnionSinkLocalState::init(RuntimeState* state, LocalSinkStateInfo& info) {
     RETURN_IF_ERROR(Base::init(state, info));
     SCOPED_TIMER(exec_time_counter());
+    SCOPED_TIMER(_init_timer);
+    _expr_timer = ADD_TIMER(_profile, "ExprTime");
+    auto& p = _parent->cast<Parent>();
+    _shared_state->data_queue.set_sink_dependency(_dependency, p._cur_child_id);
+    return Status::OK();
+}
+
+Status UnionSinkLocalState::open(RuntimeState* state) {
+    SCOPED_TIMER(exec_time_counter());
     SCOPED_TIMER(_open_timer);
+    RETURN_IF_ERROR(Base::open(state));
     auto& p = _parent->cast<Parent>();
     _child_expr.resize(p._child_expr.size());
-    _shared_state->data_queue.set_sink_dependency(_dependency, p._cur_child_id);
     for (size_t i = 0; i < p._child_expr.size(); i++) {
         RETURN_IF_ERROR(p._child_expr[i]->clone(state, _child_expr[i]));
     }
+    _shared_state->data_queue.set_max_blocks_in_sub_queue(state->data_queue_max_blocks());
     return Status::OK();
-};
+}
 
-UnionSinkOperatorX::UnionSinkOperatorX(int child_id, int sink_id, ObjectPool* pool,
+UnionSinkOperatorX::UnionSinkOperatorX(int child_id, int sink_id, int dest_id, ObjectPool* pool,
                                        const TPlanNode& tnode, const DescriptorTbl& descs)
-        : Base(sink_id, tnode.node_id, tnode.node_id),
-          _first_materialized_child_idx(tnode.union_node.first_materialized_child_idx),
+        : Base(sink_id, tnode.node_id, dest_id),
+          _first_materialized_child_idx(
+                  cast_set<int>(tnode.union_node.first_materialized_child_idx)),
           _row_descriptor(descs, tnode.row_tuples, tnode.nullable_tuples),
           _cur_child_id(child_id),
           _child_size(tnode.num_children) {}
@@ -128,12 +76,10 @@ Status UnionSinkOperatorX::init(const TPlanNode& tnode, RuntimeState* state) {
     return Status::OK();
 }
 
-Status UnionSinkOperatorX::prepare(RuntimeState* state) {
-    RETURN_IF_ERROR(vectorized::VExpr::prepare(_child_expr, state, _child_x->row_desc()));
-    return Status::OK();
-}
-
 Status UnionSinkOperatorX::open(RuntimeState* state) {
+    RETURN_IF_ERROR(DataSinkOperatorX<UnionSinkLocalState>::open(state));
+    RETURN_IF_ERROR(vectorized::VExpr::prepare(_child_expr, state, _child->row_desc()));
+    RETURN_IF_ERROR(vectorized::VExpr::check_expr_output_type(_child_expr, _row_descriptor));
     // open const expr lists.
     RETURN_IF_ERROR(vectorized::VExpr::open(_const_expr, state));
 
@@ -143,8 +89,7 @@ Status UnionSinkOperatorX::open(RuntimeState* state) {
     return Status::OK();
 }
 
-Status UnionSinkOperatorX::sink(RuntimeState* state, vectorized::Block* in_block,
-                                SourceState source_state) {
+Status UnionSinkOperatorX::sink(RuntimeState* state, vectorized::Block* in_block, bool eos) {
     auto& local_state = get_local_state(state);
     SCOPED_TIMER(local_state.exec_time_counter());
     COUNTER_UPDATE(local_state.rows_input_counter(), (int64_t)in_block->rows());
@@ -167,7 +112,7 @@ Status UnionSinkOperatorX::sink(RuntimeState* state, vectorized::Block* in_block
                                      _cur_child_id, _get_first_materialized_child_idx(),
                                      children_count());
     }
-    if (UNLIKELY(source_state == SourceState::FINISHED)) {
+    if (UNLIKELY(eos)) {
         //if _cur_child_id eos, need check to push block
         //Now here can't check _output_block rows, even it's row==0, also need push block
         //because maybe sink is eos and queue have none data, if not push block
@@ -188,4 +133,5 @@ Status UnionSinkOperatorX::sink(RuntimeState* state, vectorized::Block* in_block
     return Status::OK();
 }
 
+#include "common/compile_check_end.h"
 } // namespace doris::pipeline

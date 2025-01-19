@@ -59,6 +59,7 @@ public abstract class PartitionDefinition {
     public PartitionDefinition(boolean ifNotExists, String partName) {
         this.ifNotExists = ifNotExists;
         this.partitionName = partName;
+        this.properties = Maps.newHashMap();
     }
 
     public PartitionDefinition withProperties(Map<String, String> properties) {
@@ -161,7 +162,7 @@ public abstract class PartitionDefinition {
      */
     protected PartitionValue toLegacyPartitionValueStmt(Expression e) {
         if (e.isLiteral()) {
-            return new PartitionValue(((Literal) e).getStringValue());
+            return new PartitionValue(((Literal) e).getStringValue(), e.isNullLiteral());
         } else if (e instanceof MaxValue) {
             return PartitionValue.MAX_VALUE;
         }
