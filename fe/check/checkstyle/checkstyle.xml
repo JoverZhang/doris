@@ -431,15 +431,16 @@ under the License.
                      value="WhitespaceAround: ''{0}'' is not preceded with whitespace."/>
         </module>
 
+        <module name="PackageDeclaration">
+            <property name="matchDirectoryStructure" value="true"/>
+        </module>
+
         <!-- filter -->
         <!-- https://checkstyle.org/config_filters.html#SuppressionXpathFilter -->
         <module name="SuppressionXpathFilter">
             <property name="file" value="${org.checkstyle.google.suppressionxpathfilter.config}"
                       default="checkstyle-xpath-suppressions.xml" />
             <property name="optional" value="true"/>
-        </module>
-        <module name="IllegalImport">
-            <property name="illegalPkgs" value="io.trino"/>
         </module>
     </module>
 </module>

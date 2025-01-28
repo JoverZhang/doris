@@ -22,6 +22,7 @@ import org.apache.doris.analysis.Predicate;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.OlapTable;
+import org.apache.doris.catalog.Partition;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.FeConstants;
@@ -29,6 +30,7 @@ import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
 import org.apache.doris.common.util.ListComparator;
 import org.apache.doris.common.util.TimeUtils;
+import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.persist.gson.GsonUtils;
 import org.apache.doris.qe.ConnectContext;
@@ -102,8 +104,8 @@ public class DeleteHandler implements Writable {
     /**
      * used for Nereids planner
      */
-    public void process(Database targetDb, OlapTable targetTbl, List<String> partitionNames,
-            List<Predicate> deleteConditions, QueryState execState) {
+    public void process(Database targetDb, OlapTable targetTbl, List<Partition> selectedPartitions,
+            List<Predicate> deleteConditions, QueryState execState, List<String> partitionNames) {
         DeleteJob deleteJob = null;
         try {
             targetTbl.readLock();
@@ -113,10 +115,11 @@ public class DeleteHandler implements Writable {
                     // just add a comment here to notice.
                 }
                 deleteJob = DeleteJob.newBuilder()
-                        .buildWith(new DeleteJob.BuildParams(
+                        .buildWithNereids(new DeleteJob.BuildParams(
                                 targetDb,
                                 targetTbl,
                                 partitionNames,
+                                selectedPartitions,
                                 deleteConditions));
 
                 long txnId = deleteJob.beginTxn();
@@ -125,7 +128,7 @@ public class DeleteHandler implements Writable {
                 // must call this to make sure we only handle the tablet in the mIndex we saw here.
                 // table may be under schema change or rollup, and the newly created tablets will not be checked later,
                 // to make sure that the delete transaction can be done successfully.
-                txnState.addTableIndexes(targetTbl);
+                deleteJob.addTableIndexes(txnState);
                 idToDeleteJob.put(txnId, deleteJob);
                 deleteJob.dispatch();
             } finally {
@@ -244,6 +247,7 @@ public class DeleteHandler implements Writable {
         if (dbId == -1) {
             for (Long tempDbId : dbToDeleteInfos.keySet()) {
                 if (!Env.getCurrentEnv().getAccessManager().checkDbPriv(ConnectContext.get(),
+                        InternalCatalog.INTERNAL_CATALOG_NAME,
                         Env.getCurrentEnv().getCatalogMgr().getDbNullable(tempDbId).getFullName(),
                         PrivPredicate.LOAD)) {
                     continue;
@@ -262,9 +266,10 @@ public class DeleteHandler implements Writable {
             }
 
             for (DeleteInfo deleteInfo : deleteInfoList) {
-                if (!Env.getCurrentEnv().getAccessManager().checkTblPriv(ConnectContext.get(), dbName,
-                        deleteInfo.getTableName(),
-                        PrivPredicate.LOAD)) {
+                if (!Env.getCurrentEnv().getAccessManager()
+                        .checkTblPriv(ConnectContext.get(), InternalCatalog.INTERNAL_CATALOG_NAME, dbName,
+                                deleteInfo.getTableName(),
+                                PrivPredicate.LOAD)) {
                     continue;
                 }
 
@@ -346,6 +351,8 @@ public class DeleteHandler implements Writable {
                 iter1.remove();
             }
         }
-        LOG.debug("remove expired delete job info num: {}", counter);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("remove expired delete job info num: {}", counter);
+        }
     }
 }

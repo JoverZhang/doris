@@ -77,8 +77,8 @@ public class InSubquery extends SubqueryExpr {
     }
 
     @Override
-    public String toSql() {
-        return this.compareExpr.toSql() + " IN (" + super.toSql() + ")";
+    public String computeToSql() {
+        return this.compareExpr.toSql() + " IN (" + super.computeToSql() + ")";
     }
 
     @Override
@@ -106,7 +106,7 @@ public class InSubquery extends SubqueryExpr {
     public InSubquery withChildren(List<Expression> children) {
         Preconditions.checkArgument(children.size() == 2);
         Preconditions.checkArgument(children.get(1) instanceof ListQuery);
-        return new InSubquery(children.get(0), (ListQuery) children.get(1), isNot);
+        return new InSubquery(children.get(0), (ListQuery) children.get(1), correlateSlots, typeCoercionExpr, isNot);
     }
 
     @Override
@@ -127,7 +127,7 @@ public class InSubquery extends SubqueryExpr {
     }
 
     @Override
-    public int hashCode() {
+    public int computeHashCode() {
         return Objects.hash(this.compareExpr, this.listQuery, this.isNot);
     }
 

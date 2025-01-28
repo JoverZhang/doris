@@ -27,8 +27,11 @@
 
 #include <ostream>
 
+#include "cloud/cloud_internal_service.h"
+#include "cloud/config.h"
 #include "common/config.h"
 #include "common/logging.h"
+#include "olap/storage_engine.h"
 #include "runtime/exec_env.h"
 #include "service/backend_options.h"
 #include "service/internal_service.h"
@@ -57,25 +60,30 @@ BRpcService::~BRpcService() {
 }
 
 Status BRpcService::start(int port, int num_threads) {
-    if constexpr (!std::is_same_v<ExecEnv::Engine, StorageEngine>) {
-        // TODO(plat1ko): cloud mode
-        return Status::NotSupported("Currently only support local storage engine");
-    }
     // Add service
-    _server->AddService(
-            new PInternalServiceImpl(*ExecEnv::GetInstance()->get_storage_engine(), _exec_env),
-            brpc::SERVER_OWNS_SERVICE);
+    if (config::is_cloud_mode()) {
+        _server->AddService(
+                new CloudInternalServiceImpl(_exec_env->storage_engine().to_cloud(), _exec_env),
+                brpc::SERVER_OWNS_SERVICE);
+    } else {
+        _server->AddService(
+                new PInternalServiceImpl(_exec_env->storage_engine().to_local(), _exec_env),
+                brpc::SERVER_OWNS_SERVICE);
+    }
     // start service
     brpc::ServerOptions options;
     if (num_threads != -1) {
         options.num_threads = num_threads;
     }
+    options.idle_timeout_sec = config::brpc_idle_timeout_sec;
 
     if (config::enable_https) {
         auto sslOptions = options.mutable_ssl_options();
         sslOptions->default_cert.certificate = config::ssl_certificate_path;
         sslOptions->default_cert.private_key = config::ssl_private_key_path;
     }
+
+    options.has_builtin_services = config::enable_brpc_builtin_services;
 
     butil::EndPoint point;
     if (butil::str2endpoint(BackendOptions::get_service_bind_address(), port, &point) < 0) {

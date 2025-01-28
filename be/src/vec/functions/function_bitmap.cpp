@@ -76,6 +76,7 @@ class FunctionContext;
 } // namespace doris
 
 namespace doris::vectorized {
+#include "common/compile_check_begin.h"
 
 struct BitmapEmpty {
     static constexpr auto name = "bitmap_empty";
@@ -112,7 +113,7 @@ struct ToBitmap {
                     continue;
                 } else {
                     const char* raw_str = reinterpret_cast<const char*>(&data[offsets[i - 1]]);
-                    size_t str_size = offsets[i] - offsets[i - 1];
+                    int str_size = cast_set<int>(offsets[i] - offsets[i - 1]);
                     StringParser::ParseResult parse_result = StringParser::PARSE_SUCCESS;
                     uint64_t int_value = StringParser::string_to_unsigned_int<uint64_t>(
                             raw_str, str_size, &parse_result);
@@ -132,7 +133,9 @@ struct ToBitmap {
                         continue;
                     }
                 }
-                res_data[i].add(col->get_data()[i]);
+                if (auto value = col->get_data()[i]; value >= 0) {
+                    res_data[i].add(value);
+                }
             }
         }
     }
@@ -166,7 +169,8 @@ struct ToBitmapWithCheck {
                     continue;
                 } else {
                     const char* raw_str = reinterpret_cast<const char*>(&data[offsets[i - 1]]);
-                    size_t str_size = offsets[i] - offsets[i - 1];
+                    // The string lenght is less than 2G, so that cast the str size to int, not use size_t
+                    int str_size = cast_set<int>(offsets[i] - offsets[i - 1]);
                     StringParser::ParseResult parse_result = StringParser::PARSE_SUCCESS;
                     uint64_t int_value = StringParser::string_to_unsigned_int<uint64_t>(
                             raw_str, str_size, &parse_result);
@@ -263,11 +267,11 @@ struct BitmapFromBase64 {
             return Status::OK();
         }
         std::string decode_buff;
-        int last_decode_buff_len = 0;
-        int curr_decode_buff_len = 0;
+        size_t last_decode_buff_len = 0;
+        size_t curr_decode_buff_len = 0;
         for (size_t i = 0; i < input_rows_count; ++i) {
             const char* src_str = reinterpret_cast<const char*>(&data[offsets[i - 1]]);
-            int64_t src_size = offsets[i] - offsets[i - 1];
+            size_t src_size = offsets[i] - offsets[i - 1];
             if (0 != src_size % 4) {
                 // return Status::InvalidArgument(
                 //         fmt::format("invalid base64: {}", std::string(src_str, src_size)));
@@ -280,7 +284,7 @@ struct BitmapFromBase64 {
                 decode_buff.resize(curr_decode_buff_len);
                 last_decode_buff_len = curr_decode_buff_len;
             }
-            int outlen = base64_decode(src_str, src_size, decode_buff.data());
+            auto outlen = base64_decode(src_str, src_size, decode_buff.data());
             if (outlen < 0) {
                 res.emplace_back();
                 null_map[i] = 1;
@@ -347,10 +351,8 @@ public:
 
     size_t get_number_of_arguments() const override { return 1; }
 
-    bool use_default_implementation_for_nulls() const override { return true; }
-
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                        size_t result, size_t input_rows_count) const override {
+                        uint32_t result, size_t input_rows_count) const override {
         auto res_null_map = ColumnUInt8::create(input_rows_count, 0);
         auto res_data_column = ColumnBitmap::create();
         auto& null_map = res_null_map->get_data();
@@ -497,7 +499,7 @@ public:
     bool use_default_implementation_for_nulls() const override { return false; }
 
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                        size_t result, size_t input_rows_count) const override {
+                        uint32_t result, size_t input_rows_count) const override {
         auto res_data_column = ColumnInt64::create();
         auto& res = res_data_column->get_data();
         auto data_null_map = ColumnUInt8::create(input_rows_count, 0);
@@ -660,7 +662,7 @@ void update_bitmap_op_count(int64_t* __restrict count, const NullMap& null_map) 
 // for bitmap_and_count, bitmap_xor_count and bitmap_and_not_count,
 // result is 0 for rows that if any column is null value
 ColumnPtr handle_bitmap_op_count_null_value(ColumnPtr& src, const Block& block,
-                                            const ColumnNumbers& args, size_t result,
+                                            const ColumnNumbers& args, uint32_t result,
                                             size_t input_rows_count) {
     auto* nullable = assert_cast<const ColumnNullable*>(src.get());
     ColumnPtr src_not_nullable = nullable->get_nested_column_ptr();
@@ -683,8 +685,8 @@ ColumnPtr handle_bitmap_op_count_null_value(ColumnPtr& src, const Block& block,
             continue;
         }
 
-        if (auto* nullable = assert_cast<const ColumnNullable*>(elem.column.get())) {
-            const ColumnPtr& null_map_column = nullable->get_null_map_column_ptr();
+        if (const auto* nullable_column = assert_cast<const ColumnNullable*>(elem.column.get())) {
+            const ColumnPtr& null_map_column = nullable_column->get_null_map_column_ptr();
             const NullMap& src_null_map =
                     assert_cast<const ColumnUInt8&>(*null_map_column).get_data();
 
@@ -696,11 +698,11 @@ ColumnPtr handle_bitmap_op_count_null_value(ColumnPtr& src, const Block& block,
 }
 
 Status execute_bitmap_op_count_null_to_zero(
-        FunctionContext* context, Block& block, const ColumnNumbers& arguments, size_t result,
+        FunctionContext* context, Block& block, const ColumnNumbers& arguments, uint32_t result,
         size_t input_rows_count,
         const std::function<Status(FunctionContext*, Block&, const ColumnNumbers&, size_t, size_t)>&
                 exec_impl_func) {
-    if (get_null_presence(block, arguments)) {
+    if (have_null_column(block, arguments)) {
         auto [temporary_block, new_args, new_result] =
                 create_block_with_nested_columns(block, arguments, result);
         RETURN_IF_ERROR(exec_impl_func(context, temporary_block, new_args, new_result,
@@ -745,10 +747,10 @@ public:
     }
 
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                        size_t result, size_t input_rows_count) const override {
+                        uint32_t result, size_t input_rows_count) const override {
         DCHECK_EQ(arguments.size(), 2);
         auto impl_func = [&](FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                             size_t result, size_t input_rows_count) {
+                             uint32_t result, size_t input_rows_count) {
             return execute_impl_internal(context, block, arguments, result, input_rows_count);
         };
         return execute_bitmap_op_count_null_to_zero(context, block, arguments, result,
@@ -756,7 +758,7 @@ public:
     }
 
     Status execute_impl_internal(FunctionContext* context, Block& block,
-                                 const ColumnNumbers& arguments, size_t result,
+                                 const ColumnNumbers& arguments, uint32_t result,
                                  size_t input_rows_count) const {
         using ResultType = typename ResultDataType::FieldType;
         using ColVecResult = ColumnVector<ResultType>;
@@ -984,6 +986,7 @@ struct BitmapToBase64 {
     using Chars = ColumnString::Chars;
     using Offsets = ColumnString::Offsets;
 
+    // ColumnString not support 64bit, only 32bit, so that the max size is 4G
     static Status vector(const std::vector<BitmapValue>& data, Chars& chars, Offsets& offsets) {
         size_t size = data.size();
         offsets.resize(size);
@@ -991,7 +994,7 @@ struct BitmapToBase64 {
         for (size_t i = 0; i < size; ++i) {
             BitmapValue& bitmap_val = const_cast<BitmapValue&>(data[i]);
             auto ser_size = bitmap_val.getSizeInBytes();
-            output_char_size += ser_size * (int)(4.0 * ceil((double)ser_size / 3.0));
+            output_char_size += (int)(4.0 * ceil((double)ser_size / 3.0));
         }
         ColumnString::check_chars_length(output_char_size, size);
         chars.resize(output_char_size);
@@ -1010,12 +1013,12 @@ struct BitmapToBase64 {
             }
             bitmap_val.write_to(ser_buff.data());
 
-            int outlen = base64_encode((const unsigned char*)ser_buff.data(), cur_ser_size,
-                                       chars_data + encoded_offset);
+            auto outlen = base64_encode((const unsigned char*)ser_buff.data(), cur_ser_size,
+                                        chars_data + encoded_offset);
             DCHECK(outlen > 0);
 
             encoded_offset += (int)(4.0 * ceil((double)cur_ser_size / 3.0));
-            offsets[i] = encoded_offset;
+            offsets[i] = cast_set<UInt32>(encoded_offset);
         }
         return Status::OK();
     }
@@ -1146,10 +1149,8 @@ public:
 
     size_t get_number_of_arguments() const override { return 3; }
 
-    bool use_default_implementation_for_nulls() const override { return false; }
-
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                        size_t result, size_t input_rows_count) const override {
+                        uint32_t result, size_t input_rows_count) const override {
         DCHECK_EQ(arguments.size(), 3);
         auto res_null_map = ColumnUInt8::create(input_rows_count, 0);
         auto res_data_column = ColumnBitmap::create(input_rows_count);
@@ -1165,10 +1166,6 @@ public:
                                            : block.get_by_position(arguments[0]).column;
 
         default_preprocess_parameter_columns(argument_columns, col_const, {1, 2}, block, arguments);
-
-        for (int i = 0; i < 3; i++) {
-            check_set_nullable(argument_columns[i], res_null_map, col_const[i]);
-        }
 
         auto bitmap_column = assert_cast<const ColumnBitmap*>(argument_columns[0].get());
         auto offset_column = assert_cast<const ColumnVector<Int64>*>(argument_columns[1].get());
@@ -1205,10 +1202,8 @@ public:
 
     size_t get_number_of_arguments() const override { return 1; }
 
-    bool use_default_implementation_for_nulls() const override { return true; }
-
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                        size_t result, size_t input_rows_count) const override {
+                        uint32_t result, size_t input_rows_count) const override {
         auto return_nested_type = make_nullable(std::make_shared<DataTypeInt64>());
         auto dest_array_column_ptr = ColumnArray::create(return_nested_type->create_column(),
                                                          ColumnArray::ColumnOffsets::create());
@@ -1216,7 +1211,7 @@ public:
         IColumn* dest_nested_column = &dest_array_column_ptr->get_data();
         ColumnNullable* dest_nested_nullable_col =
                 reinterpret_cast<ColumnNullable*>(dest_nested_column);
-        dest_nested_column = dest_nested_nullable_col->get_nested_column_ptr();
+        dest_nested_column = dest_nested_nullable_col->get_nested_column_ptr().get();
         auto& dest_nested_null_map = dest_nested_nullable_col->get_null_map_column().get_data();
 
         auto& arg_col = block.get_by_position(arguments[0]).column;

@@ -15,12 +15,15 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import contextlib
 import docker
-import json
+import jsonpickle
 import logging
 import os
 import pwd
+import socket
 import subprocess
+import sys
 import time
 import yaml
 
@@ -28,7 +31,7 @@ DORIS_PREFIX = "doris-"
 
 LOG = None
 
-ENABLE_LOG = True
+ENALBE_LOG_STDOUT = True
 
 
 class Timer(object):
@@ -46,35 +49,41 @@ class Timer(object):
         self.canceled = True
 
 
-def set_enable_log(enabled):
-    global ENABLE_LOG
-    ENABLE_LOG = enabled
-    get_logger().disabled = not enabled
+def is_log_stdout():
+    return ENALBE_LOG_STDOUT
 
 
-def is_enable_log():
-    return ENABLE_LOG
+def set_log_verbose():
+    get_logger().setLevel(logging.DEBUG)
 
 
-def get_logger(name=None):
-    global LOG
-    if LOG != None:
-        return LOG
-
-    logger = logging.getLogger(name)
-    if not logger.hasHandlers():
+def set_log_to(log_file_name, is_to_stdout):
+    logger = get_logger()
+    for ch in logger.handlers:
+        logger.removeHandler(ch)
+    if log_file_name:
+        os.makedirs(os.path.dirname(log_file_name), exist_ok=True)
+        logger.addHandler(logging.FileHandler(log_file_name))
+    global ENALBE_LOG_STDOUT
+    ENALBE_LOG_STDOUT = is_to_stdout
+    if is_to_stdout:
+        logger.addHandler(logging.StreamHandler(sys.stdout))
+    for ch in logger.handlers:
         formatter = logging.Formatter(
             '%(asctime)s - %(filename)s - %(lineno)dL - %(levelname)s - %(message)s'
         )
-        ch = logging.StreamHandler()
         ch.setLevel(logging.DEBUG)
         ch.setFormatter(formatter)
-        logger.addHandler(ch)
-        logger.setLevel(logging.INFO)
 
-    LOG = logger
 
-    return logger
+def get_logger(name="doris-compose"):
+    global LOG
+    if LOG is None:
+        LOG = logging.getLogger(name)
+        LOG.setLevel(logging.INFO)
+        set_log_to(None, True)
+
+    return LOG
 
 
 get_logger()
@@ -179,25 +188,39 @@ def is_dir_empty(dir):
     return False if os.listdir(dir) else True
 
 
-def exec_shell_command(command, ignore_errors=False):
+def exec_shell_command(command, ignore_errors=False, output_real_time=False):
     LOG.info("Exec command: {}".format(command))
     p = subprocess.Popen(command,
                          shell=True,
                          stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT)
-    out = p.communicate()[0].decode('utf-8')
+    out = ''
+    exitcode = None
+    if output_real_time:
+        while p.poll() is None:
+            s = p.stdout.readline().decode('utf-8')
+            if s.rstrip():
+                for line in s.strip().splitlines():
+                    LOG.info("(docker) " + line)
+            out += s
+        exitcode = p.wait()
+    else:
+        out = p.communicate()[0].decode('utf-8')
+        exitcode = p.returncode
+        if out:
+            for line in out.splitlines():
+                LOG.info("(docker) " + line)
     if not ignore_errors:
-        assert p.returncode == 0, out
-    if ENABLE_LOG and out:
-        print(out)
-    return p.returncode, out
+        assert exitcode == 0, out
+    return exitcode, out
 
 
 def exec_docker_compose_command(compose_file,
                                 command,
                                 options=None,
                                 nodes=None,
-                                user_command=None):
+                                user_command=None,
+                                output_real_time=False):
     if nodes != None and not nodes:
         return 0, "Skip"
 
@@ -206,7 +229,7 @@ def exec_docker_compose_command(compose_file,
         " ".join([node.service_name() for node in nodes]) if nodes else "",
         user_command if user_command else "")
 
-    return exec_shell_command(compose_cmd)
+    return exec_shell_command(compose_cmd, output_real_time=output_real_time)
 
 
 def get_docker_subnets_prefix16():
@@ -262,6 +285,12 @@ def copy_image_directory(image, image_dir, local_dir):
         entrypoint="cp -r  {}  /opt/mount/".format(image_dir))
 
 
+def is_socket_avail(ip, port):
+    with contextlib.closing(socket.socket(socket.AF_INET,
+                                          socket.SOCK_STREAM)) as sock:
+        return sock.connect_ex((ip, port)) == 0
+
+
 def enable_dir_with_rw_perm(dir):
     if not os.path.exists(dir):
         return
@@ -279,6 +308,13 @@ def get_path_owner(path):
         return ""
 
 
+def get_path_uid(path):
+    try:
+        return os.stat(path).st_uid
+    except:
+        return ""
+
+
 def read_compose_file(file):
     with open(file, "r") as f:
         return yaml.safe_load(f.read())
@@ -290,7 +326,7 @@ def write_compose_file(file, compose):
 
 
 def pretty_json(json_data):
-    return json.dumps(json_data, indent=4, sort_keys=True)
+    return jsonpickle.dumps(json_data, indent=4)
 
 
 def is_true(val):

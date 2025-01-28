@@ -29,6 +29,7 @@ import org.apache.doris.common.util.Util;
 import org.apache.doris.load.routineload.AbstractDataSourceProperties;
 import org.apache.doris.load.routineload.RoutineLoadDataSourcePropertyFactory;
 import org.apache.doris.load.routineload.RoutineLoadJob;
+import org.apache.doris.qe.ConnectContext;
 
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Maps;
@@ -47,7 +48,7 @@ import java.util.Optional;
  * ...
  * )
  */
-public class AlterRoutineLoadStmt extends DdlStmt {
+public class AlterRoutineLoadStmt extends DdlStmt implements NotFallbackInParser {
 
     private static final String NAME_TYPE = "ROUTINE LOAD NAME";
 
@@ -66,6 +67,9 @@ public class AlterRoutineLoadStmt extends DdlStmt {
             .add(CreateRoutineLoadStmt.PARTIAL_COLUMNS)
             .add(LoadStmt.STRICT_MODE)
             .add(LoadStmt.TIMEZONE)
+            .add(CreateRoutineLoadStmt.WORKLOAD_GROUP)
+            .add(LoadStmt.KEY_ENCLOSE)
+            .add(LoadStmt.KEY_ESCAPE)
             .build();
 
     private final LabelName labelName;
@@ -199,7 +203,7 @@ public class AlterRoutineLoadStmt extends DdlStmt {
             long maxBatchSizeBytes = Util.getLongPropertyOrDefault(
                     jobProperties.get(CreateRoutineLoadStmt.MAX_BATCH_SIZE_PROPERTY),
                     -1, CreateRoutineLoadStmt.MAX_BATCH_SIZE_PRED,
-                    CreateRoutineLoadStmt.MAX_BATCH_SIZE_PROPERTY + " should between 100MB and 1GB");
+                    CreateRoutineLoadStmt.MAX_BATCH_SIZE_PROPERTY + " should between 100MB and 10GB");
             analyzedJobProperties.put(CreateRoutineLoadStmt.MAX_BATCH_SIZE_PROPERTY,
                     String.valueOf(maxBatchSizeBytes));
         }
@@ -242,6 +246,18 @@ public class AlterRoutineLoadStmt extends DdlStmt {
             analyzedJobProperties.put(CreateRoutineLoadStmt.PARTIAL_COLUMNS,
                     String.valueOf(isPartialUpdate));
         }
+        if (jobProperties.containsKey(CreateRoutineLoadStmt.WORKLOAD_GROUP)) {
+            String workloadGroup = jobProperties.get(CreateRoutineLoadStmt.WORKLOAD_GROUP);
+            long wgId = Env.getCurrentEnv().getWorkloadGroupMgr()
+                    .getWorkloadGroup(ConnectContext.get().getCurrentUserIdentity(), workloadGroup);
+            analyzedJobProperties.put(CreateRoutineLoadStmt.WORKLOAD_GROUP, String.valueOf(wgId));
+        }
+        if (jobProperties.containsKey(LoadStmt.KEY_ENCLOSE)) {
+            analyzedJobProperties.put(LoadStmt.KEY_ENCLOSE, jobProperties.get(LoadStmt.KEY_ENCLOSE));
+        }
+        if (jobProperties.containsKey(LoadStmt.KEY_ESCAPE)) {
+            analyzedJobProperties.put(LoadStmt.KEY_ESCAPE, jobProperties.get(LoadStmt.KEY_ESCAPE));
+        }
     }
 
     private void checkDataSourceProperties() throws UserException {
@@ -256,4 +272,10 @@ public class AlterRoutineLoadStmt extends DdlStmt {
         dataSourceProperties.setTimezone(job.getTimezone());
         dataSourceProperties.analyze();
     }
+
+    @Override
+    public StmtType stmtType() {
+        return StmtType.ALTER;
+    }
+
 }

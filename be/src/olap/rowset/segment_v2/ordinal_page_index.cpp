@@ -29,9 +29,11 @@
 #include "olap/olap_common.h"
 #include "olap/rowset/segment_v2/page_handle.h"
 #include "olap/rowset/segment_v2/page_io.h"
+#include "ordinal_page_index.h"
 #include "util/slice.h"
 
 namespace doris {
+
 namespace segment_v2 {
 
 void OrdinalIndexWriter::append_entry(ordinal_t ordinal, const PagePointer& data_pp) {
@@ -67,15 +69,17 @@ Status OrdinalIndexWriter::finish(io::FileWriter* file_writer, ColumnIndexMetaPB
     return Status::OK();
 }
 
-Status OrdinalIndexReader::load(bool use_page_cache, bool kept_in_memory) {
+Status OrdinalIndexReader::load(bool use_page_cache, bool kept_in_memory,
+                                OlapReaderStatistics* index_load_stats) {
     // TODO yyq: implement a new once flag to avoid status construct.
-    return _load_once.call([this, use_page_cache, kept_in_memory] {
-        return _load(use_page_cache, kept_in_memory, std::move(_meta_pb));
+    return _load_once.call([this, use_page_cache, kept_in_memory, index_load_stats] {
+        return _load(use_page_cache, kept_in_memory, std::move(_meta_pb), index_load_stats);
     });
 }
 
 Status OrdinalIndexReader::_load(bool use_page_cache, bool kept_in_memory,
-                                 std::unique_ptr<OrdinalIndexPB> index_meta) {
+                                 std::unique_ptr<OrdinalIndexPB> index_meta,
+                                 OlapReaderStatistics* stats) {
     if (index_meta->root_page().is_root_data_page()) {
         // only one data page, no index page
         _num_pages = 1;
@@ -86,6 +90,7 @@ Status OrdinalIndexReader::_load(bool use_page_cache, bool kept_in_memory,
     }
     // need to read index page
     OlapReaderStatistics tmp_stats;
+    OlapReaderStatistics* stats_ptr = stats != nullptr ? stats : &tmp_stats;
     PageReadOptions opts {
             .use_page_cache = use_page_cache,
             .kept_in_memory = kept_in_memory,
@@ -94,8 +99,9 @@ Status OrdinalIndexReader::_load(bool use_page_cache, bool kept_in_memory,
             .page_pointer = PagePointer(index_meta->root_page().root_page()),
             // ordinal index page uses NO_COMPRESSION right now
             .codec = nullptr,
-            .stats = &tmp_stats,
-            .io_ctx = io::IOContext {.is_index_data = true},
+            .stats = stats_ptr,
+            .io_ctx = io::IOContext {.is_index_data = true,
+                                     .file_cache_stats = &stats_ptr->file_cache_stats},
     };
 
     // read index page
@@ -111,6 +117,7 @@ Status OrdinalIndexReader::_load(bool use_page_cache, bool kept_in_memory,
     _num_pages = reader.count();
     _ordinals.resize(_num_pages + 1);
     _pages.resize(_num_pages);
+
     for (int i = 0; i < _num_pages; i++) {
         Slice key = reader.get_key(i);
         ordinal_t ordinal = 0;
@@ -122,7 +129,15 @@ Status OrdinalIndexReader::_load(bool use_page_cache, bool kept_in_memory,
         _pages[i] = reader.get_value(i);
     }
     _ordinals[_num_pages] = _num_values;
+
+    update_metadata_size();
+
     return Status::OK();
+}
+
+int64_t OrdinalIndexReader::get_metadata_size() const {
+    return sizeof(OrdinalIndexReader) + _ordinals.capacity() * sizeof(ordinal_t) +
+           _pages.capacity() * sizeof(PagePointer);
 }
 
 OrdinalPageIndexIterator OrdinalIndexReader::seek_at_or_before(ordinal_t ordinal) {
@@ -145,6 +160,8 @@ OrdinalPageIndexIterator OrdinalIndexReader::seek_at_or_before(ordinal_t ordinal
     }
     return OrdinalPageIndexIterator(this, left);
 }
+
+OrdinalIndexReader::~OrdinalIndexReader() = default;
 
 } // namespace segment_v2
 } // namespace doris

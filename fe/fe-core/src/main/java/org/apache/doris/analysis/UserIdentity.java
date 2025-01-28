@@ -112,6 +112,10 @@ public class UserIdentity implements Writable, GsonPostProcessable {
         return user;
     }
 
+    public String getUser() {
+        return user;
+    }
+
     public String getHost() {
         return host;
     }
@@ -183,6 +187,10 @@ public class UserIdentity implements Writable, GsonPostProcessable {
 
     public boolean isAdminUser() {
         return user.equals(Auth.ADMIN_USER);
+    }
+
+    public boolean isSystemUser() {
+        return isRootUser() || isAdminUser();
     }
 
     public TUserIdentity toThrift() {

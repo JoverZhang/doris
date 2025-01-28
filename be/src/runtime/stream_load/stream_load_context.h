@@ -37,6 +37,7 @@
 #include "common/utils.h"
 #include "runtime/exec_env.h"
 #include "runtime/stream_load/stream_load_executor.h"
+#include "runtime/thread_context.h"
 #include "util/byte_buffer.h"
 #include "util/time.h"
 #include "util/uid_util.h"
@@ -118,10 +119,23 @@ public:
     // also print the load source info if detail is set to true
     std::string brief(bool detail = false) const;
 
+    bool is_mow_table() const;
+
+    Status allocate_schema_buffer() {
+        if (_schema_buffer == nullptr) {
+            SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(
+                    ExecEnv::GetInstance()->stream_load_pipe_tracker());
+            return ByteBuffer::allocate(config::stream_tvf_buffer_size, &_schema_buffer);
+        }
+        return Status::OK();
+    }
+
+    ByteBufferPtr schema_buffer() { return _schema_buffer; }
+
 public:
     static const int default_txn_id = -1;
     // load type, eg: ROUTINE LOAD/MANUAL LOAD
-    TLoadType::type load_type;
+    TLoadType::type load_type = TLoadType::type::MANUL_LOAD;
     // load data source: eg: KAFKA/RAW
     TLoadSourceType::type load_src_type;
 
@@ -150,9 +164,10 @@ public:
 
     // the following members control the max progress of a consuming
     // process. if any of them reach, the consuming will finish.
-    int64_t max_interval_s = 5;
-    int64_t max_batch_rows = 100000;
-    int64_t max_batch_size = 100 * 1024 * 1024; // 100MB
+    // same as values set in fe/fe-core/src/main/java/org/apache/doris/load/routineload/RoutineLoadJob.java
+    int64_t max_interval_s = 60;
+    int64_t max_batch_rows = 20000000;
+    int64_t max_batch_size = 1024 * 1024 * 1024; // 1GB
 
     // for parse json-data
     std::string data_format = "";
@@ -182,8 +197,6 @@ public:
     std::shared_ptr<MessageBodySink> body_sink;
     std::shared_ptr<io::StreamLoadPipe> pipe;
 
-    ByteBufferPtr schema_buffer = ByteBuffer::allocate(config::stream_tvf_buffer_size);
-
     TStreamLoadPutResult put_result;
     TStreamLoadMultiTablePutResult multi_table_put_result;
 
@@ -208,6 +221,8 @@ public:
     int64_t pre_commit_txn_cost_nanos = 0;
     int64_t read_data_cost_nanos = 0;
     int64_t write_data_cost_nanos = 0;
+    int64_t receive_and_read_data_cost_nanos = 0;
+    int64_t begin_receive_and_read_data_cost_nanos = 0;
 
     std::string error_url = "";
     // if label already be used, set existing job's status here
@@ -234,11 +249,16 @@ public:
 
     bool memtable_on_sink_node = false;
 
+    // use for cloud cluster mode
+    std::string qualified_user;
+    std::string cloud_cluster;
+
 public:
     ExecEnv* exec_env() { return _exec_env; }
 
 private:
     ExecEnv* _exec_env = nullptr;
+    ByteBufferPtr _schema_buffer;
 };
 
 } // namespace doris

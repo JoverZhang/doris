@@ -70,6 +70,8 @@ class DateTimeFormatterUtilsTest {
         assertDatePart(dateTime);
         dateTime = formatter.parse("20200219T010101.1");
         assertDatePart(dateTime);
+        dateTime = formatter.parse("20200219T010101.0000001");
+        assertDatePart(dateTime);
 
         // failed case
         DateTimeFormatter withT = DateTimeFormatterUtils.BASIC_DATE_TIME_FORMATTER;
@@ -77,11 +79,9 @@ class DateTimeFormatterUtilsTest {
         Assertions.assertThrows(DateTimeParseException.class, () -> withT.parse("20200219010101."));
         Assertions.assertThrows(DateTimeParseException.class, () -> withT.parse("20200219010101.0000001"));
         Assertions.assertThrows(DateTimeParseException.class, () -> withT.parse("20200219T010101."));
-        Assertions.assertThrows(DateTimeParseException.class, () -> withT.parse("20200219T010101.0000001"));
         DateTimeFormatter withoutT = DateTimeFormatterUtils.BASIC_FORMATTER_WITHOUT_T;
         Assertions.assertThrows(DateTimeParseException.class, () -> withoutT.parse("20200219 010101"));
         Assertions.assertThrows(DateTimeParseException.class, () -> withoutT.parse("20200219010101."));
-        Assertions.assertThrows(DateTimeParseException.class, () -> withoutT.parse("20200219010101.0000001"));
         Assertions.assertThrows(DateTimeParseException.class, () -> withoutT.parse("20200219T010101."));
         Assertions.assertThrows(DateTimeParseException.class, () -> withoutT.parse("20200219T010101.0000001"));
     }
@@ -110,5 +110,31 @@ class DateTimeFormatterUtilsTest {
         assertTime.accept(dateTime);
         Assertions.assertThrows(DateTimeParseException.class, () -> timeFormatter.parse("01:01"));
         Assertions.assertThrows(DateTimeParseException.class, () -> timeFormatter.parse("01"));
+    }
+
+    @Test
+    void testZoneDateFormatter() {
+        DateTimeFormatter formatter = DateTimeFormatterUtils.ZONE_DATE_FORMATTER;
+        TemporalAccessor date = formatter.parse("2020-02-19Asia/Shanghai");
+        assertDatePart(date);
+        date = formatter.parse("2020-02-19UTC+08:00");
+        assertDatePart(date);
+        date = formatter.parse("2020-02-19+08:00");
+        assertDatePart(date);
+        Assertions.assertThrows(DateTimeParseException.class, () -> formatter.parse("2020-02-19 Asia/Shanghai"));
+        Assertions.assertThrows(DateTimeParseException.class, () -> formatter.parse("2020-02-19++08:00"));
+    }
+
+    @Test
+    void testZoneDateTimeFormatter() {
+        DateTimeFormatter formatter = DateTimeFormatterUtils.ZONE_DATE_TIME_FORMATTER;
+        TemporalAccessor dateTime = formatter.parse("2020-02-19 00:00:00Asia/Shanghai");
+        assertDatePart(dateTime);
+        dateTime = formatter.parse("2020-02-19 00:00:00UTC+08:00");
+        assertDatePart(dateTime);
+        dateTime = formatter.parse("2020-02-19 00:00:00+08:00");
+        assertDatePart(dateTime);
+        Assertions.assertThrows(DateTimeParseException.class, () -> formatter.parse("2020-02-19 00:00:00 Asia/Shanghai"));
+        Assertions.assertThrows(DateTimeParseException.class, () -> formatter.parse("2020-02-19 00:00:00++08:00"));
     }
 }

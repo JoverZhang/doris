@@ -18,48 +18,38 @@
 #pragma once
 
 #include "operator.h"
-#include "pipeline/pipeline_x/dependency.h"
-#include "pipeline/pipeline_x/operator.h"
-#include "vec/exec/join/vjoin_node_base.h"
 
-namespace doris {
-
-namespace pipeline {
+namespace doris::pipeline {
+#include "common/compile_check_begin.h"
 template <typename LocalStateType>
 class JoinProbeOperatorX;
-template <typename DependencyType, typename Derived>
-class JoinProbeLocalState : public PipelineXLocalState<DependencyType> {
+template <typename SharedStateArg, typename Derived>
+class JoinProbeLocalState : public PipelineXLocalState<SharedStateArg> {
 public:
-    using Base = PipelineXLocalState<DependencyType>;
+    using Base = PipelineXLocalState<SharedStateArg>;
     Status init(RuntimeState* state, LocalStateInfo& info) override;
     Status close(RuntimeState* state) override;
-    virtual void add_tuple_is_null_column(vectorized::Block* block) = 0;
 
 protected:
     template <typename LocalStateType>
     friend class StatefulOperatorX;
     JoinProbeLocalState(RuntimeState* state, OperatorXBase* parent)
-            : Base(state, parent),
-              _child_block(vectorized::Block::create_unique()),
-              _child_source_state(SourceState::DEPEND_ON_SOURCE) {}
+            : Base(state, parent), _child_block(vectorized::Block::create_unique()) {}
     ~JoinProbeLocalState() override = default;
     void _construct_mutable_join_block();
-    Status _build_output_block(vectorized::Block* origin_block, vectorized::Block* output_block,
-                               bool keep_origin = true);
-    void _reset_tuple_is_null_column();
+    Status _build_output_block(vectorized::Block* origin_block, vectorized::Block* output_block);
     // output expr
-    vectorized::VExprContextSPtrs _output_expr_ctxs;
     vectorized::Block _join_block;
-    vectorized::MutableColumnPtr _tuple_is_null_left_flag_column = nullptr;
-    vectorized::MutableColumnPtr _tuple_is_null_right_flag_column = nullptr;
 
-    RuntimeProfile::Counter* _probe_timer = nullptr;
+    size_t _mark_column_id = -1;
+
     RuntimeProfile::Counter* _probe_rows_counter = nullptr;
     RuntimeProfile::Counter* _join_filter_timer = nullptr;
     RuntimeProfile::Counter* _build_output_block_timer = nullptr;
+    RuntimeProfile::Counter* _finish_probe_phase_timer = nullptr;
 
     std::unique_ptr<vectorized::Block> _child_block = nullptr;
-    SourceState _child_source_state;
+    bool _child_eos = false;
 };
 
 template <typename LocalStateType>
@@ -68,10 +58,12 @@ public:
     using Base = StatefulOperatorX<LocalStateType>;
     JoinProbeOperatorX(ObjectPool* pool, const TPlanNode& tnode, int operator_id,
                        const DescriptorTbl& descs);
-    Status init(const TPlanNode& tnode, RuntimeState* state) override;
-
-    Status open(doris::RuntimeState* state) override;
-    [[nodiscard]] const RowDescriptor& row_desc() override { return *_output_row_desc; }
+    [[nodiscard]] const RowDescriptor& row_desc() const override {
+        if (Base::_output_row_descriptor) {
+            return *Base::_output_row_descriptor;
+        }
+        return *_output_row_desc;
+    }
 
     [[nodiscard]] const RowDescriptor& intermediate_row_desc() const override {
         return *_intermediate_row_desc;
@@ -79,23 +71,23 @@ public:
 
     [[nodiscard]] bool is_source() const override { return false; }
 
-    void set_build_side_child(OperatorXPtr& build_side_child) {
+    void set_build_side_child(OperatorPtr& build_side_child) {
         _build_side_child = build_side_child;
     }
 
-    Status set_child(OperatorXPtr child) override {
-        if (OperatorX<LocalStateType>::_child_x && _build_side_child == nullptr) {
+    Status set_child(OperatorPtr child) override {
+        if (OperatorX<LocalStateType>::_child && _build_side_child == nullptr) {
             // when there already (probe) child, others is build child.
             set_build_side_child(child);
         } else {
             // first child which is probe side is in this pipeline
-            OperatorX<LocalStateType>::_child_x = std::move(child);
+            RETURN_IF_ERROR(OperatorX<LocalStateType>::set_child(child));
         }
         return Status::OK();
     }
 
 protected:
-    template <typename DependencyType, typename Derived>
+    template <typename SharedStateArg, typename Derived>
     friend class JoinProbeLocalState;
 
     const TJoinOp::type _join_op;
@@ -111,11 +103,9 @@ protected:
 
     std::unique_ptr<RowDescriptor> _output_row_desc;
     std::unique_ptr<RowDescriptor> _intermediate_row_desc;
-    // output expr
-    vectorized::VExprContextSPtrs _output_expr_ctxs;
-    OperatorXPtr _build_side_child = nullptr;
+    OperatorPtr _build_side_child = nullptr;
     const bool _short_circuit_for_null_in_build_side;
 };
 
-} // namespace pipeline
-} // namespace doris
+#include "common/compile_check_end.h"
+} // namespace doris::pipeline

@@ -28,6 +28,7 @@ import org.apache.doris.common.io.Text;
 import org.apache.doris.nereids.trees.expressions.functions.udf.AliasUdf;
 import org.apache.doris.nereids.trees.expressions.functions.udf.JavaUdaf;
 import org.apache.doris.nereids.trees.expressions.functions.udf.JavaUdf;
+import org.apache.doris.nereids.trees.expressions.functions.udf.JavaUdtf;
 import org.apache.doris.nereids.types.DataType;
 
 import com.google.common.base.Strings;
@@ -37,7 +38,6 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
@@ -66,7 +66,9 @@ public class FunctionUtil {
         List<Function> existFuncs = name2Function.get(functionName);
         if (existFuncs == null) {
             if (ifExists) {
-                LOG.debug("function name does not exist: " + functionName);
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("function name does not exist: " + functionName);
+                }
                 return false;
             }
             throw new UserException("function name does not exist: " + functionName);
@@ -82,7 +84,9 @@ public class FunctionUtil {
         }
         if (!isFound) {
             if (ifExists) {
-                LOG.debug("function does not exist: " + function);
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("function does not exist: " + function);
+                }
                 return false;
             }
             throw new UserException("function does not exist: " + function);
@@ -113,7 +117,9 @@ public class FunctionUtil {
                 for (Function existFunc : existFuncs) {
                     if (function.compare(existFunc, Function.CompareMode.IS_IDENTICAL)) {
                         if (ifNotExists) {
-                            LOG.debug("function already exists");
+                            if (LOG.isDebugEnabled()) {
+                                LOG.debug("function already exists");
+                            }
                             return false;
                         }
                         throw new UserException("function already exists");
@@ -168,19 +174,6 @@ public class FunctionUtil {
         return Function.getFunction(fns, desc, mode);
     }
 
-    public static void write(DataOutput out, ConcurrentMap<String, ImmutableList<Function>> name2Function)
-            throws IOException {
-        // write functions
-        out.writeInt(name2Function.size());
-        for (Entry<String, ImmutableList<Function>> entry : name2Function.entrySet()) {
-            Text.writeString(out, entry.getKey());
-            out.writeInt(entry.getValue().size());
-            for (Function function : entry.getValue()) {
-                function.write(out);
-            }
-        }
-    }
-
     public static void readFields(DataInput in, String dbName,
             ConcurrentMap<String, ImmutableList<Function>> name2Function)
             throws IOException {
@@ -232,7 +225,11 @@ public class FunctionUtil {
             if (function instanceof AliasFunction) {
                 AliasUdf.translateToNereidsFunction(dbName, ((AliasFunction) function));
             } else if (function instanceof ScalarFunction) {
-                JavaUdf.translateToNereidsFunction(dbName, ((ScalarFunction) function));
+                if (function.isUDTFunction()) {
+                    JavaUdtf.translateToNereidsFunction(dbName, ((ScalarFunction) function));
+                } else {
+                    JavaUdf.translateToNereidsFunction(dbName, ((ScalarFunction) function));
+                }
             } else if (function instanceof AggregateFunction) {
                 JavaUdaf.translateToNereidsFunction(dbName, ((AggregateFunction) function));
             }

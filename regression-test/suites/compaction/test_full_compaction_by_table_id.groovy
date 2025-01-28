@@ -20,6 +20,11 @@ import org.codehaus.groovy.runtime.IOGroovyMethods
 suite("test_full_compaction_by_table_id") {
     def tableName = "test_full_compaction_by_table_id"
 
+    if (isCloudMode()) {
+        logger.info("compaction by table id in be is not supported in cloud mode");
+        return;
+    }
+
     try {
         String backend_id;
 
@@ -48,11 +53,12 @@ suite("test_full_compaction_by_table_id") {
         sql """
             CREATE TABLE ${tableName} (
             `user_id` INT NOT NULL, `value` INT NOT NULL)
-            UNIQUE KEY(`user_id`) 
-            DISTRIBUTED BY HASH(`user_id`) 
-            BUCKETS 8 
+            UNIQUE KEY(`user_id`)
+            DISTRIBUTED BY HASH(`user_id`)
+            BUCKETS 8
             PROPERTIES ("replication_allocation" = "tag.location.default: 1",
             "disable_auto_compaction" = "true",
+            "enable_mow_light_delete" = "false",
             "enable_unique_key_merge_on_write" = "true");"""
 
         // version1 (1,1)(2,2)
@@ -100,12 +106,12 @@ suite("test_full_compaction_by_table_id") {
         qt_skip_delete """select * from ${tableName} order by user_id, value"""
 
         //TabletId,ReplicaId,BackendId,SchemaHash,Version,LstSuccessVersion,LstFailedVersion,LstFailedTime,LocalDataSize,RemoteDataSize,RowCount,State,LstConsistencyCheckTime,CheckVersion,VersionCount,PathHash,MetaUrl,CompactionStatus
-        String[][] tablets = sql """ show tablets from ${tableName}; """
+        def tablets = sql_return_maparray """ show tablets from ${tableName}; """
 
         // before full compaction, there are 7 rowsets in all tablets.
-        for (int i=0; i<tablets.size(); ++i) {
+        for (def tablet : tablets) {
             int rowsetCount = 0
-            def (code, out, err) = curl("GET", tablets[i][18])
+            def (code, out, err) = curl("GET", tablet.CompactionStatus)
             logger.info("Show tablets status: code=" + code + ", out=" + out + ", err=" + err)
             assertEquals(code, 0)
             def tabletJson = parseJson(out.trim())
@@ -115,61 +121,22 @@ suite("test_full_compaction_by_table_id") {
         }
 
         // trigger full compactions for all tablets by table id in ${tableName}
-        // TODO: get table id
-        for (int i=0; i<tablets.size(); ++i) {
-            String tablet_id = tablets[i][0]
-            String[][] tablet_info = sql """ show tablet ${tablet_id}; """
-            logger.info("tablet"+tablet_info)
-            def table_id = tablet_info[0][5]
-            backend_id = tablets[i][2]
-            def times = 1
-            def code, out, err
-            do{
-                (code, out, err) = be_run_full_compaction_by_table_id(backendId_to_backendIP.get(backend_id), backendId_to_backendHttpPort.get(backend_id), table_id)
-                logger.info("Run compaction: code=" + code + ", out=" + out + ", err=" + err)
-                ++times
-                sleep(2000)
-            } while (parseJson(out.trim()).status.toLowerCase()!="success" && times<=10)
-
-            def compactJson = parseJson(out.trim())
-            if (compactJson.status.toLowerCase() == "fail") {
-                assertEquals(disableAutoCompaction, false)
-                logger.info("Compaction was done automatically!")
-            }
-            if (disableAutoCompaction) {
-                assertEquals("success", compactJson.status.toLowerCase())
-            }
-        }
-
-        // wait for full compaction done
-        {
-            for (int i=0; i<tablets.size(); ++i) {
-                boolean running = true
-                do {
-                    Thread.sleep(1000)
-                    def tablet_id = tablets[i][0]
-                    backend_id = tablets[i][2]
-                    def (code, out, err) = be_get_compaction_status(backendId_to_backendIP.get(backend_id), backendId_to_backendHttpPort.get(backend_id), tablet_id)
-                    logger.info("Get compaction status: code=" + code + ", out=" + out + ", err=" + err)
-                    assertEquals(code, 0)
-                    def compactionStatus = parseJson(out.trim())
-                    assertEquals("success", compactionStatus.status.toLowerCase())
-                    running = compactionStatus.run_status
-                } while (running)
-            }
-        }
+        trigger_and_wait_compaction(tableName, "full")
 
         // after full compaction, there is only 1 rowset.
-        
-        for (int i=0; i<tablets.size(); ++i) {
+        for (def tablet : tablets) {
             int rowsetCount = 0
-            def (code, out, err) = curl("GET", tablets[i][18])
+            def (code, out, err) = curl("GET", tablet.CompactionStatus)
             logger.info("Show tablets status: code=" + code + ", out=" + out + ", err=" + err)
             assertEquals(code, 0)
             def tabletJson = parseJson(out.trim())
             assert tabletJson.rowsets instanceof List
             rowsetCount =((List<String>) tabletJson.rowsets).size()
-            assertEquals (rowsetCount, 1)
+            if (isCloudMode()) {
+                assertEquals (rowsetCount, 2)
+            } else {
+                assertEquals (rowsetCount, 1)
+            }
         }
 
 

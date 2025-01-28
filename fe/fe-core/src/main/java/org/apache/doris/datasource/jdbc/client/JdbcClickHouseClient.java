@@ -20,16 +20,105 @@ package org.apache.doris.datasource.jdbc.client;
 import org.apache.doris.catalog.ArrayType;
 import org.apache.doris.catalog.ScalarType;
 import org.apache.doris.catalog.Type;
+import org.apache.doris.datasource.jdbc.util.JdbcFieldSchema;
+
+import com.google.common.collect.Lists;
+
+import java.sql.Connection;
+import java.sql.DatabaseMetaData;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.List;
+import java.util.Optional;
+import java.util.function.Consumer;
 
 public class JdbcClickHouseClient extends JdbcClient {
 
+    private final Boolean databaseTermIsCatalog;
+
     protected JdbcClickHouseClient(JdbcClientConfig jdbcClientConfig) {
         super(jdbcClientConfig);
+        try (Connection conn = getConnection()) {
+            String jdbcUrl = conn.getMetaData().getURL();
+            if (!isNewClickHouseDriver(getJdbcDriverVersion())) {
+                this.databaseTermIsCatalog = false;
+            } else {
+                this.databaseTermIsCatalog = "catalog".equalsIgnoreCase(getDatabaseTermFromUrl(jdbcUrl));
+            }
+        } catch (SQLException e) {
+            throw new JdbcClientException("Failed to initialize JdbcClickHouseClient: %s", e.getMessage());
+        }
     }
 
     @Override
-    protected String getDatabaseQuery() {
-        return "SHOW DATABASES";
+    public List<String> getDatabaseNameList() {
+        Connection conn = null;
+        ResultSet rs = null;
+        List<String> remoteDatabaseNames = Lists.newArrayList();
+        try {
+            conn = getConnection();
+            if (isOnlySpecifiedDatabase && includeDatabaseMap.isEmpty() && excludeDatabaseMap.isEmpty()) {
+                if (databaseTermIsCatalog) {
+                    remoteDatabaseNames.add(conn.getCatalog());
+                } else {
+                    remoteDatabaseNames.add(conn.getSchema());
+                }
+            } else {
+                if (databaseTermIsCatalog) {
+                    rs = conn.getMetaData().getCatalogs();
+                } else {
+                    rs = conn.getMetaData().getSchemas(conn.getCatalog(), null);
+                }
+                while (rs.next()) {
+                    remoteDatabaseNames.add(rs.getString(1));
+                }
+            }
+        } catch (SQLException e) {
+            throw new JdbcClientException("failed to get database name list from jdbc", e);
+        } finally {
+            close(rs, conn);
+        }
+        return filterDatabaseNames(remoteDatabaseNames);
+    }
+
+    @Override
+    protected void processTable(String remoteDbName, String remoteTableName, String[] tableTypes,
+            Consumer<ResultSet> resultSetConsumer) {
+        Connection conn = null;
+        ResultSet rs = null;
+        try {
+            conn = super.getConnection();
+            DatabaseMetaData databaseMetaData = conn.getMetaData();
+            if (databaseTermIsCatalog) {
+                rs = databaseMetaData.getTables(remoteDbName, null, remoteTableName, tableTypes);
+            } else {
+                rs = databaseMetaData.getTables(null, remoteDbName, remoteTableName, tableTypes);
+            }
+            resultSetConsumer.accept(rs);
+        } catch (SQLException e) {
+            throw new JdbcClientException("Failed to process table", e);
+        } finally {
+            close(rs, conn);
+        }
+    }
+
+    @Override
+    protected ResultSet getRemoteColumns(DatabaseMetaData databaseMetaData, String catalogName, String remoteDbName,
+            String remoteTableName) throws SQLException {
+        if (databaseTermIsCatalog) {
+            return databaseMetaData.getColumns(remoteDbName, null, remoteTableName, null);
+        } else {
+            return databaseMetaData.getColumns(catalogName, remoteDbName, remoteTableName, null);
+        }
+    }
+
+    @Override
+    protected String getCatalogName(Connection conn) throws SQLException {
+        if (databaseTermIsCatalog) {
+            return null;
+        } else {
+            return conn.getCatalog();
+        }
     }
 
     @Override
@@ -40,7 +129,7 @@ public class JdbcClickHouseClient extends JdbcClient {
     @Override
     protected Type jdbcTypeToDoris(JdbcFieldSchema fieldSchema) {
 
-        String ckType = fieldSchema.getDataTypeName();
+        String ckType = fieldSchema.getDataTypeName().orElse("unknown");
 
         if (ckType.startsWith("LowCardinality")) {
             fieldSchema.setAllowNull(true);
@@ -86,7 +175,7 @@ public class JdbcClickHouseClient extends JdbcClient {
 
         if (ckType.startsWith("Array")) {
             String cktype = ckType.substring(6, ckType.length() - 1);
-            fieldSchema.setDataTypeName(cktype);
+            fieldSchema.setDataTypeName(Optional.of(cktype));
             Type type = jdbcTypeToDoris(fieldSchema);
             return ArrayType.create(type, true);
         }
@@ -121,6 +210,45 @@ public class JdbcClickHouseClient extends JdbcClient {
                 return ScalarType.createDateV2Type();
             default:
                 return Type.UNSUPPORTED;
+        }
+    }
+
+    /**
+     * Determine whether the driver version is greater than or equal to 0.5.0.
+     */
+    private static boolean isNewClickHouseDriver(String driverVersion) {
+        if (driverVersion == null) {
+            throw new JdbcClientException("Driver version cannot be null");
+        }
+        try {
+            String[] versionParts = driverVersion.split("\\.");
+            int majorVersion = Integer.parseInt(versionParts[0]);
+            int minorVersion = Integer.parseInt(versionParts[1]);
+            // Determine whether it is greater than or equal to 0.5.x
+            return (majorVersion > 0) || (majorVersion == 0 && minorVersion >= 5);
+        } catch (NumberFormatException | ArrayIndexOutOfBoundsException e) {
+            throw new JdbcClientException("Invalid clickhouse driver version format: " + driverVersion, e);
+        }
+    }
+
+    /**
+     * Extract databaseterm parameters from the jdbc url.
+     */
+    private String getDatabaseTermFromUrl(String jdbcUrl) {
+        if (jdbcUrl != null && jdbcUrl.toLowerCase().contains("databaseterm=schema")) {
+            return "schema";
+        }
+        return "catalog";
+    }
+
+    /**
+     * Get the driver version.
+     */
+    public String getJdbcDriverVersion() {
+        try (Connection conn = getConnection()) {
+            return conn.getMetaData().getDriverVersion();
+        } catch (SQLException e) {
+            throw new JdbcClientException("Failed to get jdbc driver version", e);
         }
     }
 }

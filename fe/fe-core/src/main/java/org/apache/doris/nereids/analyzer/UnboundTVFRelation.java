@@ -21,7 +21,6 @@ import org.apache.doris.nereids.exceptions.UnboundException;
 import org.apache.doris.nereids.memo.GroupExpression;
 import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.properties.UnboundLogicalProperties;
-import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.Properties;
 import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.expressions.functions.table.TableValuedFunction;
@@ -80,11 +79,6 @@ public class UnboundTVFRelation extends LogicalRelation implements TVFRelation, 
     }
 
     @Override
-    public List<? extends Expression> getExpressions() {
-        throw new UnsupportedOperationException(this.getClass().getSimpleName() + " don't support getExpression()");
-    }
-
-    @Override
     public List<Slot> computeOutput() {
         throw new UnboundException("output");
     }
@@ -99,6 +93,11 @@ public class UnboundTVFRelation extends LogicalRelation implements TVFRelation, 
     public Plan withGroupExprLogicalPropChildren(Optional<GroupExpression> groupExpression,
             Optional<LogicalProperties> logicalProperties, List<Plan> children) {
         return new UnboundTVFRelation(relationId, functionName, properties, groupExpression, logicalProperties);
+    }
+
+    @Override
+    public UnboundTVFRelation withRelationId(RelationId relationId) {
+        throw new UnboundException("should not call UnboundTVFRelation's withRelationId method");
     }
 
     @Override

@@ -28,11 +28,14 @@ add_library(Service STATIC ${SRC_FILES})
 
 pch_reuse(Service)
 
-if (${MAKE_TEST} STREQUAL "OFF")
+if (${MAKE_TEST} STREQUAL "OFF" AND ${BUILD_BENCHMARK} STREQUAL "OFF")
     add_executable(doris_be
         doris_main.cpp
     )
 
+    if (ENABLE_CLANG_COVERAGE AND ENABLE_CLANG_COVERAGE STREQUAL ON AND COMPILER_CLANG)
+        target_compile_definitions(doris_be PRIVATE -DLLVM_PROFILE)
+    endif ()
     pch_reuse(doris_be)
 
     # This permits libraries loaded by dlopen to link to the symbols in the program.

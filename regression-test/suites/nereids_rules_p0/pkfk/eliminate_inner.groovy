@@ -88,6 +88,7 @@ suite("eliminate_inner") {
         qt_shape "explain shape plan ${sql}"
         order_qt_res "${sql}"
     }
+
     // not nullable
     check_shape_res("select fkt_not_null.* from pkt inner join fkt_not_null on pkt.pk = fkt_not_null.fk;", "simple_case")
     check_shape_res("select fkt_not_null.*, pkt.pk from pkt inner join fkt_not_null on pkt.pk = fkt_not_null.fk;", "with_pk_col")
@@ -96,7 +97,7 @@ suite("eliminate_inner") {
     check_shape_res("select fkt_not_null.*, pkt.pk from pkt inner join (select fkt_not_null1.fk from fkt_not_null as fkt_not_null1 group by fkt_not_null1.fk) fkt_not_null on pkt.pk = fkt_not_null.fk;", "with_pk_col")
     check_shape_res("select fkt_not_null.*, pkt.pk from pkt inner join (select * from fkt_not_null union select * from fkt_not_null) fkt_not_null on pkt.pk = fkt_not_null.fk;", "with_pk_col")
     check_shape_res("select fkt_not_null.*, pkt.pk from pkt inner join (select fk, ROW_NUMBER() OVER (PARTITION BY fk ORDER BY fk) AS RowNum from fkt_not_null) fkt_not_null on pkt.pk = fkt_not_null.fk;", "fk with window")
-    check_shape_res("select fkt_not_null.*, pkt.pk from pkt inner join (select fk from fkt_not_null limit 1) fkt_not_null on pkt.pk = fkt_not_null.fk;", "fk with limit")
+    check_shape_res("select fkt_not_null.*, pkt.pk from pkt inner join (select fk from fkt_not_null order by fk limit 1) fkt_not_null on pkt.pk = fkt_not_null.fk;", "fk with limit")
     check_shape_res("select fkt_not_null.*, pkt.pk from pkt inner join fkt_not_null on pkt.pk = fkt_not_null.fk where pkt.pk = 1 and fkt_not_null.fk = 1;", "pk with filter that same as fk")
     check_shape_res("select fkt_not_null.*, pkt.pk from pkt inner join fkt_not_null on pkt.pk = fkt_not_null.fk where pkt.pk = 1 and fkt_not_null.fk = 1 and fkt_not_null.f = 1;", "pk with filter that included same as fk")
     check_shape_res("select fkt_not_null.*, pkt.pk from pkt inner join fkt_not_null on pkt.pk = fkt_not_null.fk where pkt.p = 1 and fkt_not_null.fk = 1 and fkt_not_null.f = 1;;", "pk with filter that not same as fk")
@@ -109,9 +110,14 @@ suite("eliminate_inner") {
     check_shape_res("select fkt.*, pkt.pk from pkt inner join (select fkt1.fk from fkt as fkt1 group by fkt1.fk) fkt on pkt.pk = fkt.fk;", "with_pk_col")
     check_shape_res("select fkt.*, pkt.pk from pkt inner join (select * from fkt union select * from fkt) fkt on pkt.pk = fkt.fk;", "with_pk_col")
     check_shape_res("select fkt.*, pkt.pk from pkt inner join (select fk, ROW_NUMBER() OVER (PARTITION BY fk ORDER BY fk) AS RowNum from fkt) fkt on pkt.pk = fkt.fk;", "fk with window")
-    check_shape_res("select fkt.*, pkt.pk from pkt inner join (select fk from fkt limit 1) fkt on pkt.pk = fkt.fk;", "fk with limit")
+    check_shape_res("select fkt.*, pkt.pk from pkt inner join (select fk from fkt order by fk limit 1 ) fkt on pkt.pk = fkt.fk;", "fk with limit")
     check_shape_res("select fkt.*, pkt.pk from pkt inner join fkt on pkt.pk = fkt.fk where pkt.pk = 1 and fkt.fk = 1;", "pk with filter that same as fk")
     check_shape_res("select fkt.*, pkt.pk from pkt inner join fkt on pkt.pk = fkt.fk where pkt.pk = 1 and fkt.fk = 1 and fkt.f = 1;", "pk with filter that included same as fk")
-    check_shape_res("select fkt.*, pkt.pk from pkt inner join fkt on pkt.pk = fkt.fk where pkt.p = 1 and fkt.fk = 1 and fkt.f = 1;;", "pk with filter that not same as fk")
+    check_shape_res("select fkt.*, pkt.pk from pkt inner join fkt on pkt.pk = fkt.fk where pkt.p = 1 and fkt.fk = 1 and fkt.f = 1;", "pk with filter that not same as fk")
 
+  // Test multiple table joins, where fkt_not_null and pkt have a primary key-foreign key relationship, and fkt_not_null2 is an foreign table.
+  check_shape_res("select fkt_not_null.* from pkt inner join fkt_not_null on pkt.pk = fkt_not_null.fk inner join fkt_not_null as fkt_not_null2 on fkt_not_null.fk = fkt_not_null2.fk  where pkt.p = 1;", "multi_table_join_with_pk_predicate")
+
+  // Test multiple table joins, where fkt_not_null and pkt have a primary key-foreign key relationship, fkt_not_null2 is an foreign table, and predicates exist in both tables.
+  check_shape_res("select fkt_not_null.* from pkt inner join fkt_not_null on pkt.pk = fkt_not_null.fk inner join fkt_not_null as fkt_not_null2 on fkt_not_null.fk = fkt_not_null2.fk where pkt.pk = 1;", "multi_table_join_with_pk_fk_predicate")
 }

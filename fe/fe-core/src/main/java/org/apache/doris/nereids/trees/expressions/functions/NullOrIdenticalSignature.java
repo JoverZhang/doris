@@ -21,6 +21,7 @@ import org.apache.doris.catalog.FunctionSignature;
 import org.apache.doris.nereids.types.DataType;
 import org.apache.doris.nereids.types.NullType;
 import org.apache.doris.nereids.types.coercion.AnyDataType;
+import org.apache.doris.nereids.types.coercion.ComplexDataType;
 
 import java.util.List;
 
@@ -46,6 +47,9 @@ public interface NullOrIdenticalSignature extends ComputeSignature {
                 return true;
             }
             if (signatureType instanceof AnyDataType) {
+                return false;
+            }
+            if (signatureType instanceof ComplexDataType && !(realType instanceof ComplexDataType)) {
                 return false;
             }
             return realType.toCatalogDataType().matchesType(signatureType.toCatalogDataType());

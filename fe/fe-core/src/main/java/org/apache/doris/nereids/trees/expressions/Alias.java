@@ -23,11 +23,13 @@ import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
 import org.apache.doris.nereids.types.DataType;
 
 import com.google.common.base.Preconditions;
+import com.google.common.base.Suppliers;
 import com.google.common.collect.ImmutableList;
 
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.Supplier;
 
 /**
  * Expression for alias, such as col1 as c1.
@@ -35,7 +37,7 @@ import java.util.Optional;
 public class Alias extends NamedExpression implements UnaryExpression {
 
     private final ExprId exprId;
-    private final String name;
+    private final Supplier<String> name;
     private final List<String> qualifier;
     private final boolean nameFromChild;
 
@@ -46,15 +48,24 @@ public class Alias extends NamedExpression implements UnaryExpression {
      * @param name alias name
      */
     public Alias(Expression child, String name) {
-        this(StatementScopeIdGenerator.newExprId(), child, name, false);
+        this(child, name, false);
+    }
+
+    public Alias(Expression child, String name, boolean nameFromChild) {
+        this(StatementScopeIdGenerator.newExprId(), child, name, nameFromChild);
     }
 
     public Alias(Expression child) {
-        this(StatementScopeIdGenerator.newExprId(), child, child.toSql(), true);
+        this(StatementScopeIdGenerator.newExprId(), ImmutableList.of(child),
+                Suppliers.memoize(child::toSql), ImmutableList.of(), true);
     }
 
     public Alias(ExprId exprId, Expression child, String name) {
         this(exprId, ImmutableList.of(child), name, ImmutableList.of(), false);
+    }
+
+    public Alias(Expression child, String name, List<String> qualifier) {
+        this(StatementScopeIdGenerator.newExprId(), ImmutableList.of(child), name, qualifier, false);
     }
 
     public Alias(ExprId exprId, Expression child, String name, boolean nameFromChild) {
@@ -62,6 +73,11 @@ public class Alias extends NamedExpression implements UnaryExpression {
     }
 
     public Alias(ExprId exprId, List<Expression> child, String name, List<String> qualifier, boolean nameFromChild) {
+        this(exprId, child, Suppliers.memoize(() -> name), qualifier, nameFromChild);
+    }
+
+    private Alias(ExprId exprId, List<Expression> child, Supplier<String> name,
+            List<String> qualifier, boolean nameFromChild) {
         super(child);
         this.exprId = exprId;
         this.name = name;
@@ -71,16 +87,29 @@ public class Alias extends NamedExpression implements UnaryExpression {
 
     @Override
     public Slot toSlot() throws UnboundException {
+        SlotReference slotReference = child() instanceof SlotReference
+                ? (SlotReference) child() : null;
+
+        Supplier<Optional<String>> internalName = nameFromChild
+                        ? Suppliers.memoize(() -> Optional.of(child().toString()))
+                        : () -> Optional.of(name.get());
         return new SlotReference(exprId, name, child().getDataType(), child().nullable(), qualifier,
-                child() instanceof SlotReference
-                        ? ((SlotReference) child()).getColumn().orElse(null)
+                slotReference != null
+                        ? ((SlotReference) child()).getTable().orElse(null)
                         : null,
-                nameFromChild ? Optional.of(child().toString()) : Optional.of(name));
+                slotReference != null
+                        ? slotReference.getColumn().orElse(null)
+                        : null,
+                internalName,
+                slotReference != null
+                        ? slotReference.getSubPath()
+                        : ImmutableList.of(), Optional.empty()
+        );
     }
 
     @Override
     public String getName() throws UnboundException {
-        return name;
+        return name.get();
     }
 
     @Override
@@ -99,8 +128,8 @@ public class Alias extends NamedExpression implements UnaryExpression {
     }
 
     @Override
-    public String toSql() {
-        return child().toSql() + " AS `" + name + "`";
+    public String computeToSql() {
+        return child().toSql() + " AS `" + name.get() + "`";
     }
 
     @Override
@@ -109,35 +138,31 @@ public class Alias extends NamedExpression implements UnaryExpression {
     }
 
     @Override
-    public boolean equals(Object o) {
-        if (this == o) {
-            return true;
-        }
-        if (o == null || getClass() != o.getClass()) {
+    protected boolean extraEquals(Expression other) {
+        Alias that = (Alias) other;
+        if (!exprId.equals(that.exprId) || !qualifier.equals(that.qualifier)) {
             return false;
         }
-        Alias that = (Alias) o;
-        return exprId.equals(that.exprId)
-                && name.equals(that.name)
-                && qualifier.equals(that.qualifier)
-                && child().equals(that.child());
+
+        return nameFromChild || name.get().equals(that.name.get());
     }
 
     @Override
-    public int hashCode() {
-        return Objects.hash(exprId, name, qualifier, children());
+    public int computeHashCode() {
+        return Objects.hash(exprId, qualifier);
     }
 
     @Override
     public String toString() {
-        return child().toString() + " AS `" + name + "`#" + exprId;
+        return child().toString() + " AS `" + name.get() + "`#" + exprId;
     }
 
     @Override
     public Alias withChildren(List<Expression> children) {
         Preconditions.checkArgument(children.size() == 1);
         if (nameFromChild) {
-            return new Alias(exprId, children, children.get(0).toSql(), qualifier, nameFromChild);
+            return new Alias(exprId, children,
+                    Suppliers.memoize(() -> children.get(0).toSql()), qualifier, nameFromChild);
         } else {
             return new Alias(exprId, children, name, qualifier, nameFromChild);
         }

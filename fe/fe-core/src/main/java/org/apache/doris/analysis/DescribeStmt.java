@@ -32,6 +32,7 @@ import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.FeConstants;
+import org.apache.doris.common.Pair;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.proc.IndexSchemaProcNode;
 import org.apache.doris.common.proc.ProcNodeInterface;
@@ -44,6 +45,7 @@ import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.ShowResultSetMetaData;
 
 import com.google.common.base.Preconditions;
+import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 import org.apache.commons.lang3.StringUtils;
@@ -55,9 +57,10 @@ import java.util.Arrays;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
-public class DescribeStmt extends ShowStmt {
+public class DescribeStmt extends ShowStmt implements NotFallbackInParser {
     private static final Logger LOG = LogManager.getLogger(DescribeStmt.class);
     private static final ShowResultSetMetaData DESC_OLAP_TABLE_ALL_META_DATA =
             ShowResultSetMetaData.builder()
@@ -123,39 +126,38 @@ public class DescribeStmt extends ShowStmt {
 
     @Override
     public void analyze(Analyzer analyzer) throws UserException {
+        // First handle meta table.
+        // It will convert this to corresponding table valued functions
+        // eg: DESC table$partitions -> partition_values(...)
+        if (dbTableName != null) {
+            dbTableName.analyze(analyzer);
+            CatalogIf catalog = Env.getCurrentEnv().getCatalogMgr().getCatalogOrAnalysisException(dbTableName.getCtl());
+            Pair<String, String> sourceTableNameWithMetaName = catalog.getSourceTableNameWithMetaTableName(
+                    dbTableName.getTbl());
+            if (!Strings.isNullOrEmpty(sourceTableNameWithMetaName.second)) {
+                isTableValuedFunction = true;
+                Optional<TableValuedFunctionRef> optTvfRef = catalog.getMetaTableFunctionRef(
+                        dbTableName.getDb(), dbTableName.getTbl());
+                if (!optTvfRef.isPresent()) {
+                    throw new AnalysisException("meta table not found: " + sourceTableNameWithMetaName.second);
+                }
+                tableValuedFunctionRef = optTvfRef.get();
+            }
+        }
+
         if (!isAllTables && isTableValuedFunction) {
             tableValuedFunctionRef.analyze(analyzer);
             List<Column> columns = tableValuedFunctionRef.getTable().getBaseSchema();
             for (Column column : columns) {
                 List<String> row = Arrays.asList(
                         column.getName(),
-                        column.getOriginType().toString(),
+                        column.getOriginType().hideVersionForVersionColumn(true),
                         column.isAllowNull() ? "Yes" : "No",
                         ((Boolean) column.isKey()).toString(),
                         column.getDefaultValue() == null
                                 ? FeConstants.null_string : column.getDefaultValue(),
                         "NONE"
                 );
-                if (column.getOriginType().isDatetimeV2()) {
-                    StringBuilder typeStr = new StringBuilder("DATETIME");
-                    if (((ScalarType) column.getOriginType()).getScalarScale() > 0) {
-                        typeStr.append("(").append(((ScalarType) column.getOriginType()).getScalarScale()).append(")");
-                    }
-                    row.set(1, typeStr.toString());
-                } else if (column.getOriginType().isDateV2()) {
-                    row.set(1, "DATE");
-                } else if (column.getOriginType().isDecimalV3()) {
-                    StringBuilder typeStr = new StringBuilder("DECIMAL");
-                    ScalarType sType = (ScalarType) column.getOriginType();
-                    int scale = sType.getScalarScale();
-                    int precision = sType.getScalarPrecision();
-                    // not default
-                    if (scale > 0 && precision != 9) {
-                        typeStr.append("(").append(precision).append(", ").append(scale)
-                                .append(")");
-                    }
-                    row.set(1, typeStr.toString());
-                }
                 totalRows.add(row);
             }
             return;
@@ -168,8 +170,6 @@ public class DescribeStmt extends ShowStmt {
             }
         }
 
-        dbTableName.analyze(analyzer);
-
         if (!Env.getCurrentEnv().getAccessManager()
                 .checkTblPriv(ConnectContext.get(), dbTableName, PrivPredicate.SHOW)) {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_TABLEACCESS_DENIED_ERROR, "DESCRIBE",
@@ -179,8 +179,7 @@ public class DescribeStmt extends ShowStmt {
 
         CatalogIf catalog = Env.getCurrentEnv().getCatalogMgr().getCatalogOrAnalysisException(dbTableName.getCtl());
         DatabaseIf db = catalog.getDbOrAnalysisException(dbTableName.getDb());
-        TableIf table = db.getTableOrAnalysisException(dbTableName.getTbl());
-
+        TableIf table = db.getTableOrDdlException(dbTableName.getTbl());
         table.readLock();
         try {
             if (!isAllTables) {
@@ -363,7 +362,9 @@ public class DescribeStmt extends ShowStmt {
                                     getDb(), getTableName(), Sets.newHashSet(row.get(0)), PrivPredicate.SHOW);
                     res.add(row);
                 } catch (UserException e) {
-                    LOG.debug(e.getMessage());
+                    if (LOG.isDebugEnabled()) {
+                        LOG.debug(e.getMessage());
+                    }
                 }
             }
             return res;
@@ -405,3 +406,4 @@ public class DescribeStmt extends ShowStmt {
         return emptyRow;
     }
 }
+

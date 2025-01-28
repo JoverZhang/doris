@@ -17,7 +17,6 @@
 
 package org.apache.doris.analysis;
 
-import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.DatabaseIf;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.TableIf;
@@ -26,7 +25,6 @@ import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.UserException;
 import org.apache.doris.datasource.CatalogIf;
-import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.qe.ConnectContext;
 
@@ -35,7 +33,6 @@ import org.apache.commons.lang3.StringUtils;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
-import java.util.stream.Collectors;
 
 /**
  * Manually drop statistics for tables or partitions.
@@ -45,34 +42,33 @@ import java.util.stream.Collectors;
  * syntax:
  * DROP [EXPIRED] STATS [TableName [PARTITIONS(partitionNames)]];
  */
-public class DropStatsStmt extends DdlStmt {
+public class DropStatsStmt extends DdlStmt implements NotFallbackInParser {
 
+    public static final int MAX_IN_ELEMENT_TO_DELETE = 100;
     public final boolean dropExpired;
 
     private final TableName tableName;
     private Set<String> columnNames;
-    // Flag to drop external table row count in table_statistics.
-    private boolean dropTableRowCount;
+    private PartitionNames partitionNames;
+    private boolean isAllColumns;
 
+    private long catalogId;
+    private long dbId;
     private long tblId;
 
     public DropStatsStmt(boolean dropExpired) {
         this.dropExpired = dropExpired;
         this.tableName = null;
         this.columnNames = null;
-        this.dropTableRowCount = false;
+        this.partitionNames = null;
     }
 
     public DropStatsStmt(TableName tableName,
-            List<String> columnNames) {
+            List<String> columnNames, PartitionNames partitionNames) {
         this.tableName = tableName;
+        this.partitionNames = partitionNames;
         if (columnNames != null) {
             this.columnNames = new HashSet<>(columnNames);
-            this.dropTableRowCount = false;
-        } else {
-            // columnNames == null means drop all columns, in this case,
-            // external table need to drop the table row count as well.
-            dropTableRowCount = true;
         }
         dropExpired = false;
     }
@@ -87,12 +83,11 @@ public class DropStatsStmt extends DdlStmt {
         if (dropExpired) {
             return;
         }
+        if (tableName == null) {
+            throw new UserException("Should specify a valid table name.");
+        }
         tableName.analyze(analyzer);
         String catalogName = tableName.getCtl();
-        if (InternalCatalog.INTERNAL_CATALOG_NAME.equals(catalogName)) {
-            // Internal table doesn't need to drop table row count.
-            dropTableRowCount = false;
-        }
         String dbName = tableName.getDb();
         String tblName = tableName.getTbl();
         CatalogIf catalog = analyzer.getEnv().getCatalogMgr()
@@ -100,10 +95,16 @@ public class DropStatsStmt extends DdlStmt {
         DatabaseIf db = catalog.getDbOrAnalysisException(dbName);
         TableIf table = db.getTableOrAnalysisException(tblName);
         tblId = table.getId();
+        dbId = db.getId();
+        catalogId = catalog.getId();
         // check permission
-        checkAnalyzePriv(db.getFullName(), table.getName());
+        checkAnalyzePriv(catalogName, db.getFullName(), table.getName());
         // check columnNames
         if (columnNames != null) {
+            if (columnNames.size() > MAX_IN_ELEMENT_TO_DELETE) {
+                throw new UserException("Can't delete more that " + MAX_IN_ELEMENT_TO_DELETE + " columns at one time.");
+            }
+            isAllColumns = false;
             for (String cName : columnNames) {
                 if (table.getColumn(cName) == null) {
                     ErrorReport.reportAnalysisException(
@@ -115,7 +116,11 @@ public class DropStatsStmt extends DdlStmt {
                 }
             }
         } else {
-            columnNames = table.getColumns().stream().map(Column::getName).collect(Collectors.toSet());
+            isAllColumns = true;
+        }
+        if (partitionNames != null && partitionNames.getPartitionNames() != null
+                && partitionNames.getPartitionNames().size() > MAX_IN_ELEMENT_TO_DELETE) {
+            throw new UserException("Can't delete more that " + MAX_IN_ELEMENT_TO_DELETE + " partitions at one time");
         }
     }
 
@@ -123,12 +128,24 @@ public class DropStatsStmt extends DdlStmt {
         return tblId;
     }
 
+    public long getDbId() {
+        return dbId;
+    }
+
+    public long getCatalogIdId() {
+        return catalogId;
+    }
+
     public Set<String> getColumnNames() {
         return columnNames;
     }
 
-    public boolean dropTableRowCount() {
-        return dropTableRowCount;
+    public boolean isAllColumns() {
+        return isAllColumns;
+    }
+
+    public PartitionNames getPartitionNames() {
+        return partitionNames;
     }
 
     @Override
@@ -146,6 +163,16 @@ public class DropStatsStmt extends DdlStmt {
             sb.append(")");
         }
 
+        if (partitionNames != null) {
+            sb.append(" PARTITION(");
+            if (partitionNames.isStar()) {
+                sb.append("*");
+            } else {
+                sb.append(StringUtils.join(partitionNames.getPartitionNames(), ","));
+            }
+            sb.append(")");
+        }
+
         return sb.toString();
     }
 
@@ -154,9 +181,10 @@ public class DropStatsStmt extends DdlStmt {
         return toSql();
     }
 
-    private void checkAnalyzePriv(String dbName, String tblName) throws AnalysisException {
+    private void checkAnalyzePriv(String catalogName, String dbName, String tblName) throws AnalysisException {
         if (!Env.getCurrentEnv().getAccessManager()
-                .checkTblPriv(ConnectContext.get(), dbName, tblName, PrivPredicate.DROP)) {
+                .checkTblPriv(ConnectContext.get(), catalogName, dbName, tblName,
+                        PrivPredicate.DROP)) {
             ErrorReport.reportAnalysisException(
                     ErrorCode.ERR_TABLEACCESS_DENIED_ERROR,
                     "DROP",
@@ -164,5 +192,10 @@ public class DropStatsStmt extends DdlStmt {
                     ConnectContext.get().getRemoteIP(),
                     dbName + "." + tblName);
         }
+    }
+
+    @Override
+    public StmtType stmtType() {
+        return StmtType.DROP;
     }
 }

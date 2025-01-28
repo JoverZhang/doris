@@ -44,34 +44,28 @@ class RuntimeProfile;
 
 namespace doris::vectorized {
 
-#define FOR_FIXED_LENGTH_TYPES(M)                                      \
-    M(TypeIndex::Int8, ColumnVector<Int8>, Int8)                       \
-    M(TypeIndex::UInt8, ColumnVector<UInt8>, UInt8)                    \
-    M(TypeIndex::Int16, ColumnVector<Int16>, Int16)                    \
-    M(TypeIndex::UInt16, ColumnVector<UInt16>, UInt16)                 \
-    M(TypeIndex::Int32, ColumnVector<Int32>, Int32)                    \
-    M(TypeIndex::UInt32, ColumnVector<UInt32>, UInt32)                 \
-    M(TypeIndex::Int64, ColumnVector<Int64>, Int64)                    \
-    M(TypeIndex::UInt64, ColumnVector<UInt64>, UInt64)                 \
-    M(TypeIndex::Int128, ColumnVector<Int128>, Int128)                 \
-    M(TypeIndex::Float32, ColumnVector<Float32>, Float32)              \
-    M(TypeIndex::Float64, ColumnVector<Float64>, Float64)              \
-    M(TypeIndex::Decimal128V2, ColumnDecimal<Decimal<Int128>>, Int128) \
-    M(TypeIndex::Decimal128V3, ColumnDecimal<Decimal<Int128>>, Int128) \
-    M(TypeIndex::Decimal32, ColumnDecimal<Decimal<Int32>>, Int32)      \
-    M(TypeIndex::Decimal64, ColumnDecimal<Decimal<Int64>>, Int64)      \
-    M(TypeIndex::Date, ColumnVector<Int64>, Int64)                     \
-    M(TypeIndex::DateV2, ColumnVector<UInt32>, UInt32)                 \
-    M(TypeIndex::DateTime, ColumnVector<Int64>, Int64)                 \
-    M(TypeIndex::DateTimeV2, ColumnVector<UInt64>, UInt64)
-
-JniConnector::~JniConnector() {
-    Status st = close();
-    if (!st.ok()) {
-        // Ensure successful resource release
-        LOG(FATAL) << "Failed to release jni resource: " << st.to_string();
-    }
-}
+#define FOR_FIXED_LENGTH_TYPES(M)                                   \
+    M(TypeIndex::Int8, ColumnVector<Int8>, Int8)                    \
+    M(TypeIndex::UInt8, ColumnVector<UInt8>, UInt8)                 \
+    M(TypeIndex::Int16, ColumnVector<Int16>, Int16)                 \
+    M(TypeIndex::UInt16, ColumnVector<UInt16>, UInt16)              \
+    M(TypeIndex::Int32, ColumnVector<Int32>, Int32)                 \
+    M(TypeIndex::UInt32, ColumnVector<UInt32>, UInt32)              \
+    M(TypeIndex::Int64, ColumnVector<Int64>, Int64)                 \
+    M(TypeIndex::UInt64, ColumnVector<UInt64>, UInt64)              \
+    M(TypeIndex::Int128, ColumnVector<Int128>, Int128)              \
+    M(TypeIndex::Float32, ColumnVector<Float32>, Float32)           \
+    M(TypeIndex::Float64, ColumnVector<Float64>, Float64)           \
+    M(TypeIndex::Decimal128V2, ColumnDecimal<Decimal128V2>, Int128) \
+    M(TypeIndex::Decimal128V3, ColumnDecimal<Decimal128V3>, Int128) \
+    M(TypeIndex::Decimal32, ColumnDecimal<Decimal<Int32>>, Int32)   \
+    M(TypeIndex::Decimal64, ColumnDecimal<Decimal<Int64>>, Int64)   \
+    M(TypeIndex::Date, ColumnVector<Int64>, Int64)                  \
+    M(TypeIndex::DateV2, ColumnVector<UInt32>, UInt32)              \
+    M(TypeIndex::DateTime, ColumnVector<Int64>, Int64)              \
+    M(TypeIndex::DateTimeV2, ColumnVector<UInt64>, UInt64)          \
+    M(TypeIndex::IPv4, ColumnVector<IPv4>, IPv4)                    \
+    M(TypeIndex::IPv6, ColumnVector<IPv6>, IPv6)
 
 Status JniConnector::open(RuntimeState* state, RuntimeProfile* profile) {
     _state = state;
@@ -88,27 +82,28 @@ Status JniConnector::open(RuntimeState* state, RuntimeProfile* profile) {
         batch_size = _state->batch_size();
     }
     RETURN_IF_ERROR(JniUtil::GetJNIEnv(&env));
-    if (env == nullptr) {
-        return Status::InternalError("Failed to get/create JVM");
-    }
     SCOPED_TIMER(_open_scanner_time);
+    _scanner_params.emplace("time_zone", _state->timezone());
     RETURN_IF_ERROR(_init_jni_scanner(env, batch_size));
     // Call org.apache.doris.common.jni.JniScanner#open
     env->CallVoidMethod(_jni_scanner_obj, _jni_scanner_open);
-    _scanner_opened = true;
     RETURN_ERROR_IF_EXC(env);
+    _scanner_opened = true;
     return Status::OK();
 }
 
 Status JniConnector::init(
         std::unordered_map<std::string, ColumnValueRangeType>* colname_to_value_range) {
-    _generate_predicates(colname_to_value_range);
-    if (_predicates_length != 0 && _predicates != nullptr) {
-        int64_t predicates_address = (int64_t)_predicates.get();
-        // We can call org.apache.doris.common.jni.vec.ScanPredicate#parseScanPredicates to parse the
-        // serialized predicates in java side.
-        _scanner_params.emplace("push_down_predicates", std::to_string(predicates_address));
-    }
+    // TODO: This logic need to be changed.
+    // See the comment of "predicates" field in JniScanner.java
+
+    // _generate_predicates(colname_to_value_range);
+    // if (_predicates_length != 0 && _predicates != nullptr) {
+    //     int64_t predicates_address = (int64_t)_predicates.get();
+    //     // We can call org.apache.doris.common.jni.vec.ScanPredicate#parseScanPredicates to parse the
+    //     // serialized predicates in java side.
+    //     _scanner_params.emplace("push_down_predicates", std::to_string(predicates_address));
+    // }
     return Status::OK();
 }
 
@@ -159,6 +154,13 @@ Status JniConnector::get_table_schema(std::string& table_schema_str) {
 
 std::map<std::string, std::string> JniConnector::get_statistics(JNIEnv* env) {
     jobject metrics = env->CallObjectMethod(_jni_scanner_obj, _jni_scanner_get_statistics);
+    jthrowable exc = (env)->ExceptionOccurred();
+    if (exc != nullptr) {
+        LOG(WARNING) << "get_statistics has error: "
+                     << JniUtil::GetJniExceptionMsg(env).to_string();
+        env->DeleteLocalRef(metrics);
+        return std::map<std::string, std::string> {};
+    }
     std::map<std::string, std::string> result = JniUtil::convert_to_cpp_map(env, metrics);
     env->DeleteLocalRef(metrics);
     return result;
@@ -168,45 +170,23 @@ Status JniConnector::close() {
     if (!_closed) {
         JNIEnv* env = nullptr;
         RETURN_IF_ERROR(JniUtil::GetJNIEnv(&env));
-        if (_scanner_opened) {
-            // update scanner metrics
-            for (const auto& metric : get_statistics(env)) {
-                std::vector<std::string> type_and_name = split(metric.first, ":");
-                if (type_and_name.size() != 2) {
-                    LOG(WARNING) << "Name of JNI Scanner metric should be pattern like "
-                                 << "'metricType:metricName'";
-                    continue;
-                }
-                long metric_value = std::stol(metric.second);
-                RuntimeProfile::Counter* scanner_counter;
-                if (type_and_name[0] == "timer") {
-                    scanner_counter =
-                            ADD_CHILD_TIMER(_profile, type_and_name[1], _connector_name.c_str());
-                } else if (type_and_name[0] == "counter") {
-                    scanner_counter = ADD_CHILD_COUNTER(_profile, type_and_name[1], TUnit::UNIT,
-                                                        _connector_name.c_str());
-                } else if (type_and_name[0] == "bytes") {
-                    scanner_counter = ADD_CHILD_COUNTER(_profile, type_and_name[1], TUnit::BYTES,
-                                                        _connector_name.c_str());
-                } else {
-                    LOG(WARNING) << "Type of JNI Scanner metric should be timer, counter or bytes";
-                    continue;
-                }
-                COUNTER_UPDATE(scanner_counter, metric_value);
-            }
-
+        if (_scanner_opened && _jni_scanner_obj != nullptr) {
             // _fill_block may be failed and returned, we should release table in close.
             // org.apache.doris.common.jni.JniScanner#releaseTable is idempotent
             env->CallVoidMethod(_jni_scanner_obj, _jni_scanner_release_table);
             env->CallVoidMethod(_jni_scanner_obj, _jni_scanner_close);
             env->DeleteGlobalRef(_jni_scanner_obj);
         }
-        env->DeleteGlobalRef(_jni_scanner_cls);
+        if (_jni_scanner_cls != nullptr) {
+            // _jni_scanner_cls may be null if init connector failed
+            env->DeleteGlobalRef(_jni_scanner_cls);
+        }
         _closed = true;
         jthrowable exc = (env)->ExceptionOccurred();
         if (exc != nullptr) {
-            LOG(WARNING) << "Failed to release jni resource: "
-                         << JniUtil::GetJniExceptionMsg(env).to_string();
+            // Ensure successful resource release
+            throw Exception(Status::FatalError("Failed to release jni resource: {}",
+                                               JniUtil::GetJniExceptionMsg(env).to_string()));
         }
     }
     return Status::OK();
@@ -215,11 +195,14 @@ Status JniConnector::close() {
 Status JniConnector::_init_jni_scanner(JNIEnv* env, int batch_size) {
     RETURN_IF_ERROR(
             JniUtil::get_jni_scanner_class(env, _connector_class.c_str(), &_jni_scanner_cls));
-    if (_jni_scanner_cls == NULL) {
-        if (env->ExceptionOccurred()) env->ExceptionDescribe();
+    if (_jni_scanner_cls == nullptr) {
+        if (env->ExceptionOccurred()) {
+            env->ExceptionDescribe();
+        }
         return Status::InternalError("Fail to get JniScanner class.");
     }
     RETURN_ERROR_IF_EXC(env);
+
     jmethodID scanner_constructor =
             env->GetMethodID(_jni_scanner_cls, "<init>", "(ILjava/util/Map;)V");
     RETURN_ERROR_IF_EXC(env);
@@ -228,6 +211,10 @@ Status JniConnector::_init_jni_scanner(JNIEnv* env, int batch_size) {
     jobject hashmap_object = JniUtil::convert_to_java_map(env, _scanner_params);
     jobject jni_scanner_obj =
             env->NewObject(_jni_scanner_cls, scanner_constructor, batch_size, hashmap_object);
+
+    RETURN_ERROR_IF_EXC(env);
+
+    // prepare constructor parameters
     env->DeleteLocalRef(hashmap_object);
     RETURN_ERROR_IF_EXC(env);
 
@@ -249,15 +236,12 @@ Status JniConnector::_init_jni_scanner(JNIEnv* env, int batch_size) {
 
 Status JniConnector::fill_block(Block* block, const ColumnNumbers& arguments, long table_address) {
     if (table_address == 0) {
-        return Status::OK();
+        return Status::InternalError("table_address is 0");
     }
     TableMetaAddress table_meta(table_address);
     long num_rows = table_meta.next_meta_as_long();
-    if (num_rows == 0) {
-        return Status::OK();
-    }
     for (size_t i : arguments) {
-        if (block->get_by_position(i).column == nullptr) {
+        if (block->get_by_position(i).column.get() == nullptr) {
             auto return_type = block->get_data_type(i);
             bool result_nullable = return_type->is_nullable();
             ColumnUInt8::MutablePtr null_col = nullptr;
@@ -348,15 +332,19 @@ Status JniConnector::_fill_column(TableMetaAddress& address, ColumnPtr& doris_co
 
 Status JniConnector::_fill_string_column(TableMetaAddress& address, MutableColumnPtr& doris_column,
                                          size_t num_rows) {
-    if (num_rows == 0) {
-        return Status::OK();
-    }
     auto& string_col = static_cast<const ColumnString&>(*doris_column);
     ColumnString::Chars& string_chars = const_cast<ColumnString::Chars&>(string_col.get_chars());
     ColumnString::Offsets& string_offsets =
             const_cast<ColumnString::Offsets&>(string_col.get_offsets());
     int* offsets = reinterpret_cast<int*>(address.next_meta_as_ptr());
     char* chars = reinterpret_cast<char*>(address.next_meta_as_ptr());
+
+    // This judgment is necessary, otherwise the following statement `offsets[num_rows - 1]` out of bounds
+    // What's more, This judgment must be placed after `address.next_meta_as_ptr()`
+    // because `address.next_meta_as_ptr` will make `address._meta_index` plus 1
+    if (num_rows == 0) {
+        return Status::OK();
+    }
 
     size_t origin_chars_size = string_chars.size();
     string_chars.resize(origin_chars_size + offsets[num_rows - 1]);
@@ -464,6 +452,10 @@ std::string JniConnector::get_jni_type(const DataTypePtr& data_type) {
         return "float";
     case TYPE_DOUBLE:
         return "double";
+    case TYPE_IPV4:
+        return "ipv4";
+    case TYPE_IPV6:
+        return "ipv6";
     case TYPE_VARCHAR:
         [[fallthrough]];
     case TYPE_CHAR:
@@ -475,8 +467,6 @@ std::string JniConnector::get_jni_type(const DataTypePtr& data_type) {
     case TYPE_DATEV2:
         return "datev2";
     case TYPE_DATETIME:
-        [[fallthrough]];
-    case TYPE_TIME:
         return "datetimev1";
     case TYPE_DATETIMEV2:
         [[fallthrough]];
@@ -550,6 +540,10 @@ std::string JniConnector::get_jni_type(const TypeDescriptor& desc) {
         return "float";
     case TYPE_DOUBLE:
         return "double";
+    case TYPE_IPV4:
+        return "ipv4";
+    case TYPE_IPV6:
+        return "ipv6";
     case TYPE_VARCHAR: {
         buffer << "varchar(" << desc.len << ")";
         return buffer.str();
@@ -559,8 +553,6 @@ std::string JniConnector::get_jni_type(const TypeDescriptor& desc) {
     case TYPE_DATEV2:
         return "datev2";
     case TYPE_DATETIME:
-        [[fallthrough]];
-    case TYPE_TIME:
         return "datetimev1";
     case TYPE_DATETIMEV2:
         [[fallthrough]];
@@ -617,68 +609,79 @@ std::string JniConnector::get_jni_type(const TypeDescriptor& desc) {
     }
 }
 
-Status JniConnector::_fill_column_meta(ColumnPtr& doris_column, DataTypePtr& data_type,
+Status JniConnector::_fill_column_meta(const ColumnPtr& doris_column, const DataTypePtr& data_type,
                                        std::vector<long>& meta_data) {
     TypeIndex logical_type = remove_nullable(data_type)->get_type_id();
+    const IColumn* column = nullptr;
+    // insert const flag
+    if (is_column_const(*doris_column)) {
+        meta_data.emplace_back((long)1);
+        const auto& const_column = assert_cast<const ColumnConst&>(*doris_column);
+        column = &(const_column.get_data_column());
+    } else {
+        meta_data.emplace_back((long)0);
+        column = &(*doris_column);
+    }
+
     // insert null map address
-    MutableColumnPtr data_column;
-    if (doris_column->is_nullable()) {
-        auto* nullable_column =
-                reinterpret_cast<vectorized::ColumnNullable*>(doris_column->assume_mutable().get());
-        data_column = nullable_column->get_nested_column_ptr();
-        NullMap& null_map = nullable_column->get_null_map_data();
+    const IColumn* data_column = nullptr;
+    if (column->is_nullable()) {
+        const auto& nullable_column = assert_cast<const vectorized::ColumnNullable&>(*column);
+        data_column = &(nullable_column.get_nested_column());
+        const auto& null_map = nullable_column.get_null_map_data();
         meta_data.emplace_back((long)null_map.data());
     } else {
         meta_data.emplace_back(0);
-        data_column = doris_column->assume_mutable();
+        data_column = column;
     }
     switch (logical_type) {
-#define DISPATCH(TYPE_INDEX, COLUMN_TYPE, CPP_TYPE)                                         \
-    case TYPE_INDEX: {                                                                      \
-        meta_data.emplace_back(_get_fixed_length_column_address<COLUMN_TYPE>(data_column)); \
-        break;                                                                              \
+#define DISPATCH(TYPE_INDEX, COLUMN_TYPE, CPP_TYPE)                                          \
+    case TYPE_INDEX: {                                                                       \
+        meta_data.emplace_back(_get_fixed_length_column_address<COLUMN_TYPE>(*data_column)); \
+        break;                                                                               \
     }
         FOR_FIXED_LENGTH_TYPES(DISPATCH)
 #undef DISPATCH
     case TypeIndex::String:
         [[fallthrough]];
     case TypeIndex::FixedString: {
-        auto& string_column = static_cast<ColumnString&>(*data_column);
+        const auto& string_column = assert_cast<const ColumnString&>(*data_column);
         // inert offsets
         meta_data.emplace_back((long)string_column.get_offsets().data());
         meta_data.emplace_back((long)string_column.get_chars().data());
         break;
     }
     case TypeIndex::Array: {
-        ColumnPtr& element_column = static_cast<ColumnArray&>(*data_column).get_data_ptr();
-        meta_data.emplace_back((long)static_cast<ColumnArray&>(*data_column).get_offsets().data());
-        DataTypePtr& element_type = const_cast<DataTypePtr&>(
-                (reinterpret_cast<const DataTypeArray*>(remove_nullable(data_type).get()))
+        const auto& element_column = assert_cast<const ColumnArray&>(*data_column).get_data_ptr();
+        meta_data.emplace_back(
+                (long)assert_cast<const ColumnArray&>(*data_column).get_offsets().data());
+        const auto& element_type = assert_cast<const DataTypePtr&>(
+                (assert_cast<const DataTypeArray*>(remove_nullable(data_type).get()))
                         ->get_nested_type());
         RETURN_IF_ERROR(_fill_column_meta(element_column, element_type, meta_data));
         break;
     }
     case TypeIndex::Struct: {
-        auto& doris_struct = static_cast<ColumnStruct&>(*data_column);
-        const DataTypeStruct* doris_struct_type =
-                reinterpret_cast<const DataTypeStruct*>(remove_nullable(data_type).get());
+        const auto& doris_struct = assert_cast<const ColumnStruct&>(*data_column);
+        const auto* doris_struct_type =
+                assert_cast<const DataTypeStruct*>(remove_nullable(data_type).get());
         for (int i = 0; i < doris_struct.tuple_size(); ++i) {
-            ColumnPtr& struct_field = doris_struct.get_column_ptr(i);
-            DataTypePtr& field_type = const_cast<DataTypePtr&>(doris_struct_type->get_element(i));
+            const auto& struct_field = doris_struct.get_column_ptr(i);
+            const auto& field_type =
+                    assert_cast<const DataTypePtr&>(doris_struct_type->get_element(i));
             RETURN_IF_ERROR(_fill_column_meta(struct_field, field_type, meta_data));
         }
         break;
     }
     case TypeIndex::Map: {
-        auto& map = static_cast<ColumnMap&>(*data_column);
-        DataTypePtr& key_type = const_cast<DataTypePtr&>(
-                reinterpret_cast<const DataTypeMap*>(remove_nullable(data_type).get())
-                        ->get_key_type());
-        DataTypePtr& value_type = const_cast<DataTypePtr&>(
-                reinterpret_cast<const DataTypeMap*>(remove_nullable(data_type).get())
+        const auto& map = assert_cast<const ColumnMap&>(*data_column);
+        const auto& key_type = assert_cast<const DataTypePtr&>(
+                assert_cast<const DataTypeMap*>(remove_nullable(data_type).get())->get_key_type());
+        const auto& value_type = assert_cast<const DataTypePtr&>(
+                assert_cast<const DataTypeMap*>(remove_nullable(data_type).get())
                         ->get_value_type());
-        ColumnPtr& key_column = map.get_keys_ptr();
-        ColumnPtr& value_column = map.get_values_ptr();
+        const auto& key_column = map.get_keys_ptr();
+        const auto& value_column = map.get_values_ptr();
         meta_data.emplace_back((long)map.get_offsets().data());
         RETURN_IF_ERROR(_fill_column_meta(key_column, key_type, meta_data));
         RETURN_IF_ERROR(_fill_column_meta(value_column, value_type, meta_data));
@@ -704,11 +707,6 @@ Status JniConnector::to_java_table(Block* block, size_t num_rows, const ColumnNu
     // insert number of rows
     meta_data.emplace_back(num_rows);
     for (size_t i : arguments) {
-        if (is_column_const(*(block->get_by_position(i).column))) {
-            auto doris_column = block->get_by_position(i).column->convert_to_full_column_if_const();
-            bool is_nullable = block->get_by_position(i).type->is_nullable();
-            block->replace_by_position(i, is_nullable ? make_nullable(doris_column) : doris_column);
-        }
         auto& column_with_type_and_name = block->get_by_position(i);
         RETURN_IF_ERROR(_fill_column_meta(column_with_type_and_name.column,
                                           column_with_type_and_name.type, meta_data));
@@ -757,4 +755,39 @@ std::pair<std::string, std::string> JniConnector::parse_table_schema(Block* bloc
     return parse_table_schema(block, arguments, true);
 }
 
+void JniConnector::_collect_profile_before_close() {
+    if (_scanner_opened && _profile != nullptr) {
+        JNIEnv* env = nullptr;
+        Status st = JniUtil::GetJNIEnv(&env);
+        if (!st) {
+            LOG(WARNING) << "failed to get jni env when collect profile: " << st;
+            return;
+        }
+        // update scanner metrics
+        for (const auto& metric : get_statistics(env)) {
+            std::vector<std::string> type_and_name = split(metric.first, ":");
+            if (type_and_name.size() != 2) {
+                LOG(WARNING) << "Name of JNI Scanner metric should be pattern like "
+                             << "'metricType:metricName'";
+                continue;
+            }
+            long metric_value = std::stol(metric.second);
+            RuntimeProfile::Counter* scanner_counter;
+            if (type_and_name[0] == "timer") {
+                scanner_counter =
+                        ADD_CHILD_TIMER(_profile, type_and_name[1], _connector_name.c_str());
+            } else if (type_and_name[0] == "counter") {
+                scanner_counter = ADD_CHILD_COUNTER(_profile, type_and_name[1], TUnit::UNIT,
+                                                    _connector_name.c_str());
+            } else if (type_and_name[0] == "bytes") {
+                scanner_counter = ADD_CHILD_COUNTER(_profile, type_and_name[1], TUnit::BYTES,
+                                                    _connector_name.c_str());
+            } else {
+                LOG(WARNING) << "Type of JNI Scanner metric should be timer, counter or bytes";
+                continue;
+            }
+            COUNTER_UPDATE(scanner_counter, metric_value);
+        }
+    }
+}
 } // namespace doris::vectorized

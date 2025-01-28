@@ -151,6 +151,10 @@ public class DiskInfo implements Writable {
         return pathHash != 0;
     }
 
+    public boolean isAlive() {
+        return state == DiskState.ONLINE;
+    }
+
     public boolean isStorageMediumMatch(TStorageMedium storageMedium) {
         return this.storageMedium == storageMedium;
     }
@@ -169,8 +173,10 @@ public class DiskInfo implements Writable {
      *      floodStage threshold means a loosely limit, and we use 'AND' to give a more loosely limit.
      */
     public boolean exceedLimit(boolean floodStage) {
-        LOG.debug("flood stage: {}, diskAvailableCapacityB: {}, totalCapacityB: {}",
-                floodStage, diskAvailableCapacityB, totalCapacityB);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("flood stage: {}, diskAvailableCapacityB: {}, totalCapacityB: {}",
+                    floodStage, diskAvailableCapacityB, totalCapacityB);
+        }
         if (floodStage) {
             return diskAvailableCapacityB < Config.storage_flood_stage_left_capacity_bytes
                 && this.getUsedPct() > (Config.storage_flood_stage_usage_percent / 100.0);

@@ -22,13 +22,13 @@
 #include "pipeline/exec/operator.h"
 
 namespace doris::pipeline {
-
-OPERATOR_CODE_GENERATOR(EmptySetSourceOperator, SourceOperator)
+#include "common/compile_check_begin.h"
 
 Status EmptySetSourceOperatorX::get_block(RuntimeState* state, vectorized::Block* block,
-                                          SourceState& source_state) {
-    source_state = SourceState::FINISHED;
+                                          bool* eos) {
+    *eos = true;
     return Status::OK();
 }
 
+#include "common/compile_check_end.h"
 } // namespace doris::pipeline

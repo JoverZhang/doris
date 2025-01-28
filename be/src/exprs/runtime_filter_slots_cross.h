@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <utility>
 #include <vector>
 
 #include "common/status.h"
@@ -34,17 +35,14 @@ namespace doris {
 // this class used in cross join node
 class VRuntimeFilterSlotsCross {
 public:
-    VRuntimeFilterSlotsCross(const std::vector<TRuntimeFilterDesc>& runtime_filter_descs,
-                             const vectorized::VExprContextSPtrs& src_expr_ctxs)
-            : _runtime_filter_descs(runtime_filter_descs), filter_src_expr_ctxs(src_expr_ctxs) {}
+    VRuntimeFilterSlotsCross(const std::vector<std::shared_ptr<IRuntimeFilter>>& runtime_filters,
+                             vectorized::VExprContextSPtrs src_expr_ctxs)
+            : _runtime_filters(runtime_filters), filter_src_expr_ctxs(std::move(src_expr_ctxs)) {}
 
     ~VRuntimeFilterSlotsCross() = default;
 
     Status init(RuntimeState* state) {
-        for (auto& filter_desc : _runtime_filter_descs) {
-            IRuntimeFilter* runtime_filter = nullptr;
-            RETURN_IF_ERROR(state->runtime_filter_mgr()->get_producer_filter(filter_desc.filter_id,
-                                                                             &runtime_filter));
+        for (auto runtime_filter : _runtime_filters) {
             if (runtime_filter == nullptr) {
                 return Status::InternalError("runtime filter is nullptr");
             }
@@ -53,14 +51,13 @@ public:
                 runtime_filter->has_remote_target()) {
                 return Status::InternalError("cross join runtime filter has remote target");
             }
-            _runtime_filters.push_back(runtime_filter);
         }
         return Status::OK();
     }
 
     Status insert(vectorized::Block* block) {
         for (int i = 0; i < _runtime_filters.size(); ++i) {
-            auto* filter = _runtime_filters[i];
+            auto filter = _runtime_filters[i];
             const auto& vexpr_ctx = filter_src_expr_ctxs[i];
 
             int result_column_id = -1;
@@ -75,19 +72,18 @@ public:
         return Status::OK();
     }
 
-    Status publish() {
-        for (auto& filter : _runtime_filters) {
-            RETURN_IF_ERROR(filter->publish());
+    Status publish(RuntimeState* state) {
+        for (auto filter : _runtime_filters) {
+            RETURN_IF_ERROR(filter->publish(state));
         }
         return Status::OK();
     }
 
-    bool empty() { return _runtime_filters.empty(); }
+    bool empty() const { return _runtime_filters.empty(); }
 
 private:
-    const std::vector<TRuntimeFilterDesc>& _runtime_filter_descs;
+    const std::vector<std::shared_ptr<IRuntimeFilter>>& _runtime_filters;
     const vectorized::VExprContextSPtrs filter_src_expr_ctxs;
-    std::vector<IRuntimeFilter*> _runtime_filters;
 };
 
 } // namespace doris

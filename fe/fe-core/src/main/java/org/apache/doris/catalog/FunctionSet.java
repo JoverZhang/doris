@@ -46,6 +46,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
 import java.util.Set;
 
 public class FunctionSet<T> {
@@ -154,6 +155,32 @@ public class FunctionSet<T> {
                     .put(Type.DECIMAL128, Type.DECIMAL128)
                     .build();
 
+    public static final Set<String> nonDeterministicFunctions =
+            ImmutableSet.<String>builder()
+                    .add("RAND")
+                    .add("RANDOM")
+                    .add("RANDOM_BYTES")
+                    .add("CONNECTION_ID")
+                    .add("DATABASE")
+                    .add("USER")
+                    .add("UUID")
+                    .add("CURRENT_USER")
+                    .add("UUID_NUMERIC")
+                    .build();
+
+    public static final Set<String> nonDeterministicTimeFunctions =
+            ImmutableSet.<String>builder()
+                    .add("NOW")
+                    .add("CURDATE")
+                    .add("CURRENT_DATE")
+                    .add("UTC_TIMESTAMP")
+                    .add("CURTIME")
+                    .add("CURRENT_TIMESTAMP")
+                    .add("CURRENT_TIME")
+                    .add("UNIX_TIMESTAMP")
+                    .add()
+                    .build();
+
     private static final Map<Type, String> STDDEV_UPDATE_SYMBOL =
             ImmutableMap.<Type, String>builder()
                 .put(Type.TINYINT,
@@ -177,6 +204,7 @@ public class FunctionSet<T> {
     public static final String HLL_UNION_AGG = "hll_union_agg";
     public static final String HLL_RAW_AGG = "hll_raw_agg";
     public static final String HLL_CARDINALITY = "hll_cardinality";
+    public static final String HLL_FROM_BASE64 = "hll_from_base64";
 
     public static final String TO_BITMAP = "to_bitmap";
     public static final String TO_BITMAP_WITH_CHECK = "to_bitmap_with_check";
@@ -202,6 +230,7 @@ public class FunctionSet<T> {
     public static final String COLLECT_LIST = "collect_list";
     public static final String COLLECT_SET = "collect_set";
     public static final String HISTOGRAM = "histogram";
+    public static final String LINEAR_HISTOGRAM = "linear_histogram";
     public static final String HIST = "hist";
     public static final String MAP_AGG = "map_agg";
 
@@ -349,8 +378,10 @@ public class FunctionSet<T> {
             if (LOG.isDebugEnabled()) {
                 LOG.debug("templateFunction signature: {}, return type: {}",
                             templateFunction.signatureString(), templateFunction.getReturnType());
-                LOG.debug("requestFunction signature: {}, return type: {}",
-                            requestFunction.signatureString(), requestFunction.getReturnType());
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("requestFunction signature: {}, return type: {}",
+                                requestFunction.signatureString(), requestFunction.getReturnType());
+                }
             }
             List<Type> newArgTypes = Lists.newArrayList();
             List<Type> newRetType = Lists.newArrayList();
@@ -493,6 +524,12 @@ public class FunctionSet<T> {
                 return false;
             }
         }
+        if (FunctionCallExpr.STRING_SEARCH_FUNCTION_SET.contains(desc.functionName())) {
+            if (descArgTypes[1].isStringType() && candicateArgTypes[1].isArrayType()) {
+                // The needles arg of search functions should not be allowed to cast from string.
+                return false;
+            }
+        }
         // If set `roundPreciseDecimalV2Value`, only use decimalv3 as target type to execute round function
         if (ConnectContext.get() != null
                 && ConnectContext.get().getSessionVariable().roundPreciseDecimalV2Value
@@ -595,6 +632,10 @@ public class FunctionSet<T> {
 
     public static final String RETENTION = "retention";
 
+    public static final String REGR_INTERCEPT = "regr_intercept";
+
+    public static final String REGR_SLOPE = "regr_slope";
+
     public static final String SEQUENCE_MATCH = "sequence_match";
 
     public static final String SEQUENCE_COUNT = "sequence_count";
@@ -603,7 +644,13 @@ public class FunctionSet<T> {
 
     public static final String GROUP_ARRAY = "group_array";
 
+    public static final String GROUP_ARRAY_INTERSECT = "group_array_intersect";
+
     public static final String ARRAY_AGG = "array_agg";
+
+    public static final String SUM0 = "sum0";
+
+    public static final String MULTI_DISTINCT_SUM0 = "multi_distinct_sum0";
 
     // Populate all the aggregate builtins in the catalog.
     // null symbols indicate the function does not need that step of the evaluation.
@@ -621,6 +668,25 @@ public class FunctionSet<T> {
                 null, null,
                 "",
                 null, false, true, true, true));
+
+        // regr_intercept
+        addBuiltin(AggregateFunction.createBuiltin(FunctionSet.REGR_INTERCEPT,
+                Lists.newArrayList(Type.DOUBLE, Type.DOUBLE), Type.DOUBLE, Type.DOUBLE,
+                "",
+                "",
+                "",
+                null, null,
+                "",
+                null, false, false, false, true));
+        // regr_slope
+        addBuiltin(AggregateFunction.createBuiltin(FunctionSet.REGR_SLOPE,
+                Lists.newArrayList(Type.DOUBLE, Type.DOUBLE), Type.DOUBLE, Type.DOUBLE,
+                "",
+                "",
+                "",
+                null, null,
+                "",
+                null, false, false, false, true));
 
         // count(array/map/struct)
         for (Type complexType : Lists.newArrayList(Type.ARRAY, Type.MAP, Type.GENERIC_STRUCT)) {
@@ -925,10 +991,32 @@ public class FunctionSet<T> {
                         null,
                         null,
                         "",
+                        false, true, false, true));
+                addBuiltin(AggregateFunction.createBuiltin("multi_distinct_sum0", Lists.newArrayList(t),
+                        t,
+                        t,
+                        "",
+                        "",
+                        "",
+                        "",
+                        null,
+                        null,
+                        "",
                         false, true, true, true));
             }  else if (t.equals(Type.MAX_DECIMALV2_TYPE)) {
                 // vectorized
                 addBuiltin(AggregateFunction.createBuiltin("multi_distinct_sum", Lists.newArrayList(t),
+                        MULTI_DISTINCT_SUM_RETURN_TYPE.get(t),
+                        Type.MAX_DECIMALV2_TYPE,
+                        "",
+                        "",
+                        "",
+                        "",
+                        null,
+                        null,
+                        "",
+                        false, true, false, true));
+                addBuiltin(AggregateFunction.createBuiltin("multi_distinct_sum0", Lists.newArrayList(t),
                         MULTI_DISTINCT_SUM_RETURN_TYPE.get(t),
                         Type.MAX_DECIMALV2_TYPE,
                         "",
@@ -951,6 +1039,17 @@ public class FunctionSet<T> {
                         null,
                         null,
                         "",
+                        false, true, false, true));
+                addBuiltin(AggregateFunction.createBuiltin("multi_distinct_sum0", Lists.newArrayList(t),
+                        MULTI_DISTINCT_SUM_RETURN_TYPE.get(t),
+                        Type.DECIMAL32,
+                        "",
+                        "",
+                        "",
+                        "",
+                        null,
+                        null,
+                        "",
                         false, true, true, true));
             } else if (t.equals(Type.DECIMAL64)) {
                 addBuiltin(AggregateFunction.createBuiltin("multi_distinct_sum", Lists.newArrayList(t),
@@ -963,9 +1062,31 @@ public class FunctionSet<T> {
                         null,
                         null,
                         "",
+                        false, true, false, true));
+                addBuiltin(AggregateFunction.createBuiltin("multi_distinct_sum0", Lists.newArrayList(t),
+                        MULTI_DISTINCT_SUM_RETURN_TYPE.get(t),
+                        Type.DECIMAL64,
+                        "",
+                        "",
+                        "",
+                        "",
+                        null,
+                        null,
+                        "",
                         false, true, true, true));
             } else if (t.equals(Type.DECIMAL128)) {
                 addBuiltin(AggregateFunction.createBuiltin("multi_distinct_sum", Lists.newArrayList(t),
+                        MULTI_DISTINCT_SUM_RETURN_TYPE.get(t),
+                        Type.DECIMAL128,
+                        "",
+                        "",
+                        "",
+                        "",
+                        null,
+                        null,
+                        "",
+                        false, true, false, true));
+                addBuiltin(AggregateFunction.createBuiltin("multi_distinct_sum0", Lists.newArrayList(t),
                         MULTI_DISTINCT_SUM_RETURN_TYPE.get(t),
                         Type.DECIMAL128,
                         "",
@@ -1166,86 +1287,91 @@ public class FunctionSet<T> {
         }
 
         // Sum
-        String []sumNames = {"sum", "sum_distinct"};
-        for (String name : sumNames) {
-            addBuiltin(AggregateFunction.createBuiltin(name,
+        // functionName(String) -> returnsNonNullOnEmpty(Boolean)
+        Map<String, Boolean> sumNames = ImmutableMap.of(
+                "sum", false,
+                "sum_distinct", false,
+                "sum0", true
+        );
+        for (Entry<String, Boolean> nameWithReturn : sumNames.entrySet()) {
+            addBuiltin(AggregateFunction.createBuiltin(nameWithReturn.getKey(),
                     Lists.<Type>newArrayList(Type.BOOLEAN), Type.BIGINT, Type.BIGINT, "",
                     "",
                     "",
                     null, null,
                     "",
-                    null, false, true, false, true));
+                    null, false, true, nameWithReturn.getValue(), true));
 
-            addBuiltin(AggregateFunction.createBuiltin(name,
+            addBuiltin(AggregateFunction.createBuiltin(nameWithReturn.getKey(),
                     Lists.<Type>newArrayList(Type.TINYINT), Type.BIGINT, Type.BIGINT, "",
                     "",
                     "",
                     null, null,
                     "",
-                    null, false, true, false, true));
-            addBuiltin(AggregateFunction.createBuiltin(name,
+                    null, false, true, nameWithReturn.getValue(), true));
+            addBuiltin(AggregateFunction.createBuiltin(nameWithReturn.getKey(),
                     Lists.<Type>newArrayList(Type.SMALLINT), Type.BIGINT, Type.BIGINT, "",
                     "",
                     "",
                     null, null,
                     "",
-                    null, false, true, false, true));
-            addBuiltin(AggregateFunction.createBuiltin(name,
+                    null, false, true, nameWithReturn.getValue(), true));
+            addBuiltin(AggregateFunction.createBuiltin(nameWithReturn.getKey(),
                     Lists.<Type>newArrayList(Type.INT), Type.BIGINT, Type.BIGINT, "",
                     "",
                     "",
                     null, null,
                     "",
-                    null, false, true, false, true));
-            addBuiltin(AggregateFunction.createBuiltin(name,
+                    null, false, true, nameWithReturn.getValue(), true));
+            addBuiltin(AggregateFunction.createBuiltin(nameWithReturn.getKey(),
                     Lists.<Type>newArrayList(Type.BIGINT), Type.BIGINT, Type.BIGINT, "",
                     "",
                     "",
                     null, null,
                     "",
-                    null, false, true, false, true));
-            addBuiltin(AggregateFunction.createBuiltin(name,
+                    null, false, true, nameWithReturn.getValue(), true));
+            addBuiltin(AggregateFunction.createBuiltin(nameWithReturn.getKey(),
                     Lists.<Type>newArrayList(Type.DOUBLE), Type.DOUBLE, Type.DOUBLE, "",
                     "",
                     "",
                     null, null,
                     "",
-                    null, false, true, false, true));
-            addBuiltin(AggregateFunction.createBuiltin(name,
+                    null, false, true, nameWithReturn.getValue(), true));
+            addBuiltin(AggregateFunction.createBuiltin(nameWithReturn.getKey(),
                     Lists.<Type>newArrayList(Type.MAX_DECIMALV2_TYPE), Type.MAX_DECIMALV2_TYPE, Type.MAX_DECIMALV2_TYPE, "",
                     "",
                     "",
                     null, null,
                     "",
-                    null, false, true, false, true));
-            addBuiltin(AggregateFunction.createBuiltin(name,
+                    null, false, true, nameWithReturn.getValue(), true));
+            addBuiltin(AggregateFunction.createBuiltin(nameWithReturn.getKey(),
                     Lists.<Type>newArrayList(Type.DECIMAL32), ScalarType.DECIMAL128, Type.DECIMAL128, "",
                     "",
                     "",
                     null, null,
                     "",
-                    null, false, true, false, true));
-            addBuiltin(AggregateFunction.createBuiltin(name,
+                    null, false, true, nameWithReturn.getValue(), true));
+            addBuiltin(AggregateFunction.createBuiltin(nameWithReturn.getKey(),
                     Lists.<Type>newArrayList(Type.DECIMAL64), Type.DECIMAL128, Type.DECIMAL128, "",
                     "",
                     "",
                     null, null,
                     "",
-                    null, false, true, false, true));
-            addBuiltin(AggregateFunction.createBuiltin(name,
+                    null, false, true, nameWithReturn.getValue(), true));
+            addBuiltin(AggregateFunction.createBuiltin(nameWithReturn.getKey(),
                     Lists.<Type>newArrayList(Type.DECIMAL128), Type.DECIMAL128, Type.DECIMAL128, "",
                     "",
                     "",
                     null, null,
                     "",
-                    null, false, true, false, true));
-            addBuiltin(AggregateFunction.createBuiltin(name,
+                    null, false, true, nameWithReturn.getValue(), true));
+            addBuiltin(AggregateFunction.createBuiltin(nameWithReturn.getKey(),
                     Lists.<Type>newArrayList(Type.LARGEINT), Type.LARGEINT, Type.LARGEINT, "",
                     "",
                     "",
                     null, null,
                     "",
-                    null, false, true, false, true));
+                    null, false, true, nameWithReturn.getValue(), true));
         }
 
         Type[] types = {Type.SMALLINT, Type.TINYINT, Type.INT, Type.BIGINT, Type.FLOAT, Type.DOUBLE, Type.CHAR,
@@ -1423,6 +1549,14 @@ public class FunctionSet<T> {
                     Type.VARCHAR, t,
                     "", "", "", "", "", true, false, true, true));
 
+            // linear histogram
+            addBuiltin(AggregateFunction.createBuiltin(LINEAR_HISTOGRAM,
+                    Lists.<Type>newArrayList(t, Type.DOUBLE), Type.VARCHAR, t,
+                    "", "", "", "", "", true, false, true, true));
+            addBuiltin(AggregateFunction.createBuiltin(LINEAR_HISTOGRAM,
+                    Lists.<Type>newArrayList(t, Type.DOUBLE, Type.DOUBLE), Type.VARCHAR, t,
+                    "", "", "", "", "", true, false, true, true));
+
             // group array
             addBuiltin(AggregateFunction.createBuiltin(GROUP_UNIQ_ARRAY, Lists.newArrayList(t), new ArrayType(t), t,
                     "", "", "", "", "", true, false, true, true));
@@ -1434,7 +1568,9 @@ public class FunctionSet<T> {
             addBuiltin(
                     AggregateFunction.createBuiltin(GROUP_ARRAY, Lists.newArrayList(t, Type.INT), new ArrayType(t),
                             t, "", "", "", "", "", true, false, true, true));
-
+            addBuiltin(
+                    AggregateFunction.createBuiltin(GROUP_ARRAY_INTERSECT, Lists.newArrayList(new ArrayType(t)),
+                            new ArrayType(t), t, "", "", "", "", "", true, false, true, true));
             addBuiltin(AggregateFunction.createBuiltin(ARRAY_AGG, Lists.newArrayList(t), new ArrayType(t), t, "", "", "", "", "",
                     true, false, true, true));
 
@@ -1557,6 +1693,14 @@ public class FunctionSet<T> {
                 null,
                 "",
                 ""));
+        // Percent Rank
+        addBuiltin(AggregateFunction.createAnalyticBuiltin("percent_rank",
+                Lists.<Type>newArrayList(), Type.DOUBLE, Type.VARCHAR,
+                "",
+                "",
+                null,
+                "",
+                ""));
         // Dense rank
         addBuiltin(AggregateFunction.createAnalyticBuiltin("dense_rank",
                 Lists.<Type>newArrayList(), Type.BIGINT, Type.VARCHAR,
@@ -1584,9 +1728,25 @@ public class FunctionSet<T> {
                 null,
                 "",
                 "", true));
+        //vec Percent Rank
+        addBuiltin(AggregateFunction.createAnalyticBuiltin("percent_rank",
+                Lists.<Type>newArrayList(), Type.DOUBLE, Type.VARCHAR,
+                "",
+                "",
+                null,
+                "",
+                "", true));
         //vec Dense rank
         addBuiltin(AggregateFunction.createAnalyticBuiltin("dense_rank",
                 Lists.<Type>newArrayList(), Type.BIGINT, Type.VARCHAR,
+                "",
+                "",
+                null,
+                "",
+                "", true));
+        // vec cume_dist
+        addBuiltin(AggregateFunction.createAnalyticBuiltin("cume_dist",
+                Lists.<Type>newArrayList(), Type.DOUBLE, Type.VARCHAR,
                 "",
                 "",
                 null,
@@ -1710,6 +1870,144 @@ public class FunctionSet<T> {
                 "",
                 false, true, false, true));
 
+        // corr
+        addBuiltin(AggregateFunction.createBuiltin("corr",
+                Lists.<Type>newArrayList(Type.TINYINT, Type.TINYINT), Type.DOUBLE, Type.DOUBLE,
+                "", "", "", "", "", "", "",
+                false, false, false, true));
+        addBuiltin(AggregateFunction.createBuiltin("corr",
+                Lists.<Type>newArrayList(Type.SMALLINT, Type.SMALLINT), Type.DOUBLE, Type.DOUBLE,
+                "", "", "", "", "", "", "",
+                false, false, false, true));
+        addBuiltin(AggregateFunction.createBuiltin("corr",
+                Lists.<Type>newArrayList(Type.INT, Type.INT), Type.DOUBLE, Type.DOUBLE,
+                "", "", "", "", "", "", "",
+                false, false, false, true));
+        addBuiltin(AggregateFunction.createBuiltin("corr",
+                Lists.<Type>newArrayList(Type.BIGINT, Type.BIGINT), Type.DOUBLE, Type.DOUBLE,
+                "", "", "", "", "", "", "",
+                false, false, false, true));
+        addBuiltin(AggregateFunction.createBuiltin("corr",
+                Lists.<Type>newArrayList(Type.FLOAT, Type.FLOAT), Type.DOUBLE, Type.DOUBLE,
+                "", "", "", "", "", "", "",
+                false, false, false, true));
+        addBuiltin(AggregateFunction.createBuiltin("corr",
+                Lists.<Type>newArrayList(Type.DOUBLE, Type.DOUBLE), Type.DOUBLE, Type.DOUBLE,
+                "", "", "", "", "", "", "",
+                false, false, false, true));
+
+        // covar
+        addBuiltin(AggregateFunction.createBuiltin("covar",
+                Lists.<Type>newArrayList(Type.TINYINT, Type.TINYINT), Type.DOUBLE, Type.DOUBLE,
+                "", "", "", "", "", "", "",
+                false, false, false, true));
+        addBuiltin(AggregateFunction.createBuiltin("covar",
+                Lists.<Type>newArrayList(Type.SMALLINT, Type.SMALLINT), Type.DOUBLE, Type.DOUBLE,
+                "", "", "", "", "", "", "",
+                false, false, false, true));
+        addBuiltin(AggregateFunction.createBuiltin("covar",
+                Lists.<Type>newArrayList(Type.INT, Type.INT), Type.DOUBLE, Type.DOUBLE,
+                "", "", "", "", "", "", "",
+                false, false, false, true));
+        addBuiltin(AggregateFunction.createBuiltin("covar",
+                Lists.<Type>newArrayList(Type.BIGINT, Type.BIGINT), Type.DOUBLE, Type.DOUBLE,
+                "", "", "", "", "", "", "",
+                false, false, false, true));
+        addBuiltin(AggregateFunction.createBuiltin("covar",
+                Lists.<Type>newArrayList(Type.FLOAT, Type.FLOAT), Type.DOUBLE, Type.DOUBLE,
+                "", "", "", "", "", "", "",
+                false, false, false, true));
+        addBuiltin(AggregateFunction.createBuiltin("covar",
+                Lists.<Type>newArrayList(Type.DOUBLE, Type.DOUBLE), Type.DOUBLE, Type.DOUBLE,
+                "", "", "", "", "", "", "",
+                false, false, false, true));
+
+        addBuiltin(AggregateFunction.createBuiltin("covar_pop",
+                Lists.<Type>newArrayList(Type.TINYINT, Type.TINYINT), Type.DOUBLE, Type.DOUBLE,
+                "", "", "", "", "", "", "",
+                false, false, false, true));
+        addBuiltin(AggregateFunction.createBuiltin("covar_pop",
+                Lists.<Type>newArrayList(Type.SMALLINT, Type.SMALLINT), Type.DOUBLE, Type.DOUBLE,
+                "", "", "", "", "", "", "",
+                false, false, false, true));
+        addBuiltin(AggregateFunction.createBuiltin("covar_pop",
+                Lists.<Type>newArrayList(Type.INT, Type.INT), Type.DOUBLE, Type.DOUBLE,
+                "", "", "", "", "", "", "",
+                false, false, false, true));
+        addBuiltin(AggregateFunction.createBuiltin("covar_pop",
+                Lists.<Type>newArrayList(Type.BIGINT, Type.BIGINT), Type.DOUBLE, Type.DOUBLE,
+                "", "", "", "", "", "", "",
+                false, false, false, true));
+        addBuiltin(AggregateFunction.createBuiltin("covar_pop",
+                Lists.<Type>newArrayList(Type.FLOAT, Type.FLOAT), Type.DOUBLE, Type.DOUBLE,
+                "", "", "", "", "", "", "",
+                false, false, false, true));
+        addBuiltin(AggregateFunction.createBuiltin("covar_pop",
+                Lists.<Type>newArrayList(Type.DOUBLE, Type.DOUBLE), Type.DOUBLE, Type.DOUBLE,
+                "", "", "", "", "", "", "",
+                false, false, false, true));
+
+        // covar_samp
+        addBuiltin(AggregateFunction.createBuiltin("covar_samp",
+                Lists.<Type>newArrayList(Type.TINYINT, Type.TINYINT), Type.DOUBLE, Type.DOUBLE,
+                "", "", "", "", "", "", "",
+                false, false, false, true));
+        addBuiltin(AggregateFunction.createBuiltin("covar_samp",
+                Lists.<Type>newArrayList(Type.SMALLINT, Type.SMALLINT), Type.DOUBLE, Type.DOUBLE,
+                "", "", "", "", "", "", "",
+                false, false, false, true));
+        addBuiltin(AggregateFunction.createBuiltin("covar_samp",
+                Lists.<Type>newArrayList(Type.INT, Type.INT), Type.DOUBLE, Type.DOUBLE,
+                "", "", "", "", "", "", "",
+                false, false, false, true));
+        addBuiltin(AggregateFunction.createBuiltin("covar_samp",
+                Lists.<Type>newArrayList(Type.BIGINT, Type.BIGINT), Type.DOUBLE, Type.DOUBLE,
+                "", "", "", "", "", "", "",
+                false, false, false, true));
+        addBuiltin(AggregateFunction.createBuiltin("covar_samp",
+                Lists.<Type>newArrayList(Type.FLOAT, Type.FLOAT), Type.DOUBLE, Type.DOUBLE,
+                "", "", "", "", "", "", "",
+                false, false, false, true));
+        addBuiltin(AggregateFunction.createBuiltin("covar_samp",
+                Lists.<Type>newArrayList(Type.DOUBLE, Type.DOUBLE), Type.DOUBLE, Type.DOUBLE,
+                "", "", "", "", "", "", "",
+                false, false, false, true));
+
+
+        List<String> skewnessAndKurtosis = Lists.newArrayList("skew", "skew_pop", "skewness", "kurt",
+                "kurt_pop", "kurtosis");
+        skewnessAndKurtosis.addAll(skewnessAndKurtosis);
+
+        for (String name : skewnessAndKurtosis) {
+            addBuiltin(AggregateFunction.createBuiltin(name,
+                    Lists.<Type>newArrayList(Type.TINYINT), Type.DOUBLE, Type.DOUBLE,
+                    "", "", "", "", "", "", "",
+                    false, false, false, true));
+            addBuiltin(AggregateFunction.createBuiltin(name,
+                    Lists.<Type>newArrayList(Type.SMALLINT), Type.DOUBLE, Type.DOUBLE,
+                    "", "", "", "", "", "", "",
+                    false, false, false, true));
+            addBuiltin(AggregateFunction.createBuiltin(name,
+                    Lists.<Type>newArrayList(Type.INT), Type.DOUBLE, Type.DOUBLE,
+                    "", "", "", "", "", "", "",
+                    false, false, false, true));
+            addBuiltin(AggregateFunction.createBuiltin(name,
+                    Lists.<Type>newArrayList(Type.BIGINT), Type.DOUBLE, Type.DOUBLE,
+                    "", "", "", "", "", "", "",
+                    false, false, false, true));
+            addBuiltin(AggregateFunction.createBuiltin(name,
+                    Lists.<Type>newArrayList(Type.LARGEINT), Type.DOUBLE, Type.DOUBLE,
+                    "", "", "", "", "", "", "",
+                    false, false, false, true));
+            addBuiltin(AggregateFunction.createBuiltin(name,
+                    Lists.<Type>newArrayList(Type.FLOAT), Type.DOUBLE, Type.DOUBLE,
+                    "", "", "", "", "", "", "",
+                    false, false, false, true));
+            addBuiltin(AggregateFunction.createBuiltin(name,
+                    Lists.<Type>newArrayList(Type.DOUBLE), Type.DOUBLE, Type.DOUBLE,
+                    "", "", "", "", "", "", "",
+                    false, false, false, true));
+        }
     }
 
     public Map<String, List<Function>> getVectorizedFunctions() {
@@ -1803,6 +2101,7 @@ public class FunctionSet<T> {
         addTableFunctionWithCombinator(EXPLODE, Type.WILDCARD_DECIMAL, Function.NullableMode.ALWAYS_NULLABLE,
                 Lists.newArrayList(new ArrayType(Type.WILDCARD_DECIMAL)), false,
                 "_ZN5doris19DummyTableFunctions7explodeEPN9doris_udf15FunctionContextERKNS1_13CollectionValE");
+
     }
 
     public boolean isAggFunctionName(String name) {

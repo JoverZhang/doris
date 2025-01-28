@@ -44,7 +44,6 @@
 namespace doris {
 
 extern TLoadTxnBeginResult k_stream_load_begin_result;
-extern Status k_stream_load_exec_status;
 
 ExecEnv* _env = nullptr;
 std::filesystem::path wal_dir = std::filesystem::current_path().string() + "/wal_test";
@@ -56,32 +55,38 @@ public:
     void SetUp() override {
         prepare();
         _env = ExecEnv::GetInstance();
-        _env->_master_info = new TMasterInfo();
-        _env->_master_info->network_address.hostname = "host name";
-        _env->_master_info->network_address.port = 1234;
-        _env->new_load_stream_mgr() = NewLoadStreamMgr::create_shared();
+        _env->_cluster_info = new ClusterInfo();
+        _env->_cluster_info->master_fe_addr.hostname = "host name";
+        _env->_cluster_info->master_fe_addr.port = 1234;
+        _env->_cluster_info->backend_id = 1001;
+        _env->set_new_load_stream_mgr(NewLoadStreamMgr::create_unique());
         _env->_internal_client_cache = new BrpcClientCache<PBackendService_Stub>();
         _env->_function_client_cache = new BrpcClientCache<PFunctionService_Stub>();
-        _env->_stream_load_executor = StreamLoadExecutor::create_shared(_env);
+        _env->_stream_load_executor = StreamLoadExecutor::create_unique(_env);
         _env->_store_paths = {StorePath(std::filesystem::current_path(), 0)};
-        _env->_wal_manager = WalManager::create_shared(_env, wal_dir.string());
+        _env->set_wal_mgr(WalManager::create_unique(_env, wal_dir.string()));
         k_stream_load_begin_result = TLoadTxnBeginResult();
     }
     void TearDown() override {
         Status st = io::global_local_filesystem()->delete_directory(wal_dir);
         if (!st.ok()) {
             LOG(WARNING) << "fail to delete " << wal_dir.string();
+        } else {
+            LOG(INFO) << "delete " << wal_dir.string();
         }
         SAFE_STOP(_env->_wal_manager);
         SAFE_DELETE(_env->_function_client_cache);
         SAFE_DELETE(_env->_internal_client_cache);
-        SAFE_DELETE(_env->_master_info);
+        SAFE_DELETE(_env->_cluster_info);
+        _env->clear_new_load_stream_mgr();
+        _env->clear_stream_load_executor();
+        //_env->clear_wal_mgr();
     }
 
     void prepare() {
         Status st = io::global_local_filesystem()->create_directory(wal_dir);
         if (!st.ok()) {
-            LOG(WARNING) << "create dir  " << wal_dir.string();
+            LOG(WARNING) << "fail to create dir  " << wal_dir.string();
         }
     }
 
@@ -100,57 +105,62 @@ public:
 
 TEST_F(WalManagerTest, recovery_normal) {
     _env->wal_mgr()->wal_limit_test_bytes = 1099511627776;
-    k_stream_load_exec_status = Status::OK();
 
     std::string db_id = "1";
     int64_t tb_1_id = 1;
-    std::string wal_100_id = "100";
-    std::string wal_101_id = "101";
+    std::string wal_file_1 = "0_1001_1_group_commit_label1";
+    std::string wal_file_2 = "0_1001_2_group_commit_label2";
     int64_t tb_2_id = 2;
-    std::string wal_200_id = "200";
-    std::string wal_201_id = "201";
+    std::string wal_file_3 = "0_1001_3_group_commit_label3";
+    std::string wal_file_4 = "0_1001_4_group_commit_label4";
 
     bool res = std::filesystem::create_directory(wal_dir.string() + "/" + db_id);
     ASSERT_TRUE(res);
     res = std::filesystem::create_directory(wal_dir.string() + "/" + db_id + "/" +
                                             std::to_string(tb_1_id));
     ASSERT_TRUE(res);
-    std::string wal_100 =
-            wal_dir.string() + "/" + db_id + "/" + std::to_string(tb_1_id) + "/" + wal_100_id;
-    std::string wal_101 =
-            wal_dir.string() + "/" + db_id + "/" + std::to_string(tb_1_id) + "/" + wal_101_id;
-    createWal(wal_100);
-    createWal(wal_101);
+    std::string wal_1 =
+            wal_dir.string() + "/" + db_id + "/" + std::to_string(tb_1_id) + "/" + wal_file_1;
+    std::string wal_2 =
+            wal_dir.string() + "/" + db_id + "/" + std::to_string(tb_1_id) + "/" + wal_file_2;
+    createWal(wal_1);
+    createWal(wal_2);
 
     res = std::filesystem::create_directory(wal_dir.string() + "/" + db_id + "/" +
                                             std::to_string(tb_2_id));
     ASSERT_TRUE(res);
-    std::string wal_200 =
-            wal_dir.string() + "/" + db_id + "/" + std::to_string(tb_2_id) + "/" + wal_200_id;
-    std::string wal_201 =
-            wal_dir.string() + "/" + db_id + "/" + std::to_string(tb_2_id) + "/" + wal_201_id;
-    createWal(wal_200);
-    createWal(wal_201);
+    std::string wal_3 =
+            wal_dir.string() + "/" + db_id + "/" + std::to_string(tb_2_id) + "/" + wal_file_3;
+    std::string wal_4 =
+            wal_dir.string() + "/" + db_id + "/" + std::to_string(tb_2_id) + "/" + wal_file_4;
+    createWal(wal_3);
+    createWal(wal_4);
     Status st = _env->wal_mgr()->init();
     if (!st.ok()) {
         LOG(WARNING) << "fail to int wal manager ";
     }
 
-    while (_env->wal_mgr()->get_wal_table_size(tb_1_id) > 0 ||
-           _env->wal_mgr()->get_wal_table_size(tb_2_id) > 0) {
+    auto count = 0;
+    while (std::filesystem::exists(wal_1) || std::filesystem::exists(wal_2) ||
+           std::filesystem::exists(wal_3) || std::filesystem::exists(wal_4)) {
+        if (count > 30) {
+            LOG(WARNING) << "wait time out";
+            break;
+        }
         sleep(1);
+        count++;
         continue;
     }
-    ASSERT_TRUE(!std::filesystem::exists(wal_100));
-    ASSERT_TRUE(!std::filesystem::exists(wal_101));
-    ASSERT_TRUE(!std::filesystem::exists(wal_200));
-    ASSERT_TRUE(!std::filesystem::exists(wal_201));
+    ASSERT_TRUE(!std::filesystem::exists(wal_1));
+    ASSERT_TRUE(!std::filesystem::exists(wal_2));
+    ASSERT_TRUE(!std::filesystem::exists(wal_3));
+    ASSERT_TRUE(!std::filesystem::exists(wal_4));
 }
 
 TEST_F(WalManagerTest, TestDynamicWalSpaceLimt) {
-    auto wal_mgr = WalManager::create_shared(_env, config::group_commit_wal_path);
+    auto wal_mgr = WalManager::create_unique(_env, config::group_commit_wal_path);
     static_cast<void>(wal_mgr->init());
-    _env->set_wal_mgr(wal_mgr);
+    _env->set_wal_mgr(std::move(wal_mgr));
 
     // 1T
     size_t available_bytes = 1099511627776;
@@ -164,13 +174,13 @@ TEST_F(WalManagerTest, TestDynamicWalSpaceLimt) {
     _env->wal_mgr()->wal_limit_test_bytes = available_bytes;
     config::group_commit_wal_max_disk_limit = "5%";
     EXPECT_EQ(_env->wal_mgr()->_init_wal_dirs_info(), Status::OK());
-    wal_limit_bytes = available_bytes * 0.05;
+    wal_limit_bytes = size_t(available_bytes * 0.05);
     EXPECT_EQ(_env->wal_mgr()->wal_limit_test_bytes, wal_limit_bytes);
 
     _env->wal_mgr()->wal_limit_test_bytes = available_bytes;
     config::group_commit_wal_max_disk_limit = "50%";
     EXPECT_EQ(_env->wal_mgr()->_init_wal_dirs_info(), Status::OK());
-    wal_limit_bytes = available_bytes * 0.5;
+    wal_limit_bytes = size_t(available_bytes * 0.5);
     EXPECT_EQ(_env->wal_mgr()->wal_limit_test_bytes, wal_limit_bytes);
 
     _env->wal_mgr()->wal_limit_test_bytes = available_bytes;

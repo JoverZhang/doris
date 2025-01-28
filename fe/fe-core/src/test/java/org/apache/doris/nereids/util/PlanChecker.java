@@ -20,6 +20,7 @@ package org.apache.doris.nereids.util;
 import org.apache.doris.analysis.ExplainOptions;
 import org.apache.doris.nereids.CascadesContext;
 import org.apache.doris.nereids.NereidsPlanner;
+import org.apache.doris.nereids.PlanProcess;
 import org.apache.doris.nereids.StatementContext;
 import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.glue.LogicalPlanAdapter;
@@ -48,7 +49,7 @@ import org.apache.doris.nereids.rules.Rule;
 import org.apache.doris.nereids.rules.RuleFactory;
 import org.apache.doris.nereids.rules.RuleSet;
 import org.apache.doris.nereids.rules.RuleType;
-import org.apache.doris.nereids.rules.analysis.BindRelation.CustomTableResolver;
+import org.apache.doris.nereids.rules.exploration.mv.InitMaterializationContextHook;
 import org.apache.doris.nereids.rules.rewrite.OneRewriteRuleFactory;
 import org.apache.doris.nereids.trees.plans.GroupPlan;
 import org.apache.doris.nereids.trees.plans.Plan;
@@ -69,7 +70,6 @@ import org.junit.jupiter.api.Assertions;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
 import java.util.Set;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
@@ -121,6 +121,7 @@ public class PlanChecker {
     public PlanChecker analyze() {
         this.cascadesContext.newAnalyzer().analyze();
         this.cascadesContext.toMemo();
+        InitMaterializationContextHook.INSTANCE.initMaterializationContext(this.cascadesContext);
         return this;
     }
 
@@ -144,12 +145,6 @@ public class PlanChecker {
         return this;
     }
 
-    public PlanChecker customAnalyzer(Optional<CustomTableResolver> customTableResolver) {
-        this.cascadesContext.newAnalyzer(customTableResolver).analyze();
-        this.cascadesContext.toMemo();
-        return this;
-    }
-
     public PlanChecker customRewrite(CustomRewriter customRewriter) {
         Rewriter.getWholeTreeRewriterWithCustomJobs(cascadesContext,
                         ImmutableList.of(Rewriter.custom(RuleType.TEST_REWRITE, () -> customRewriter)))
@@ -157,6 +152,30 @@ public class PlanChecker {
         cascadesContext.toMemo();
         MemoValidator.validate(cascadesContext.getMemo());
         return this;
+    }
+
+    public PlanChecker disableNereidsRules(String rules) {
+        connectContext.getSessionVariable().setDisableNereidsRules(rules);
+        return this;
+    }
+
+    public PlanChecker printPlanProcess(String sql) {
+        List<PlanProcess> planProcesses = explainPlanProcess(sql);
+        for (PlanProcess row : planProcesses) {
+            System.out.println("RULE: " + row.ruleName + "\nBEFORE:\n"
+                    + row.beforeShape + "\nafter:\n" + row.afterShape);
+        }
+        return this;
+    }
+
+    public List<PlanProcess> explainPlanProcess(String sql) {
+        NereidsParser parser = new NereidsParser();
+        LogicalPlan command = parser.parseSingle(sql);
+        NereidsPlanner planner = new NereidsPlanner(
+                new StatementContext(connectContext, new OriginStatement(sql, 0)));
+        planner.planWithLock(command, PhysicalProperties.ANY, ExplainLevel.ALL_PLAN, true);
+        this.cascadesContext = planner.getCascadesContext();
+        return cascadesContext.getPlanProcesses();
     }
 
     public PlanChecker applyTopDown(RuleFactory ruleFactory) {
@@ -233,9 +252,25 @@ public class PlanChecker {
     public PlanChecker optimize() {
         cascadesContext.setJobContext(PhysicalProperties.GATHER);
         double now = System.currentTimeMillis();
-        new Optimizer(cascadesContext).execute();
+        try {
+            new Optimizer(cascadesContext).execute();
+        } finally {
+            // Mv rewrite add lock manually, so need release manually
+            cascadesContext.getStatementContext().releasePlannerResources();
+        }
         System.out.println("cascades:" + (System.currentTimeMillis() - now));
         return this;
+    }
+
+    public NereidsPlanner plan(String sql) {
+        StatementContext statementContext = new StatementContext(connectContext, new OriginStatement(sql, 0));
+        connectContext.setStatementContext(statementContext);
+        NereidsPlanner planner = new NereidsPlanner(statementContext);
+        LogicalPlan parsedPlan = new NereidsParser().parseSingle(sql);
+        LogicalPlanAdapter parsedPlanAdaptor = new LogicalPlanAdapter(parsedPlan, statementContext);
+        statementContext.setParsedStatement(parsedPlanAdaptor);
+        planner.plan(parsedPlanAdaptor);
+        return planner;
     }
 
     public PlanChecker dpHypOptimize() {
@@ -532,7 +567,7 @@ public class PlanChecker {
         NereidsPlanner nereidsPlanner = new NereidsPlanner(
                 new StatementContext(connectContext, new OriginStatement(sql, 0)));
         LogicalPlanAdapter adapter = LogicalPlanAdapter.of(parsed);
-        adapter.setIsExplain(new ExplainOptions(ExplainLevel.ALL_PLAN));
+        adapter.setIsExplain(new ExplainOptions(ExplainLevel.ALL_PLAN, false));
         nereidsPlanner.plan(adapter);
         consumer.accept(nereidsPlanner);
         return this;

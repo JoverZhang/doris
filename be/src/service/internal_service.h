@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <brpc/closure_guard.h>
 #include <gen_cpp/internal_service.pb.h>
 
 #include <string>
@@ -35,23 +36,33 @@ class StorageEngine;
 class ExecEnv;
 class PHandShakeRequest;
 class PHandShakeResponse;
-class LoadStreamMgr;
 class RuntimeState;
+
+template <typename T>
+concept CanCancel = requires(T* response) { response->mutable_status(); };
+
+template <typename T>
+void offer_failed(T* response, google::protobuf::Closure* done, const FifoThreadPool& pool) {
+    brpc::ClosureGuard closure_guard(done);
+    LOG(WARNING) << "fail to offer request to the work pool, pool=" << pool.get_info();
+}
+
+template <CanCancel T>
+void offer_failed(T* response, google::protobuf::Closure* done, const FifoThreadPool& pool) {
+    brpc::ClosureGuard closure_guard(done);
+    // Should use status to generate protobuf message, because it will encoding Backend Info
+    // into the error message and then we could know which backend's pool is full.
+    Status st = Status::Error<TStatusCode::CANCELLED>(
+            "fail to offer request to the work pool, pool={}", pool.get_info());
+    st.to_protobuf(response->mutable_status());
+    LOG(WARNING) << "cancelled due to fail to offer request to the work pool, pool="
+                 << pool.get_info();
+}
 
 class PInternalService : public PBackendService {
 public:
     PInternalService(ExecEnv* exec_env);
     ~PInternalService() override;
-
-    void transmit_data(::google::protobuf::RpcController* controller,
-                       const ::doris::PTransmitDataParams* request,
-                       ::doris::PTransmitDataResult* response,
-                       ::google::protobuf::Closure* done) override;
-
-    void transmit_data_by_http(::google::protobuf::RpcController* controller,
-                               const ::doris::PEmptyRequest* request,
-                               ::doris::PTransmitDataResult* response,
-                               ::google::protobuf::Closure* done) override;
 
     void exec_plan_fragment(google::protobuf::RpcController* controller,
                             const PExecPlanFragmentRequest* request,
@@ -75,6 +86,15 @@ public:
 
     void fetch_data(google::protobuf::RpcController* controller, const PFetchDataRequest* request,
                     PFetchDataResult* result, google::protobuf::Closure* done) override;
+
+    void fetch_arrow_data(google::protobuf::RpcController* controller,
+                          const PFetchArrowDataRequest* request, PFetchArrowDataResult* result,
+                          google::protobuf::Closure* done) override;
+
+    void outfile_write_success(google::protobuf::RpcController* controller,
+                               const POutfileWriteSuccessRequest* request,
+                               POutfileWriteSuccessResult* result,
+                               google::protobuf::Closure* done) override;
 
     void fetch_table_schema(google::protobuf::RpcController* controller,
                             const PFetchTableSchemaRequest* request,
@@ -128,10 +148,15 @@ public:
                       ::doris::PMergeFilterResponse* response,
                       ::google::protobuf::Closure* done) override;
 
-    void apply_filter(::google::protobuf::RpcController* controller,
-                      const ::doris::PPublishFilterRequest* request,
-                      ::doris::PPublishFilterResponse* response,
-                      ::google::protobuf::Closure* done) override;
+    void send_filter_size(::google::protobuf::RpcController* controller,
+                          const ::doris::PSendFilterSizeRequest* request,
+                          ::doris::PSendFilterSizeResponse* response,
+                          ::google::protobuf::Closure* done) override;
+
+    void sync_filter_size(::google::protobuf::RpcController* controller,
+                          const ::doris::PSyncFilterSizeRequest* request,
+                          ::doris::PSyncFilterSizeResponse* response,
+                          ::google::protobuf::Closure* done) override;
     void apply_filterv2(::google::protobuf::RpcController* controller,
                         const ::doris::PPublishFilterRequestV2* request,
                         ::doris::PPublishFilterResponse* response,
@@ -183,6 +208,28 @@ public:
                             PGetWalQueueSizeResponse* response,
                             google::protobuf::Closure* done) override;
 
+    void multiget_data(google::protobuf::RpcController* controller, const PMultiGetRequest* request,
+                       PMultiGetResponse* response, google::protobuf::Closure* done) override;
+
+    void tablet_fetch_data(google::protobuf::RpcController* controller,
+                           const PTabletKeyLookupRequest* request,
+                           PTabletKeyLookupResponse* response,
+                           google::protobuf::Closure* done) override;
+
+    void test_jdbc_connection(google::protobuf::RpcController* controller,
+                              const PJdbcTestConnectionRequest* request,
+                              PJdbcTestConnectionResult* result,
+                              google::protobuf::Closure* done) override;
+
+    void fetch_remote_tablet_schema(google::protobuf::RpcController* controller,
+                                    const PFetchRemoteSchemaRequest* request,
+                                    PFetchRemoteSchemaResponse* response,
+                                    google::protobuf::Closure* done) override;
+
+    void get_be_resource(google::protobuf::RpcController* controller,
+                         const PGetBeResourceRequest* request, PGetBeResourceResponse* response,
+                         google::protobuf::Closure* done) override;
+
 private:
     void _exec_plan_fragment_in_pthread(google::protobuf::RpcController* controller,
                                         const PExecPlanFragmentRequest* request,
@@ -196,15 +243,13 @@ private:
 
     Status _fold_constant_expr(const std::string& ser_request, PConstantExprResult* response);
 
-    void _transmit_data(::google::protobuf::RpcController* controller,
-                        const ::doris::PTransmitDataParams* request,
-                        ::doris::PTransmitDataResult* response, ::google::protobuf::Closure* done,
-                        const Status& extract_st);
-
     void _transmit_block(::google::protobuf::RpcController* controller,
                          const ::doris::PTransmitDataParams* request,
                          ::doris::PTransmitDataResult* response, ::google::protobuf::Closure* done,
-                         const Status& extract_st);
+                         const Status& extract_st, const int64_t wait_for_worker);
+
+    Status _tablet_fetch_data(const PTabletKeyLookupRequest* request,
+                              PTabletKeyLookupResponse* response);
 
 protected:
     ExecEnv* _exec_env = nullptr;
@@ -215,8 +260,7 @@ protected:
     // otherwise as light interface
     FifoThreadPool _heavy_work_pool;
     FifoThreadPool _light_work_pool;
-
-    std::unique_ptr<LoadStreamMgr> _load_stream_mgr;
+    FifoThreadPool _arrow_flight_work_pool;
 };
 
 // `StorageEngine` mixin for `PInternalService`
@@ -233,13 +277,6 @@ public:
                                            const PTabletWriteSlaveDoneRequest* request,
                                            PTabletWriteSlaveDoneResult* response,
                                            google::protobuf::Closure* done) override;
-    void multiget_data(google::protobuf::RpcController* controller, const PMultiGetRequest* request,
-                       PMultiGetResponse* response, google::protobuf::Closure* done) override;
-
-    void tablet_fetch_data(google::protobuf::RpcController* controller,
-                           const PTabletKeyLookupRequest* request,
-                           PTabletKeyLookupResponse* response,
-                           google::protobuf::Closure* done) override;
 
     void get_column_ids_by_tablet_ids(google::protobuf::RpcController* controller,
                                       const PFetchColIdsRequest* request,
@@ -251,15 +288,7 @@ public:
                                     PGetTabletVersionsResponse* response,
                                     google::protobuf::Closure* done) override;
 
-    void fetch_remote_tablet_schema(google::protobuf::RpcController* controller,
-                                    const PFetchRemoteSchemaRequest* request,
-                                    PFetchRemoteSchemaResponse* response,
-                                    google::protobuf::Closure* done) override;
-
 private:
-    Status _tablet_fetch_data(const PTabletKeyLookupRequest* request,
-                              PTabletKeyLookupResponse* response);
-
     void _response_pull_slave_rowset(const std::string& remote_host, int64_t brpc_port,
                                      int64_t txn_id, int64_t tablet_id, int64_t node_id,
                                      bool is_succeed);

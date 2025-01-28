@@ -47,7 +47,7 @@ import java.util.List;
  */
 public class Sum extends NullableAggregateFunction
         implements UnaryExpression, ExplicitlyCastableSignature, ComputePrecisionForSum, SupportWindowAnalytic,
-        CouldRollUp {
+        RollUpTrait, SupportMultiDistinct {
 
     public static final List<FunctionSignature> SIGNATURES = ImmutableList.of(
             FunctionSignature.ret(BigIntType.INSTANCE).args(BooleanType.INSTANCE),
@@ -76,6 +76,13 @@ public class Sum extends NullableAggregateFunction
 
     public Sum(boolean distinct, boolean alwaysNullable, Expression arg) {
         super("sum", distinct, alwaysNullable, arg);
+    }
+
+    @Override
+    public MultiDistinctSum convertToMultiDistinct() {
+        Preconditions.checkArgument(distinct,
+                "can't convert to multi_distinct_sum because there is no distinct args");
+        return new MultiDistinctSum(false, alwaysNullable, child());
     }
 
     @Override
@@ -122,5 +129,10 @@ public class Sum extends NullableAggregateFunction
     @Override
     public Function constructRollUp(Expression param, Expression... varParams) {
         return new Sum(this.distinct, param);
+    }
+
+    @Override
+    public boolean canRollUp() {
+        return true;
     }
 }

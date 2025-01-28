@@ -16,6 +16,10 @@
 // under the License.
 
 suite ("test_alter_table_property") {
+    if (isCloudMode()) {
+        return
+    }
+
     String tableName = "test_alter_table_property_table"
     sql "DROP TABLE IF EXISTS ${tableName}"
     sql """
@@ -39,17 +43,28 @@ suite ("test_alter_table_property") {
 
     def queryReplicaCount = { partitionName ->
         def result = sql "SHOW REPLICA DISTRIBUTION FROM ${tableName} PARTITION ${partitionName}"
+        logger.info("${result}")
         int sum = 0
         for (row in result) {
             sum += row[1].toInteger()
         }
         sum
     }
+    def replication_num = 1
+    def forceReplicaNum = getFeConfig('force_olap_table_replication_num').toInteger()
+    if (forceReplicaNum > 0) {
+        replication_num = forceReplicaNum
+    }
 
-    assertEquals(1, queryReplicaCount("p1"))
+    assertEquals(replication_num, queryReplicaCount("p1"))
 
     sql """ ALTER TABLE ${tableName} ADD PARTITION p2 VALUES LESS THAN ("200") """
-    assertEquals(1, queryReplicaCount("p2"))
+    assertEquals(replication_num, queryReplicaCount("p2"))
+
+    def res = sql """show backends;"""
+    if (res.size() < 3) {
+        return
+    }
 
     sql """ ALTER TABLE ${tableName} SET ( "default.replication_allocation" = "tag.location.default: 2" ) """
     sql """ ALTER TABLE ${tableName} ADD PARTITION p3 VALUES LESS THAN ("300") """
@@ -62,7 +77,7 @@ suite ("test_alter_table_property") {
         }
     }
     assertEquals(2, queryReplicaCount("p1"))
-    assertEquals(1, queryReplicaCount("p2"))
+    assertEquals(replication_num, queryReplicaCount("p2"))
 
     sql "DROP TABLE ${tableName}"
 }

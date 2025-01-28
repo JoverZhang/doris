@@ -21,6 +21,7 @@
 #include "util/runtime_profile.h"
 
 namespace doris {
+#include "common/compile_check_begin.h"
 class TExpr;
 
 namespace vectorized {
@@ -30,15 +31,21 @@ DeltaWriterV2Map::DeltaWriterV2Map(UniqueId load_id, int num_use, DeltaWriterV2P
 
 DeltaWriterV2Map::~DeltaWriterV2Map() = default;
 
-DeltaWriterV2* DeltaWriterV2Map::get_or_create(
+std::shared_ptr<DeltaWriterV2> DeltaWriterV2Map::get_or_create(
         int64_t tablet_id, std::function<std::unique_ptr<DeltaWriterV2>()> creator) {
-    _map.lazy_emplace(tablet_id, [&](const TabletToDeltaWriterV2Map::constructor& ctor) {
-        ctor(tablet_id, creator());
-    });
-    return _map.at(tablet_id).get();
+    std::lock_guard lock(_mutex);
+    if (_map.contains(tablet_id)) {
+        return _map.at(tablet_id);
+    }
+    std::shared_ptr<DeltaWriterV2> writer = creator();
+    if (writer != nullptr) {
+        _map[tablet_id] = writer;
+    }
+    return writer;
 }
 
-Status DeltaWriterV2Map::close(RuntimeProfile* profile) {
+Status DeltaWriterV2Map::close(std::unordered_map<int64_t, int32_t>& segments_for_tablet,
+                               RuntimeProfile* profile) {
     int num_use = --_use_cnt;
     if (num_use > 0) {
         LOG(INFO) << "keeping DeltaWriterV2Map, load_id=" << _load_id << " , use_cnt=" << num_use;
@@ -48,22 +55,17 @@ Status DeltaWriterV2Map::close(RuntimeProfile* profile) {
         _pool->erase(_load_id);
     }
     LOG(INFO) << "closing DeltaWriterV2Map, load_id=" << _load_id;
-    Status status = Status::OK();
-    _map.for_each([&status](auto& entry) {
-        if (status.ok()) {
-            status = entry.second->close();
-        }
-    });
-    if (!status.ok()) {
-        return status;
+    std::lock_guard lock(_mutex);
+    for (auto& [_, writer] : _map) {
+        RETURN_IF_ERROR(writer->close());
     }
     LOG(INFO) << "close-waiting DeltaWriterV2Map, load_id=" << _load_id;
-    _map.for_each([&status, profile](auto& entry) {
-        if (status.ok()) {
-            status = entry.second->close_wait(profile);
-        }
-    });
-    return status;
+    for (auto& [tablet_id, writer] : _map) {
+        int32_t num_segments;
+        RETURN_IF_ERROR(writer->close_wait(num_segments, profile));
+        segments_for_tablet[tablet_id] = num_segments;
+    }
+    return Status::OK();
 }
 
 void DeltaWriterV2Map::cancel(Status status) {
@@ -72,9 +74,10 @@ void DeltaWriterV2Map::cancel(Status status) {
     if (num_use == 0 && _pool != nullptr) {
         _pool->erase(_load_id);
     }
-    _map.for_each([&status](auto& entry) {
-        static_cast<void>(entry.second->cancel_with_status(status));
-    });
+    std::lock_guard lock(_mutex);
+    for (auto& [_, writer] : _map) {
+        static_cast<void>(writer->cancel_with_status(status));
+    }
 }
 
 DeltaWriterV2Pool::DeltaWriterV2Pool() = default;

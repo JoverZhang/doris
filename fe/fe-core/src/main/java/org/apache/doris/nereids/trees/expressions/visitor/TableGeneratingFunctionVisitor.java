@@ -28,12 +28,20 @@ import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeJso
 import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeJsonArrayJsonOuter;
 import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeJsonArrayString;
 import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeJsonArrayStringOuter;
+import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeJsonObject;
+import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeJsonObjectOuter;
+import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeMap;
+import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeMapOuter;
 import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeNumbers;
 import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeNumbersOuter;
 import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeOuter;
 import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeSplit;
 import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeSplitOuter;
+import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeVariantArray;
+import org.apache.doris.nereids.trees.expressions.functions.generator.PosExplode;
+import org.apache.doris.nereids.trees.expressions.functions.generator.PosExplodeOuter;
 import org.apache.doris.nereids.trees.expressions.functions.generator.TableGeneratingFunction;
+import org.apache.doris.nereids.trees.expressions.functions.udf.JavaUdtf;
 
 /**
  * visitor function for all table generating function.
@@ -46,6 +54,26 @@ public interface TableGeneratingFunctionVisitor<R, C> {
     }
 
     default R visitExplodeOuter(ExplodeOuter explodeOuter, C context) {
+        return visitTableGeneratingFunction(explodeOuter, context);
+    }
+
+    default R visitExplodeVariant(ExplodeVariantArray explodeVariantArray, C context) {
+        return visitTableGeneratingFunction(explodeVariantArray, context);
+    }
+
+    default R visitExplodeMap(ExplodeMap explode, C context) {
+        return visitTableGeneratingFunction(explode, context);
+    }
+
+    default R visitExplodeMapOuter(ExplodeMapOuter explodeOuter, C context) {
+        return visitTableGeneratingFunction(explodeOuter, context);
+    }
+
+    default R visitExplodeJsonObject(ExplodeJsonObject explode, C context) {
+        return visitTableGeneratingFunction(explode, context);
+    }
+
+    default R visitExplodeJsonObjectOuter(ExplodeJsonObjectOuter explodeOuter, C context) {
         return visitTableGeneratingFunction(explodeOuter, context);
     }
 
@@ -105,4 +133,15 @@ public interface TableGeneratingFunctionVisitor<R, C> {
         return visitTableGeneratingFunction(explodeJsonArrayJsonOuter, context);
     }
 
+    default R visitJavaUdtf(JavaUdtf udtf, C context) {
+        return visitTableGeneratingFunction(udtf, context);
+    }
+
+    default R visitPosExplode(PosExplode posExplode, C context) {
+        return visitTableGeneratingFunction(posExplode, context);
+    }
+
+    default R visitPosExplodeOuter(PosExplodeOuter posExplodeOuter, C context) {
+        return visitTableGeneratingFunction(posExplodeOuter, context);
+    }
 }

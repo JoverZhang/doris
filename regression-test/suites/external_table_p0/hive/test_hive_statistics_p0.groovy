@@ -17,10 +17,15 @@
 
 suite("test_hive_statistics_p0", "all_types,p0,external,hive,external_docker,external_docker_hive") {
     String enabled = context.config.otherConfigs.get("enableHiveTest")
-    if (enabled != null && enabled.equalsIgnoreCase("true")) {
+    if (enabled == null || !enabled.equalsIgnoreCase("true")) {
+        logger.info("diable Hive test.")
+        return;
+    }
+
+    for (String hivePrefix : ["hive2", "hive3"]) {
         try {
-            String hms_port = context.config.otherConfigs.get("hms_port")
-            String catalog_name = "test_hive_statistics_p0"
+            String hms_port = context.config.otherConfigs.get(hivePrefix + "HmsPort")
+            String catalog_name = "test_${hivePrefix}_statistics_p0"
             String externalEnvIp = context.config.otherConfigs.get("externalEnvIp")
 
             sql """drop catalog if exists ${catalog_name}"""
@@ -31,6 +36,20 @@ suite("test_hive_statistics_p0", "all_types,p0,external,hive,external_docker,ext
             sql """use `${catalog_name}`.`stats_test`"""
             sql """analyze database stats_test with sync"""
 
+            // Test hive scan node cardinality. Estimated row count.
+            for (int i = 0; i < 60; i++) {
+                def result = sql """show table stats `${catalog_name}`.`statistics`.`statistics`"""
+                logger.info("Table stats " + result)
+                if (!"66".equalsIgnoreCase(result[0][2])) {
+                    Thread.sleep(1000)
+                } else {
+                    explain {
+                        sql "select count(2) from `${catalog_name}`.`statistics`.`statistics`;"
+                        contains "cardinality=66"
+                    }
+                    break;
+                }
+            }
 
             def result = sql """show catalog ${catalog_name}"""
             for (int i = 0; i < result.size(); i++) {
@@ -59,62 +78,62 @@ suite("test_hive_statistics_p0", "all_types,p0,external,hive,external_docker,ext
             result = sql """show column stats stats_test1(id);"""
             assertEquals(1, result.size())
             assertEquals("id", result[0][0])
-            assertEquals("3.0", result[0][1])
             assertEquals("3.0", result[0][2])
-            assertEquals("0.0", result[0][3])
-            assertEquals("12.0", result[0][4])
-            assertEquals("4.0", result[0][5])
-            assertEquals("1", result[0][6])
-            assertEquals("3", result[0][7])
-            assertEquals("FULL" , result[0][8])
-            assertEquals("FUNDAMENTALS" , result[0][9])
-            assertEquals("MANUAL" , result[0][10])
-            assertEquals("0" , result[0][11])
+            assertEquals("3.0", result[0][3])
+            assertEquals("0.0", result[0][4])
+            assertEquals("12.0", result[0][5])
+            assertEquals("4.0", result[0][6])
+            assertEquals("1", result[0][7])
+            assertEquals("3", result[0][8])
+            assertEquals("FULL" , result[0][9])
+            assertEquals("FUNDAMENTALS" , result[0][10])
+            assertEquals("MANUAL" , result[0][11])
+            assertEquals("0" , result[0][12])
 
             result = sql """show column stats stats_test1(value);"""
             assertEquals(1, result.size())
             assertEquals("value", result[0][0])
-            assertEquals("3.0", result[0][1])
             assertEquals("3.0", result[0][2])
-            assertEquals("0.0", result[0][3])
-            assertEquals("15.0", result[0][4])
-            assertEquals("5.0", result[0][5])
-            assertEquals("\'name1\'" , result[0][6])
-            assertEquals("\'name3\'" , result[0][7])
-            assertEquals("FULL" , result[0][8])
-            assertEquals("FUNDAMENTALS" , result[0][9])
-            assertEquals("MANUAL" , result[0][10])
-            assertEquals("0" , result[0][11])
+            assertEquals("3.0", result[0][3])
+            assertEquals("0.0", result[0][4])
+            assertEquals("15.0", result[0][5])
+            assertEquals("5.0", result[0][6])
+            assertEquals("\'name1\'" , result[0][7])
+            assertEquals("\'name3\'" , result[0][8])
+            assertEquals("FULL" , result[0][9])
+            assertEquals("FUNDAMENTALS" , result[0][10])
+            assertEquals("MANUAL" , result[0][11])
+            assertEquals("0" , result[0][12])
 
             result = sql """show column stats stats_test2(id);"""
             assertEquals(1, result.size())
             assertEquals("id", result[0][0])
-            assertEquals("2.0", result[0][1])
             assertEquals("2.0", result[0][2])
-            assertEquals("0.0", result[0][3])
-            assertEquals("8.0", result[0][4])
-            assertEquals("4.0", result[0][5])
-            assertEquals("1", result[0][6])
-            assertEquals("2", result[0][7])
-            assertEquals("FULL" , result[0][8])
-            assertEquals("FUNDAMENTALS" , result[0][9])
-            assertEquals("MANUAL" , result[0][10])
-            assertEquals("0" , result[0][11])
+            assertEquals("2.0", result[0][3])
+            assertEquals("0.0", result[0][4])
+            assertEquals("8.0", result[0][5])
+            assertEquals("4.0", result[0][6])
+            assertEquals("1", result[0][7])
+            assertEquals("2", result[0][8])
+            assertEquals("FULL" , result[0][9])
+            assertEquals("FUNDAMENTALS" , result[0][10])
+            assertEquals("MANUAL" , result[0][11])
+            assertEquals("0" , result[0][12])
 
             result = sql """show column stats stats_test2(value);"""
             assertEquals(1, result.size())
             assertEquals("value", result[0][0])
-            assertEquals("2.0", result[0][1])
             assertEquals("2.0", result[0][2])
-            assertEquals("0.0", result[0][3])
-            assertEquals("2.0", result[0][4])
-            assertEquals("1.0", result[0][5])
-            assertEquals("\'*\'", result[0][6])
-            assertEquals("\';\'", result[0][7])
-            assertEquals("FULL" , result[0][8])
-            assertEquals("FUNDAMENTALS" , result[0][9])
-            assertEquals("MANUAL" , result[0][10])
-            assertEquals("0" , result[0][11])
+            assertEquals("2.0", result[0][3])
+            assertEquals("0.0", result[0][4])
+            assertEquals("2.0", result[0][5])
+            assertEquals("1.0", result[0][6])
+            assertEquals("\'*\'", result[0][7])
+            assertEquals("\';\'", result[0][8])
+            assertEquals("FULL" , result[0][9])
+            assertEquals("FUNDAMENTALS" , result[0][10])
+            assertEquals("MANUAL" , result[0][11])
+            assertEquals("0" , result[0][12])
 
             sql """drop catalog if exists ${catalog_name}"""
 
@@ -127,17 +146,17 @@ suite("test_hive_statistics_p0", "all_types,p0,external,hive,external_docker,ext
             result = sql """show column stats stats_test1(value);"""
             assertEquals(1, result.size())
             assertEquals("value", result[0][0])
-            assertEquals("3.0", result[0][1])
             assertEquals("3.0", result[0][2])
-            assertEquals("0.0", result[0][3])
-            assertEquals("15.0", result[0][4])
-            assertEquals("5.0", result[0][5])
-            assertEquals("\'name1\'" , result[0][6])
-            assertEquals("\'name3\'" , result[0][7])
-            assertEquals("FULL" , result[0][8])
-            assertEquals("FUNDAMENTALS" , result[0][9])
-            assertEquals("MANUAL" , result[0][10])
-            assertEquals("0" , result[0][11])
+            assertEquals("3.0", result[0][3])
+            assertEquals("0.0", result[0][4])
+            assertEquals("15.0", result[0][5])
+            assertEquals("5.0", result[0][6])
+            assertEquals("\'name1\'" , result[0][7])
+            assertEquals("\'name3\'" , result[0][8])
+            assertEquals("FULL" , result[0][9])
+            assertEquals("FUNDAMENTALS" , result[0][10])
+            assertEquals("MANUAL" , result[0][11])
+            assertEquals("0" , result[0][12])
 
             result = sql """show column stats stats_test1(id);"""
             assertEquals(0, result.size())
@@ -146,72 +165,137 @@ suite("test_hive_statistics_p0", "all_types,p0,external,hive,external_docker,ext
             result = sql """show column stats stats_test1(id);"""
             assertEquals(1, result.size())
             assertEquals("id", result[0][0])
-            assertEquals("3.0", result[0][1])
             assertEquals("3.0", result[0][2])
-            assertEquals("0.0", result[0][3])
-            assertEquals("12.0", result[0][4])
-            assertEquals("4.0", result[0][5])
-            assertEquals("N/A", result[0][6])
+            assertEquals("3.0", result[0][3])
+            assertEquals("0.0", result[0][4])
+            assertEquals("12.0", result[0][5])
+            assertEquals("4.0", result[0][6])
             assertEquals("N/A", result[0][7])
-            assertEquals("SAMPLE" , result[0][8])
-            assertEquals("FUNDAMENTALS" , result[0][9])
-            assertEquals("MANUAL" , result[0][10])
-            assertEquals("0" , result[0][11])
+            assertEquals("N/A", result[0][8])
+            assertEquals("SAMPLE" , result[0][9])
+            assertEquals("FUNDAMENTALS" , result[0][10])
+            assertEquals("MANUAL" , result[0][11])
+            assertEquals("0" , result[0][12])
 
             sql """analyze table stats_test2 with sync;"""
             result = sql """show column stats stats_test2(id);"""
             assertEquals(1, result.size())
             assertEquals("id", result[0][0])
-            assertEquals("2.0", result[0][1])
             assertEquals("2.0", result[0][2])
-            assertEquals("0.0", result[0][3])
-            assertEquals("8.0", result[0][4])
-            assertEquals("4.0", result[0][5])
-            assertEquals("1", result[0][6])
-            assertEquals("2", result[0][7])
-            assertEquals("FULL" , result[0][8])
-            assertEquals("FUNDAMENTALS" , result[0][9])
-            assertEquals("MANUAL" , result[0][10])
-            assertEquals("0" , result[0][11])
+            assertEquals("2.0", result[0][3])
+            assertEquals("0.0", result[0][4])
+            assertEquals("8.0", result[0][5])
+            assertEquals("4.0", result[0][6])
+            assertEquals("1", result[0][7])
+            assertEquals("2", result[0][8])
+            assertEquals("FULL" , result[0][9])
+            assertEquals("FUNDAMENTALS" , result[0][10])
+            assertEquals("MANUAL" , result[0][11])
+            assertEquals("0" , result[0][12])
 
             result = sql """show column stats stats_test2(value);"""
             assertEquals(1, result.size())
             assertEquals("value", result[0][0])
-            assertEquals("2.0", result[0][1])
             assertEquals("2.0", result[0][2])
-            assertEquals("0.0", result[0][3])
-            assertEquals("2.0", result[0][4])
-            assertEquals("1.0", result[0][5])
-            assertEquals("\'*\'", result[0][6])
-            assertEquals("\';\'", result[0][7])
-            assertEquals("FULL" , result[0][8])
-            assertEquals("FUNDAMENTALS" , result[0][9])
-            assertEquals("MANUAL" , result[0][10])
-            assertEquals("0" , result[0][11])
+            assertEquals("2.0", result[0][3])
+            assertEquals("0.0", result[0][4])
+            assertEquals("2.0", result[0][5])
+            assertEquals("1.0", result[0][6])
+            assertEquals("\'*\'", result[0][7])
+            assertEquals("\';\'", result[0][8])
+            assertEquals("FULL" , result[0][9])
+            assertEquals("FUNDAMENTALS" , result[0][10])
+            assertEquals("MANUAL" , result[0][11])
+            assertEquals("0" , result[0][12])
 
 
             sql """analyze table stats_test3 with sync"""
             result = sql """show column stats stats_test3(id);"""
             assertEquals(1, result.size())
             assertEquals("id", result[0][0])
-            assertEquals("0.0", result[0][1])
             assertEquals("0.0", result[0][2])
             assertEquals("0.0", result[0][3])
             assertEquals("0.0", result[0][4])
             assertEquals("0.0", result[0][5])
-            assertEquals("N/A", result[0][6])
+            assertEquals("0.0", result[0][6])
             assertEquals("N/A", result[0][7])
+            assertEquals("N/A", result[0][8])
 
             result = sql """show column stats stats_test3(value);"""
             assertEquals(1, result.size())
             assertEquals("value", result[0][0])
-            assertEquals("0.0", result[0][1])
             assertEquals("0.0", result[0][2])
             assertEquals("0.0", result[0][3])
             assertEquals("0.0", result[0][4])
             assertEquals("0.0", result[0][5])
-            assertEquals("N/A", result[0][6])
+            assertEquals("0.0", result[0][6])
             assertEquals("N/A", result[0][7])
+            assertEquals("N/A", result[0][8])
+
+
+            // Test auto analyze policy
+            sql """drop stats stats_test1"""
+            result = sql """show table stats stats_test1"""
+            assertEquals(1, result.size())
+            assertEquals("false", result[0][8])
+
+            sql """ALTER CATALOG `${catalog_name}` SET PROPERTIES ('enable.auto.analyze'='true')"""
+            result = sql """show table stats stats_test1"""
+            assertEquals(1, result.size())
+            assertEquals("true", result[0][8])
+
+            sql """ALTER CATALOG `${catalog_name}` SET PROPERTIES ('enable.auto.analyze'='false')"""
+            result = sql """show table stats stats_test1"""
+            assertEquals(1, result.size())
+            assertEquals("false", result[0][8])
+
+            sql """analyze table stats_test1 PROPERTIES("use.auto.analyzer"="true")"""
+            result = sql """show auto analyze stats_test1"""
+            assertEquals(0, result.size())
+
+            sql """ALTER TABLE stats_test1 SET ("auto_analyze_policy" = "enable");"""
+            result = sql """show table stats stats_test1"""
+            assertEquals(1, result.size())
+            assertEquals("true", result[0][8])
+
+            sql """analyze table stats_test1 PROPERTIES("use.auto.analyzer"="true")"""
+            result = sql """show auto analyze stats_test1"""
+            assertEquals(1, result.size())
+
+            sql """ALTER CATALOG `${catalog_name}` SET PROPERTIES ('enable.auto.analyze'='true')"""
+            result = sql """show table stats stats_test1"""
+            assertEquals(1, result.size())
+            assertEquals("true", result[0][8])
+
+            sql """ALTER CATALOG `${catalog_name}` SET PROPERTIES ('enable.auto.analyze'='false')"""
+            result = sql """show table stats stats_test1"""
+            assertEquals(1, result.size())
+            assertEquals("true", result[0][8])
+
+            sql """ALTER TABLE stats_test1 SET ("auto_analyze_policy" = "disable");"""
+            result = sql """show table stats stats_test1"""
+            assertEquals(1, result.size())
+            assertEquals("false", result[0][8])
+
+            sql """ALTER CATALOG `${catalog_name}` SET PROPERTIES ('enable.auto.analyze'='true')"""
+            result = sql """show table stats stats_test1"""
+            assertEquals(1, result.size())
+            assertEquals("false", result[0][8])
+
+            sql """ALTER CATALOG `${catalog_name}` SET PROPERTIES ('enable.auto.analyze'='false')"""
+            result = sql """show table stats stats_test1"""
+            assertEquals(1, result.size())
+            assertEquals("false", result[0][8])
+
+            sql """ALTER TABLE stats_test1 SET ("auto_analyze_policy" = "base_on_catalog");"""
+            result = sql """show table stats stats_test1"""
+            assertEquals(1, result.size())
+            assertEquals("false", result[0][8])
+
+            sql """ALTER CATALOG `${catalog_name}` SET PROPERTIES ('enable.auto.analyze'='true')"""
+            result = sql """show table stats stats_test1"""
+            assertEquals(1, result.size())
+            assertEquals("true", result[0][8])
 
             sql """drop catalog if exists ${catalog_name}"""
 

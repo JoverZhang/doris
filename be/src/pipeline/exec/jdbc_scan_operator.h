@@ -24,10 +24,9 @@
 #include "common/status.h"
 #include "operator.h"
 #include "pipeline/exec/scan_operator.h"
-#include "pipeline/pipeline_x/operator.h"
-#include "vec/exec/scan/vscan_node.h"
 
 namespace doris {
+#include "common/compile_check_begin.h"
 
 namespace vectorized {
 class NewJdbcScanner;
@@ -64,4 +63,5 @@ private:
     TOdbcTableType::type _table_type;
 };
 
+#include "common/compile_check_end.h"
 } // namespace doris::pipeline

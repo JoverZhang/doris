@@ -34,18 +34,23 @@ class POpenStreamSinkRequest;
 
 class LoadStreamMgr {
 public:
-    LoadStreamMgr(uint32_t segment_file_writer_thread_num, FifoThreadPool* heavy_work_pool,
-                  FifoThreadPool* light_work_pool);
+    LoadStreamMgr(uint32_t segment_file_writer_thread_num);
     ~LoadStreamMgr();
 
-    Status open_load_stream(const POpenLoadStreamRequest* request,
-                            LoadStreamSharedPtr& load_stream);
+    Status open_load_stream(const POpenLoadStreamRequest* request, LoadStream*& load_stream);
     void clear_load(UniqueId loadid);
-    void create_tokens(std::vector<std::unique_ptr<ThreadPoolToken>>& tokens) {
-        for (int i = 0; i < _num_threads * 2; i++) {
-            tokens.push_back(
-                    _file_writer_thread_pool->new_token(ThreadPool::ExecutionMode::SERIAL));
+    void create_token(std::unique_ptr<ThreadPoolToken>& token) {
+        token = _file_writer_thread_pool->new_token(ThreadPool::ExecutionMode::SERIAL);
+    }
+
+    std::vector<std::string> get_all_load_stream_ids() {
+        std::vector<std::string> result;
+        std::lock_guard<std::mutex> lock(_lock);
+
+        for (auto& [id, _] : _load_streams_map) {
+            result.push_back(id.to_string());
         }
+        return result;
     }
 
     // only used by ut
@@ -54,12 +59,13 @@ public:
     FifoThreadPool* heavy_work_pool() { return _heavy_work_pool; }
     FifoThreadPool* light_work_pool() { return _light_work_pool; }
 
+    void set_heavy_work_pool(FifoThreadPool* pool) { _heavy_work_pool = pool; }
+    void set_light_work_pool(FifoThreadPool* pool) { _light_work_pool = pool; }
+
 private:
     std::mutex _lock;
-    std::unordered_map<UniqueId, LoadStreamSharedPtr> _load_streams_map;
+    std::unordered_map<UniqueId, LoadStreamPtr> _load_streams_map;
     std::unique_ptr<ThreadPool> _file_writer_thread_pool;
-
-    uint32_t _num_threads = 0;
 
     FifoThreadPool* _heavy_work_pool = nullptr;
     FifoThreadPool* _light_work_pool = nullptr;

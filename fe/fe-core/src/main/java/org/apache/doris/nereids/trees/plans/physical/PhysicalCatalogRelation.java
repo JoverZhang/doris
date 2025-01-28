@@ -17,12 +17,16 @@
 
 package org.apache.doris.nereids.trees.plans.physical;
 
+import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.DatabaseIf;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.TableIf;
+import org.apache.doris.catalog.constraint.PrimaryKeyConstraint;
+import org.apache.doris.catalog.constraint.UniqueConstraint;
 import org.apache.doris.datasource.CatalogIf;
 import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.memo.GroupExpression;
+import org.apache.doris.nereids.properties.DataTrait;
 import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.properties.PhysicalProperties;
 import org.apache.doris.nereids.trees.expressions.Slot;
@@ -31,14 +35,17 @@ import org.apache.doris.nereids.trees.plans.PlanType;
 import org.apache.doris.nereids.trees.plans.RelationId;
 import org.apache.doris.nereids.trees.plans.algebra.CatalogRelation;
 import org.apache.doris.nereids.util.Utils;
+import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.statistics.Statistics;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
 
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * relation generated from TableIf
@@ -85,13 +92,20 @@ public abstract class PhysicalCatalogRelation extends PhysicalRelation implement
     public DatabaseIf getDatabase() throws AnalysisException {
         Preconditions.checkArgument(!qualifier.isEmpty(), "qualifier can not be empty");
         try {
-            CatalogIf catalog = qualifier.size() == 3
-                    ? Env.getCurrentEnv().getCatalogMgr().getCatalogOrException(qualifier.get(0),
-                        s -> new Exception("Catalog [" + qualifier.get(0) + "] does not exist."))
-                    : Env.getCurrentEnv().getCurrentCatalog();
-            return catalog.getDbOrException(qualifier.size() == 3 ? qualifier.get(1) : qualifier.get(0),
-                    s -> new Exception("Database [" + qualifier.get(1) + "] does not exist in catalog ["
-                        + qualifier.get(0) + "]."));
+            int len = qualifier.size();
+            if (2 == len) {
+                CatalogIf<DatabaseIf> catalog = Env.getCurrentEnv().getCatalogMgr()
+                        .getCatalogOrAnalysisException(qualifier.get(0));
+                return catalog.getDbOrAnalysisException(qualifier.get(1));
+            } else if (1 == len) {
+                CatalogIf<DatabaseIf> catalog = Env.getCurrentEnv().getCurrentCatalog();
+                return catalog.getDbOrAnalysisException(qualifier.get(0));
+            } else if (0 == len) {
+                CatalogIf<DatabaseIf> catalog = Env.getCurrentEnv().getCurrentCatalog();
+                ConnectContext ctx = ConnectContext.get();
+                return catalog.getDb(ctx.getDatabase()).get();
+            }
+            return null;
         } catch (Exception e) {
             throw new AnalysisException(e.getMessage(), e);
         }
@@ -101,7 +115,7 @@ public abstract class PhysicalCatalogRelation extends PhysicalRelation implement
     public List<Slot> computeOutput() {
         return table.getBaseSchema()
                 .stream()
-                .map(col -> SlotReference.fromColumn(col, qualified()))
+                .map(col -> SlotReference.fromColumn(table, col, qualified()))
                 .collect(ImmutableList.toImmutableList());
     }
 
@@ -139,5 +153,48 @@ public abstract class PhysicalCatalogRelation extends PhysicalRelation implement
                     .stream().forEach(rf -> shapeBuilder.append(" RF").append(rf.getId().asInt()));
         }
         return shapeBuilder.toString();
+    }
+
+    @Override
+    public void computeUnique(DataTrait.Builder builder) {
+        Set<Slot> outputSet = Utils.fastToImmutableSet(getOutputSet());
+        for (PrimaryKeyConstraint c : table.getPrimaryKeyConstraints()) {
+            Set<Column> columns = c.getPrimaryKeys(table);
+            builder.addUniqueSlot((ImmutableSet) findSlotsByColumn(outputSet, columns));
+        }
+
+        for (UniqueConstraint c : table.getUniqueConstraints()) {
+            Set<Column> columns = c.getUniqueKeys(table);
+            builder.addUniqueSlot((ImmutableSet) findSlotsByColumn(outputSet, columns));
+        }
+    }
+
+    @Override
+    public void computeUniform(DataTrait.Builder builder) {
+        // No uniform slot for catalog relation
+    }
+
+    private ImmutableSet<SlotReference> findSlotsByColumn(Set<Slot> outputSet, Set<Column> columns) {
+        ImmutableSet.Builder<SlotReference> slotSet = ImmutableSet.builderWithExpectedSize(columns.size());
+        for (Slot slot : outputSet) {
+            if (!(slot instanceof SlotReference)) {
+                continue;
+            }
+            SlotReference slotRef = (SlotReference) slot;
+            if (slotRef.getColumn().isPresent() && columns.contains(slotRef.getColumn().get())) {
+                slotSet.add(slotRef);
+            }
+        }
+        return slotSet.build();
+    }
+
+    @Override
+    public void computeEqualSet(DataTrait.Builder builder) {
+        // don't generate any equal pair
+    }
+
+    @Override
+    public void computeFd(DataTrait.Builder builder) {
+        // don't generate any equal pair
     }
 }

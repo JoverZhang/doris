@@ -72,6 +72,10 @@ public class DistributionDescriptor {
      * analyze distribution descriptor
      */
     public void validate(Map<String, ColumnDefinition> columnMap, KeysType keysType) {
+        if (bucketNum <= 0) {
+            throw new AnalysisException(isHash ? "Number of hash distribution should be greater than zero."
+                    : "Number of random distribution should be greater than zero.");
+        }
         if (isHash) {
             Set<String> colSet = Sets.newHashSet(cols);
             if (colSet.size() != cols.size()) {
@@ -82,6 +86,13 @@ public class DistributionDescriptor {
                     throw new AnalysisException(String.format("Distribution column(%s) doesn't exist", c));
                 }
             });
+            for (String columnName : cols) {
+                ColumnDefinition columnDefinition = columnMap.get(columnName);
+                if (!columnDefinition.isKey()
+                        && (keysType == KeysType.UNIQUE_KEYS || keysType == KeysType.AGG_KEYS)) {
+                    throw new AnalysisException("Distribution column[" + columnName + "] is not key column");
+                }
+            }
         } else {
             if (keysType.equals(KeysType.UNIQUE_KEYS)) {
                 throw new AnalysisException("Create unique keys table should not contain random distribution desc");
@@ -99,5 +110,42 @@ public class DistributionDescriptor {
             return new HashDistributionDesc(bucketNum, isAutoBucket, cols);
         }
         return new RandomDistributionDesc(bucketNum, isAutoBucket);
+    }
+
+    public boolean inDistributionColumns(String columnName) {
+        return cols != null && cols.contains(columnName);
+    }
+
+    /**
+     * toSql
+     */
+    public String toSql() {
+        StringBuilder stringBuilder = new StringBuilder();
+        if (isHash) {
+            stringBuilder.append("DISTRIBUTED BY HASH(");
+            int i = 0;
+            for (String columnName : cols) {
+                if (i != 0) {
+                    stringBuilder.append(", ");
+                }
+                stringBuilder.append("`").append(columnName).append("`");
+                i++;
+            }
+            stringBuilder.append(")\n");
+            if (isAutoBucket) {
+                stringBuilder.append("BUCKETS AUTO");
+            } else {
+                stringBuilder.append("BUCKETS ").append(bucketNum);
+            }
+        } else {
+            stringBuilder.append("DISTRIBUTED BY RANDOM\n")
+                    .append("BUCKETS ");
+            if (isAutoBucket) {
+                stringBuilder.append("AUTO");
+            } else {
+                stringBuilder.append(bucketNum);
+            }
+        }
+        return stringBuilder.toString();
     }
 }

@@ -23,6 +23,7 @@ import org.apache.doris.nereids.types.ArrayType;
 import org.apache.doris.nereids.types.DataType;
 import org.apache.doris.nereids.types.NullType;
 import org.apache.doris.nereids.types.coercion.AnyDataType;
+import org.apache.doris.nereids.types.coercion.ComplexDataType;
 import org.apache.doris.nereids.types.coercion.FollowToAnyDataType;
 import org.apache.doris.qe.SessionVariable;
 
@@ -51,6 +52,9 @@ public interface ImplicitlyCastableSignature extends ComputeSignature {
         if (realType instanceof NullType) {
             return true;
         }
+        if (signatureType instanceof ComplexDataType && !(realType instanceof ComplexDataType)) {
+            return false;
+        }
         try {
             // TODO: copy isImplicitlyCastable method to DataType
             // TODO: resolve AnyDataType invoke toCatalogDataType
@@ -68,8 +72,10 @@ public interface ImplicitlyCastableSignature extends ComputeSignature {
         }
         try {
             List<DataType> allPromotions = realType.getAllPromotions();
-            if (allPromotions.stream().anyMatch(promotion -> isImplicitlyCastable(signatureType, promotion))) {
-                return true;
+            for (DataType promotion : allPromotions) {
+                if (isImplicitlyCastable(signatureType, promotion)) {
+                    return true;
+                }
             }
         } catch (Throwable t) {
             // the signatureType maybe DataType and can not cast to catalog data type.

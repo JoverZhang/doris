@@ -46,12 +46,17 @@ TypeDescriptor::TypeDescriptor(const std::vector<TTypeNode>& types, int* idx)
             DCHECK(scalar_type.__isset.len);
             len = scalar_type.len;
         } else if (type == TYPE_DECIMALV2 || type == TYPE_DECIMAL32 || type == TYPE_DECIMAL64 ||
-                   type == TYPE_DECIMAL128I || type == TYPE_DECIMAL256 || type == TYPE_DATETIMEV2 ||
-                   type == TYPE_TIMEV2) {
+                   type == TYPE_DECIMAL128I || type == TYPE_DECIMAL256 || type == TYPE_DATETIMEV2) {
             DCHECK(scalar_type.__isset.precision);
             DCHECK(scalar_type.__isset.scale);
             precision = scalar_type.precision;
             scale = scalar_type.scale;
+        } else if (type == TYPE_TIMEV2) {
+            if (scalar_type.__isset.scale) {
+                scale = scalar_type.scale;
+            } else {
+                scale = 0;
+            }
         } else if (type == TYPE_STRING) {
             if (scalar_type.__isset.len) {
                 len = scalar_type.len;
@@ -66,7 +71,7 @@ TypeDescriptor::TypeDescriptor(const std::vector<TTypeNode>& types, int* idx)
         DCHECK_LT(*idx, types.size() - 1);
         type = TYPE_ARRAY;
         contains_nulls.reserve(1);
-        // here should compatible with fe 1.2, because use contains_null in contains_nulls
+        // here should compatible with fe 1.2, because use contain_null in contains_nulls
         if (node.__isset.contains_nulls) {
             DCHECK_EQ(node.contains_nulls.size(), 1);
             contains_nulls.push_back(node.contains_nulls[0]);
@@ -94,7 +99,7 @@ TypeDescriptor::TypeDescriptor(const std::vector<TTypeNode>& types, int* idx)
         break;
     }
     case TTypeNodeType::MAP: {
-        //TODO(xy): handle contains_null[0] for key and [1] for value
+        //TODO(xy): handle contain_null[0] for key and [1] for value
         DCHECK(!node.__isset.scalar_type);
         DCHECK_LT(*idx, types.size() - 2);
         DCHECK_EQ(node.contains_nulls.size(), 2);

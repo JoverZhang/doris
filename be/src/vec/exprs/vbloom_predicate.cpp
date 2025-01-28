@@ -17,19 +17,15 @@
 
 #include "vec/exprs/vbloom_predicate.h"
 
-#include <stddef.h>
-
+#include <cstddef>
 #include <utility>
-#include <vector>
 
 #include "common/status.h"
 #include "exprs/bloom_filter_func.h"
-#include "gutil/integral_types.h"
 #include "runtime/runtime_state.h"
 #include "vec/columns/column.h"
 #include "vec/columns/column_nullable.h"
 #include "vec/columns/column_vector.h"
-#include "vec/common/string_ref.h"
 #include "vec/core/block.h"
 #include "vec/core/column_numbers.h"
 #include "vec/core/column_with_type_and_name.h"
@@ -41,12 +37,12 @@ namespace doris {
 class RowDescriptor;
 class TExprNode;
 
-namespace vectorized {
-class VExprContext;
-} // namespace vectorized
 } // namespace doris
 
 namespace doris::vectorized {
+#include "common/compile_check_begin.h"
+
+class VExprContext;
 
 VBloomPredicate::VBloomPredicate(const TExprNode& node)
         : VExpr(node), _filter(nullptr), _expr_name("bloom_predicate") {}
@@ -60,12 +56,15 @@ Status VBloomPredicate::prepare(RuntimeState* state, const RowDescriptor& desc,
     }
 
     _be_exec_version = state->be_exec_version();
+    _prepare_finished = true;
     return Status::OK();
 }
 
 Status VBloomPredicate::open(RuntimeState* state, VExprContext* context,
                              FunctionContext::FunctionStateScope scope) {
+    DCHECK(_prepare_finished);
     RETURN_IF_ERROR(VExpr::open(state, context, scope));
+    _open_finished = true;
     return Status::OK();
 }
 
@@ -74,6 +73,7 @@ void VBloomPredicate::close(VExprContext* context, FunctionContext::FunctionStat
 }
 
 Status VBloomPredicate::execute(VExprContext* context, Block* block, int* result_column_id) {
+    DCHECK(_open_finished || _getting_const_col);
     doris::vectorized::ColumnNumbers arguments(_children.size());
     for (int i = 0; i < _children.size(); ++i) {
         int column_id = -1;
@@ -81,7 +81,7 @@ Status VBloomPredicate::execute(VExprContext* context, Block* block, int* result
         arguments[i] = column_id;
     }
     // call function
-    size_t num_columns_without_result = block->columns();
+    auto num_columns_without_result = block->columns();
     auto res_data_column = ColumnVector<UInt8>::create(block->rows());
 
     ColumnPtr argument_column =
@@ -108,4 +108,6 @@ const std::string& VBloomPredicate::expr_name() const {
 void VBloomPredicate::set_filter(std::shared_ptr<BloomFilterFuncBase>& filter) {
     _filter = filter;
 }
+
+#include "common/compile_check_end.h"
 } // namespace doris::vectorized

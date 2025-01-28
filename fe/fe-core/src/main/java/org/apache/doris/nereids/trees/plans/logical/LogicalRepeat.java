@@ -18,7 +18,7 @@
 package org.apache.doris.nereids.trees.plans.logical;
 
 import org.apache.doris.nereids.memo.GroupExpression;
-import org.apache.doris.nereids.properties.FunctionalDependencies;
+import org.apache.doris.nereids.properties.DataTrait;
 import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.NamedExpression;
@@ -37,7 +37,6 @@ import com.google.common.collect.ImmutableList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.function.Supplier;
 
 /**
  * LogicalRepeat.
@@ -156,6 +155,10 @@ public class LogicalRepeat<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_T
                 children.get(0));
     }
 
+    public LogicalRepeat<CHILD_TYPE> withGroupSets(List<List<Expression>> groupingSets) {
+        return new LogicalRepeat<>(groupingSets, outputExpressions, child());
+    }
+
     public LogicalRepeat<CHILD_TYPE> withGroupSetsAndOutput(List<List<Expression>> groupingSets,
             List<NamedExpression> outputExpressionList) {
         return new LogicalRepeat<>(groupingSets, outputExpressionList, child());
@@ -181,12 +184,23 @@ public class LogicalRepeat<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_T
     }
 
     @Override
-    public FunctionalDependencies computeFuncDeps(Supplier<List<Slot>> outputSupplier) {
-        FunctionalDependencies.Builder builder = new FunctionalDependencies.Builder();
-        // Note uniform does not reject nullable slots
-        outputSupplier.get().stream()
-                .filter(child(0).getLogicalProperties().getFunctionalDependencies()::isUniform)
-                .forEach(builder::addUniformSlot);
-        return builder.build();
+    public void computeUnique(DataTrait.Builder builder) {
+        // don't generate unique slot
+    }
+
+    @Override
+    public void computeUniform(DataTrait.Builder builder) {
+        // don't generate uniform slot
+        // TODO: this need be supported later
+    }
+
+    @Override
+    public void computeEqualSet(DataTrait.Builder builder) {
+        builder.addEqualSet(child().getLogicalProperties().getTrait());
+    }
+
+    @Override
+    public void computeFd(DataTrait.Builder builder) {
+        // don't generate fd
     }
 }

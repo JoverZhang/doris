@@ -14,20 +14,10 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-// This file is copied from
-// https://github.com/ClickHouse/ClickHouse/blob/master/src/DataTypes/DataTypeString.h
-// and modified by Doris
 
 #pragma once
 
-#include <gen_cpp/Types_types.h>
 #include <gen_cpp/data.pb.h>
-#include <glog/logging.h>
-#include <stddef.h>
-#include <stdint.h>
-
-#include <memory>
-#include <string>
 
 #include "common/exception.h"
 #include "common/status.h"
@@ -39,45 +29,43 @@
 #include "vec/data_types/data_type.h"
 #include "vec/data_types/data_type_fixed_length_object.h"
 #include "vec/data_types/data_type_string.h"
-#include "vec/data_types/serde/data_type_fixedlengthobject_serde.h"
-
-namespace doris {
-namespace vectorized {
-class BufferWritable;
-class IColumn;
-class ReadBuffer;
-} // namespace vectorized
-} // namespace doris
+#include "vec/data_types/serde/data_type_string_serde.h"
 
 namespace doris::vectorized {
 
 class DataTypeAggState : public DataTypeString {
 public:
-    DataTypeAggState(DataTypes sub_types, bool result_is_nullable, std::string function_name)
+    DataTypeAggState(DataTypes sub_types, bool result_is_nullable, std::string function_name,
+                     int be_exec_version)
             : _result_is_nullable(result_is_nullable),
-              _sub_types(sub_types),
-              _function_name(function_name) {
-        _agg_function = AggregateFunctionSimpleFactory::instance().get(_function_name, _sub_types,
-                                                                       _result_is_nullable);
-        if (_agg_function == nullptr) {
+              _sub_types(std::move(sub_types)),
+              _function_name(std::move(function_name)),
+              _be_exec_version(be_exec_version) {
+        _agg_function = AggregateFunctionSimpleFactory::instance().get(
+                _function_name, _sub_types, _result_is_nullable, _be_exec_version);
+        if (_agg_function == nullptr ||
+            !BeExecVersionManager::check_be_exec_version(be_exec_version)) {
             throw Exception(ErrorCode::INVALID_ARGUMENT,
                             "DataTypeAggState function get failed, type={}", do_get_name());
         }
+        _agg_function->set_version(be_exec_version);
         _agg_serialized_type = _agg_function->get_serialized_type();
     }
 
     const char* get_family_name() const override { return "AggState"; }
 
     std::string do_get_name() const override {
-        return fmt::format("AggState(function_name={},result_is_nullable={},arguments=[{}])",
-                           _function_name, _result_is_nullable, get_types_string());
+        return fmt::format(
+                "AggState(function_name={},result_is_nullable={},arguments=[{}],be_exec_version={}"
+                ")",
+                _function_name, _result_is_nullable, get_types_string(), _be_exec_version);
     }
+
+    std::string get_function_name() const { return _function_name; }
 
     TypeIndex get_type_id() const override { return TypeIndex::AggState; }
 
-    TypeDescriptor get_type_as_type_descriptor() const override {
-        return TypeDescriptor(TYPE_AGG_STATE);
-    }
+    TypeDescriptor get_type_as_type_descriptor() const override { return {TYPE_AGG_STATE}; }
 
     doris::FieldType get_storage_field_type() const override {
         return doris::FieldType::OLAP_FIELD_TYPE_AGG_STATE;
@@ -105,6 +93,7 @@ public:
         }
         col_meta->set_function_name(_function_name);
         col_meta->set_result_is_nullable(_result_is_nullable);
+        col_meta->set_be_exec_version(_be_exec_version);
     }
 
     AggregateFunctionPtr get_nested_function() const { return _agg_function; }
@@ -118,7 +107,8 @@ public:
         return _agg_serialized_type->serialize(column, buf, be_exec_version);
     }
 
-    const char* deserialize(const char* buf, IColumn* column, int be_exec_version) const override {
+    const char* deserialize(const char* buf, MutableColumnPtr* column,
+                            int be_exec_version) const override {
         return _agg_serialized_type->deserialize(buf, column, be_exec_version);
     }
 
@@ -132,6 +122,11 @@ public:
     };
 
     DataTypePtr get_serialized_type() const { return _agg_serialized_type; }
+
+    void check_function_compatibility(int read_be_exec_version) const {
+        BeExecVersionManager::check_function_compatibility(read_be_exec_version, _be_exec_version,
+                                                           get_nested_function()->get_name());
+    }
 
 private:
     std::string get_types_string() const {
@@ -151,6 +146,7 @@ private:
     AggregateFunctionPtr _agg_function;
     DataTypes _sub_types;
     std::string _function_name;
+    int _be_exec_version;
 };
 
 } // namespace doris::vectorized

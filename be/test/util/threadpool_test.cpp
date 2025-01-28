@@ -42,6 +42,7 @@
 
 #include "common/logging.h"
 #include "common/status.h"
+#include "gtest/gtest.h"
 #include "gtest/gtest_pred_impl.h"
 #include "gutil/strings/substitute.h"
 #include "util/barrier.h"
@@ -332,6 +333,8 @@ TEST_F(ThreadPoolTest, TestDeadlocks) {
     const char* death_msg = "doris::ThreadPool::check_not_pool_thread_unlocked()";
 #elif defined(__APPLE__)
     const char* death_msg = "pthread_start";
+#elif defined(__clang__) && defined(USE_LIBCPP)
+    const char* death_msg = "doris::ThreadPool::check_not_pool_thread_unlocked()";
 #else
     const char* death_msg =
             "_ZNSt5_BindIFMN5doris10ThreadPoolEFvvEPS1_EE6__callIvJEJLm0EEEET_OSt5tupleIJDpT0_"

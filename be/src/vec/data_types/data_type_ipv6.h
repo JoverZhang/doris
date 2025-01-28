@@ -45,6 +45,9 @@ namespace doris::vectorized {
 class DataTypeIPv6 final : public DataTypeNumberBase<IPv6> {
 public:
     TypeIndex get_type_id() const override { return TypeIndex::IPv6; }
+    TypeDescriptor get_type_as_type_descriptor() const override {
+        return TypeDescriptor(TYPE_IPV6);
+    }
     doris::FieldType get_storage_field_type() const override {
         return doris::FieldType::OLAP_FIELD_TYPE_IPV6;
     }
@@ -52,8 +55,15 @@ public:
     std::string do_get_name() const override { return "IPv6"; }
 
     bool equals(const IDataType& rhs) const override;
+    void to_string_batch(const IColumn& column, ColumnString& column_to) const final {
+        DataTypeNumberBase<IPv6>::template to_string_batch_impl<DataTypeIPv6>(column, column_to);
+    }
+
+    size_t number_length() const;
+    void push_number(ColumnString::Chars& chars, const IPv6& num) const;
     std::string to_string(const IColumn& column, size_t row_num) const override;
     void to_string(const IColumn& column, size_t row_num, BufferWritable& ostr) const override;
+    static std::string to_string(const IPv6& value);
     Status from_string(ReadBuffer& rb, IColumn* column) const override;
 
     Field get_field(const TExprNode& node) const override {

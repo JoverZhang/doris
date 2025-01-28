@@ -69,6 +69,11 @@ public class SyncJobManager implements Writable {
     }
 
     public void addDataSyncJob(CreateDataSyncJobStmt stmt) throws DdlException {
+        if (!Config.enable_feature_data_sync_job) {
+            throw new DdlException("Data sync job is deprecated and disabled by default. You can enable it by setting "
+                    + "'enable_feature_data_sync_job=true' in fe.conf. "
+                    + "But it's not recommended to use it in production.");
+        }
         long jobId = Env.getCurrentEnv().getNextId();
         SyncJob syncJob = SyncJob.fromStmt(jobId, stmt);
         writeLock();
@@ -288,7 +293,9 @@ public class SyncJobManager implements Writable {
     // Remove old sync jobs. Called periodically.
     // Stopped jobs will be removed after Config.label_keep_max_second.
     public void cleanOldSyncJobs() {
-        LOG.debug("begin to clean old sync jobs ");
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("begin to clean old sync jobs ");
+        }
         cleanFinishedSyncJobsIf(job -> job.isExpired(System.currentTimeMillis()));
     }
 
@@ -301,7 +308,9 @@ public class SyncJobManager implements Writable {
         }
         writeLock();
         try {
-            LOG.debug("begin to clean finished sync jobs ");
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("begin to clean finished sync jobs ");
+            }
             Deque<SyncJob> finishedJobs = idToSyncJob
                     .values()
                     .stream()

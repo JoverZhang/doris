@@ -18,6 +18,7 @@
 package org.apache.doris.nereids.trees.plans.algebra;
 
 import org.apache.doris.nereids.hint.DistributeHint;
+import org.apache.doris.nereids.trees.expressions.EqualPredicate;
 import org.apache.doris.nereids.trees.expressions.EqualTo;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.MarkJoinSlotReference;
@@ -28,11 +29,24 @@ import org.apache.doris.nereids.trees.plans.JoinType;
 import java.util.List;
 import java.util.Optional;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * Common interface for logical/physical join.
  */
 public interface Join {
+    /**
+     * join shuffle type
+     */
+    enum ShuffleType {
+        shuffle,
+        broadcast,
+        bucketShuffle,
+        shuffleBucket,
+        colocated,
+        unknown
+    }
+
     JoinType getJoinType();
 
     List<Expression> getHashJoinConjuncts();
@@ -42,7 +56,15 @@ public interface Join {
                 .collect(Collectors.toList());
     }
 
+    default List<EqualPredicate> getEqualPredicates() {
+        return Stream.concat(getHashJoinConjuncts().stream(), getMarkJoinConjuncts().stream())
+                .filter(EqualPredicate.class::isInstance).map(EqualPredicate.class::cast)
+                .collect(Collectors.toList());
+    }
+
     List<Expression> getOtherJoinConjuncts();
+
+    List<Expression> getMarkJoinConjuncts();
 
     Optional<Expression> getOnClauseCondition();
 
@@ -50,15 +72,10 @@ public interface Join {
 
     boolean isMarkJoin();
 
+    Optional<MarkJoinSlotReference> getMarkJoinSlotReference();
+
     default boolean hasDistributeHint() {
         return getDistributeHint().distributeType != DistributeType.NONE;
-    }
-
-    /**
-     * The join plan has join condition or not.
-     */
-    default boolean hasJoinCondition() {
-        return !getHashJoinConjuncts().isEmpty() || !getOtherJoinConjuncts().isEmpty();
     }
 
     default JoinDistributeType getLeftHint() {
@@ -77,9 +94,5 @@ public interface Join {
             default:
                 return JoinDistributeType.NONE;
         }
-    }
-
-    default Optional<MarkJoinSlotReference> getLeftMarkJoinSlotReference() {
-        return Optional.empty();
     }
 }

@@ -17,9 +17,9 @@
 
 package org.apache.doris.nereids.trees.plans.commands;
 
-import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.TableIf;
 import org.apache.doris.common.Pair;
+import org.apache.doris.common.util.MetaLockUtils;
 import org.apache.doris.nereids.NereidsPlanner;
 import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.properties.PhysicalProperties;
@@ -30,15 +30,17 @@ import org.apache.doris.nereids.trees.plans.commands.ExplainCommand.ExplainLevel
 import org.apache.doris.nereids.trees.plans.logical.LogicalCatalogRelation;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
-import org.apache.doris.persist.AlterConstraintLog;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.StmtExecutor;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Lists;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.util.Comparator;
+import java.util.List;
 import java.util.Set;
 
 /**
@@ -63,24 +65,32 @@ public class AddConstraintCommand extends Command implements ForwardWithSync {
     @Override
     public void run(ConnectContext ctx, StmtExecutor executor) throws Exception {
         Pair<ImmutableList<String>, TableIf> columnsAndTable = extractColumnsAndTable(ctx, constraint.toProject());
-        org.apache.doris.catalog.constraint.Constraint catalogConstraint = null;
+        List<TableIf> tables = Lists.newArrayList(columnsAndTable.second);
+        Pair<ImmutableList<String>, TableIf> referencedColumnsAndTable = null;
         if (constraint.isForeignKey()) {
-            Pair<ImmutableList<String>, TableIf> referencedColumnsAndTable
-                    = extractColumnsAndTable(ctx, constraint.toReferenceProject());
-            catalogConstraint = columnsAndTable.second.addForeignConstraint(name, columnsAndTable.first,
-                    referencedColumnsAndTable.second, referencedColumnsAndTable.first);
-        } else if (constraint.isPrimaryKey()) {
-            catalogConstraint = columnsAndTable.second.addPrimaryKeyConstraint(name, columnsAndTable.first);
-        } else if (constraint.isUnique()) {
-            catalogConstraint = columnsAndTable.second.addUniqueConstraint(name, columnsAndTable.first);
+            referencedColumnsAndTable = extractColumnsAndTable(ctx, constraint.toReferenceProject());
+            tables.add(referencedColumnsAndTable.second);
         }
-        Env.getCurrentEnv().getEditLog().logAddConstraint(
-                new AlterConstraintLog(catalogConstraint, columnsAndTable.second));
+        tables.sort((Comparator.comparing(TableIf::getId)));
+        MetaLockUtils.writeLockTables(tables);
+        try {
+            if (constraint.isForeignKey()) {
+                Preconditions.checkState(referencedColumnsAndTable != null);
+                columnsAndTable.second.addForeignConstraint(name, columnsAndTable.first,
+                        referencedColumnsAndTable.second, referencedColumnsAndTable.first, false);
+            } else if (constraint.isPrimaryKey()) {
+                columnsAndTable.second.addPrimaryKeyConstraint(name, columnsAndTable.first, false);
+            } else if (constraint.isUnique()) {
+                columnsAndTable.second.addUniqueConstraint(name, columnsAndTable.first, false);
+            }
+        } finally {
+            MetaLockUtils.writeUnlockTables(tables);
+        }
     }
 
     private Pair<ImmutableList<String>, TableIf> extractColumnsAndTable(ConnectContext ctx, LogicalPlan plan) {
         NereidsPlanner planner = new NereidsPlanner(ctx.getStatementContext());
-        Plan analyzedPlan = planner.plan(plan, PhysicalProperties.ANY, ExplainLevel.ANALYZED_PLAN);
+        Plan analyzedPlan = planner.planWithLock(plan, PhysicalProperties.ANY, ExplainLevel.ANALYZED_PLAN);
         Set<LogicalCatalogRelation> logicalCatalogRelationSet = analyzedPlan
                 .collect(LogicalCatalogRelation.class::isInstance);
         if (logicalCatalogRelationSet.size() != 1) {

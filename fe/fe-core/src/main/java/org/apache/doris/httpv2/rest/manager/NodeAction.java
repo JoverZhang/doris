@@ -144,8 +144,12 @@ public class NodeAction extends RestBaseController {
     private Object fetchNodeInfo(HttpServletRequest request, HttpServletResponse response, String procPath)
             throws Exception {
         try {
-            if (!Env.getCurrentEnv().isMaster()) {
-                return redirectToMasterOrException(request, response);
+            if (needRedirect(request.getScheme())) {
+                return redirectToHttps(request);
+            }
+
+            if (checkForwardToMaster(request)) {
+                return forwardToMaster(request, null);
             }
 
             ProcResult procResult = ProcService.getInstance().open(procPath).fetchResult();
@@ -604,8 +608,12 @@ public class NodeAction extends RestBaseController {
     public Object operateBackend(HttpServletRequest request, HttpServletResponse response, @PathVariable String action,
             @RequestBody BackendReqInfo reqInfo) {
         try {
-            if (!Env.getCurrentEnv().isMaster()) {
-                return redirectToMasterOrException(request, response);
+            if (needRedirect(request.getScheme())) {
+                return redirectToHttps(request);
+            }
+
+            if (checkForwardToMaster(request)) {
+                return forwardToMaster(request, reqInfo);
             }
 
             List<String> hostPorts = reqInfo.getHostPorts();
@@ -627,7 +635,7 @@ public class NodeAction extends RestBaseController {
             } else if ("DROP".equals(action)) {
                 currentSystemInfo.dropBackends(hostInfos);
             } else if ("DECOMMISSION".equals(action)) {
-                ImmutableMap<Long, Backend> backendsInCluster = currentSystemInfo.getAllBackendsMap();
+                ImmutableMap<Long, Backend> backendsInCluster = currentSystemInfo.getAllBackendsByAllCluster();
                 backendsInCluster.forEach((k, v) -> {
                     hostInfos.stream()
                             .filter(h -> v.getHost().equals(h.getHost()) && v.getHeartbeatPort() == h.getPort())
@@ -647,8 +655,12 @@ public class NodeAction extends RestBaseController {
     public Object operateFrontends(HttpServletRequest request, HttpServletResponse response,
             @PathVariable String action, @RequestBody FrontendReqInfo reqInfo) {
         try {
-            if (!Env.getCurrentEnv().isMaster()) {
-                return redirectToMasterOrException(request, response);
+            if (needRedirect(request.getScheme())) {
+                return redirectToHttps(request);
+            }
+
+            if (checkForwardToMaster(request)) {
+                return forwardToMaster(request, reqInfo);
             }
 
             String role = reqInfo.getRole();

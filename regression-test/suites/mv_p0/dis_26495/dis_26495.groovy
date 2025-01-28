@@ -22,11 +22,15 @@ suite ("dis_26495") {
     sql """ DROP TABLE IF EXISTS doris_test; """
 
     sql """
-        create table doris_test (a int,b int, agg_st_1 agg_state max_by(int ,int))
+        create table doris_test (a int,b int, agg_st_1 agg_state<max_by(int ,int)> generic)
             DISTRIBUTED BY HASH(a) BUCKETS 1 properties("replication_num" = "1");
         """
 
     sql """insert into doris_test values (1,2,max_by_state(1,2));"""
+
+    sql """alter table doris_test modify column agg_st_1 set stats ('row_count'='1');"""
+
+    sql """set enable_stats=false;"""
 
     streamLoad {
         table "doris_test"

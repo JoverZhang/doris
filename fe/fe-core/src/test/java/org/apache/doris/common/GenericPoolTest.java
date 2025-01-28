@@ -23,21 +23,21 @@ import org.apache.doris.thrift.TAgentResult;
 import org.apache.doris.thrift.TAgentTaskRequest;
 import org.apache.doris.thrift.TCancelPlanFragmentParams;
 import org.apache.doris.thrift.TCancelPlanFragmentResult;
-import org.apache.doris.thrift.TCheckPreCacheRequest;
-import org.apache.doris.thrift.TCheckPreCacheResponse;
 import org.apache.doris.thrift.TCheckStorageFormatResult;
+import org.apache.doris.thrift.TCheckWarmUpCacheAsyncRequest;
+import org.apache.doris.thrift.TCheckWarmUpCacheAsyncResponse;
 import org.apache.doris.thrift.TDiskTrashInfo;
 import org.apache.doris.thrift.TExecPlanFragmentParams;
 import org.apache.doris.thrift.TExecPlanFragmentResult;
 import org.apache.doris.thrift.TExportStatusResult;
 import org.apache.doris.thrift.TExportTaskRequest;
+import org.apache.doris.thrift.TGetRealtimeExecStatusRequest;
+import org.apache.doris.thrift.TGetRealtimeExecStatusResponse;
 import org.apache.doris.thrift.TGetTopNHotPartitionsRequest;
 import org.apache.doris.thrift.TGetTopNHotPartitionsResponse;
 import org.apache.doris.thrift.TIngestBinlogRequest;
 import org.apache.doris.thrift.TIngestBinlogResult;
 import org.apache.doris.thrift.TNetworkAddress;
-import org.apache.doris.thrift.TPreCacheAsyncRequest;
-import org.apache.doris.thrift.TPreCacheAsyncResponse;
 import org.apache.doris.thrift.TPublishTopicRequest;
 import org.apache.doris.thrift.TPublishTopicResult;
 import org.apache.doris.thrift.TQueryIngestBinlogRequest;
@@ -55,9 +55,9 @@ import org.apache.doris.thrift.TStreamLoadRecordResult;
 import org.apache.doris.thrift.TSyncLoadForTabletsRequest;
 import org.apache.doris.thrift.TSyncLoadForTabletsResponse;
 import org.apache.doris.thrift.TTabletStatResult;
-import org.apache.doris.thrift.TTransmitDataParams;
-import org.apache.doris.thrift.TTransmitDataResult;
 import org.apache.doris.thrift.TUniqueId;
+import org.apache.doris.thrift.TWarmUpCacheAsyncRequest;
+import org.apache.doris.thrift.TWarmUpCacheAsyncResponse;
 import org.apache.doris.thrift.TWarmUpTabletsRequest;
 import org.apache.doris.thrift.TWarmUpTabletsResponse;
 import org.apache.doris.utframe.UtFrameUtils;
@@ -131,11 +131,6 @@ public class GenericPoolTest {
         @Override
         public TCancelPlanFragmentResult cancelPlanFragment(TCancelPlanFragmentParams params) {
             return new TCancelPlanFragmentResult();
-        }
-
-        @Override
-        public TTransmitDataResult transmitData(TTransmitDataParams params) {
-            return new TTransmitDataResult();
         }
 
         @Override
@@ -228,11 +223,6 @@ public class GenericPoolTest {
         }
 
         @Override
-        public void cleanTrash() throws TException {
-            // TODO Auto-generated method stub
-        }
-
-        @Override
         public TCheckStorageFormatResult checkStorageFormat() throws TException {
             return new TCheckStorageFormatResult();
         }
@@ -249,12 +239,12 @@ public class GenericPoolTest {
         }
 
         @Override
-        public TPreCacheAsyncResponse preCacheAsync(TPreCacheAsyncRequest request) throws TException {
+        public TWarmUpCacheAsyncResponse warmUpCacheAsync(TWarmUpCacheAsyncRequest request) throws TException {
             return null;
         }
 
         @Override
-        public TCheckPreCacheResponse checkPreCache(TCheckPreCacheRequest request) throws TException {
+        public TCheckWarmUpCacheAsyncResponse checkWarmUpCacheAsync(TCheckWarmUpCacheAsyncRequest request) throws TException {
             return null;
         }
 
@@ -271,6 +261,12 @@ public class GenericPoolTest {
 
         @Override
         public TWarmUpTabletsResponse warmUpTablets(TWarmUpTabletsRequest request) throws TException {
+            return null;
+        }
+
+        @Override
+        public TGetRealtimeExecStatusResponse getRealtimeExecStatus(TGetRealtimeExecStatusRequest request)
+                throws TException {
             return null;
         }
     }

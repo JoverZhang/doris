@@ -25,14 +25,17 @@ import org.apache.doris.nereids.trees.expressions.AssertNumRowsElement;
 import org.apache.doris.nereids.trees.expressions.AssertNumRowsElement.Assertion;
 import org.apache.doris.nereids.trees.expressions.EqualTo;
 import org.apache.doris.nereids.trees.expressions.Expression;
+import org.apache.doris.nereids.trees.expressions.MarkJoinSlotReference;
 import org.apache.doris.nereids.trees.expressions.NamedExpression;
 import org.apache.doris.nereids.trees.plans.DistributeType;
 import org.apache.doris.nereids.trees.plans.JoinType;
 import org.apache.doris.nereids.trees.plans.LimitPhase;
 import org.apache.doris.nereids.trees.plans.Plan;
+import org.apache.doris.nereids.trees.plans.algebra.SetOperation.Qualifier;
 import org.apache.doris.nereids.trees.plans.logical.LogicalAggregate;
 import org.apache.doris.nereids.trees.plans.logical.LogicalAssertNumRows;
 import org.apache.doris.nereids.trees.plans.logical.LogicalFilter;
+import org.apache.doris.nereids.trees.plans.logical.LogicalIntersect;
 import org.apache.doris.nereids.trees.plans.logical.LogicalJoin;
 import org.apache.doris.nereids.trees.plans.logical.LogicalLimit;
 import org.apache.doris.nereids.trees.plans.logical.LogicalOlapScan;
@@ -49,6 +52,7 @@ import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -83,6 +87,12 @@ public class LogicalPlanBuilder {
         return from(project);
     }
 
+    public LogicalPlanBuilder projectAll() {
+        LogicalProject<LogicalPlan> project = new LogicalProject<>(ImmutableList.copyOf(this.plan.getOutput()),
+                this.plan);
+        return from(project);
+    }
+
     public LogicalPlanBuilder projectExprs(List<NamedExpression> projectExprs) {
         LogicalProject<LogicalPlan> project = new LogicalProject<>(projectExprs, this.plan);
         return from(project);
@@ -99,12 +109,34 @@ public class LogicalPlanBuilder {
         return from(project);
     }
 
+    public LogicalPlanBuilder markJoin(LogicalPlan right, JoinType joinType, Pair<Integer, Integer> hashOnSlots) {
+        ImmutableList<EqualTo> hashConjuncts = ImmutableList.of(
+                new EqualTo(this.plan.getOutput().get(hashOnSlots.first), right.getOutput().get(hashOnSlots.second)));
+
+        LogicalJoin<LogicalPlan, LogicalPlan> join = new LogicalJoin<>(joinType, new ArrayList<>(hashConjuncts),
+                Collections.emptyList(), Collections.emptyList(),
+                new DistributeHint(DistributeType.NONE), Optional.of(new MarkJoinSlotReference("fake")),
+                this.plan, right, null);
+        return from(join);
+    }
+
+    public LogicalPlanBuilder markJoinWithMarkConjuncts(LogicalPlan right, JoinType joinType, Pair<Integer, Integer> hashOnSlots) {
+        ImmutableList<EqualTo> markConjuncts = ImmutableList.of(
+                new EqualTo(this.plan.getOutput().get(hashOnSlots.first), right.getOutput().get(hashOnSlots.second)));
+
+        LogicalJoin<LogicalPlan, LogicalPlan> join = new LogicalJoin<>(joinType, Collections.emptyList(),
+                Collections.emptyList(), new ArrayList<>(markConjuncts),
+                new DistributeHint(DistributeType.NONE), Optional.of(new MarkJoinSlotReference("fake")),
+                this.plan, right, null);
+        return from(join);
+    }
+
     public LogicalPlanBuilder join(LogicalPlan right, JoinType joinType, Pair<Integer, Integer> hashOnSlots) {
         ImmutableList<EqualTo> hashConjuncts = ImmutableList.of(
                 new EqualTo(this.plan.getOutput().get(hashOnSlots.first), right.getOutput().get(hashOnSlots.second)));
 
         LogicalJoin<LogicalPlan, LogicalPlan> join = new LogicalJoin<>(joinType, new ArrayList<>(hashConjuncts),
-                this.plan, right);
+                this.plan, right, null);
         return from(join);
     }
 
@@ -115,19 +147,19 @@ public class LogicalPlanBuilder {
                 .collect(Collectors.toList());
 
         LogicalJoin<LogicalPlan, LogicalPlan> join = new LogicalJoin<>(joinType, new ArrayList<>(hashConjuncts),
-                this.plan, right);
+                this.plan, right, null);
         return from(join);
     }
 
     public LogicalPlanBuilder join(LogicalPlan right, JoinType joinType, List<Expression> hashJoinConjuncts,
             List<Expression> otherJoinConjucts) {
         LogicalJoin<LogicalPlan, LogicalPlan> join = new LogicalJoin<>(joinType, hashJoinConjuncts, otherJoinConjucts,
-                new DistributeHint(DistributeType.NONE), Optional.empty(), this.plan, right);
+                new DistributeHint(DistributeType.NONE), Optional.empty(), this.plan, right, null);
         return from(join);
     }
 
     public LogicalPlanBuilder joinEmptyOn(LogicalPlan right, JoinType joinType) {
-        LogicalJoin<LogicalPlan, LogicalPlan> join = new LogicalJoin<>(joinType, this.plan, right);
+        LogicalJoin<LogicalPlan, LogicalPlan> join = new LogicalJoin<>(joinType, this.plan, right, null);
         return from(join);
     }
 
@@ -185,8 +217,8 @@ public class LogicalPlanBuilder {
     }
 
     public LogicalPlanBuilder aggGroupUsingIndexAndSourceRepeat(List<Integer> groupByKeysIndex,
-                                                                List<NamedExpression> outputExprsList,
-                                                                Optional<LogicalRepeat<?>> sourceRepeat) {
+            List<NamedExpression> outputExprsList,
+            Optional<LogicalRepeat<?>> sourceRepeat) {
         Builder<Expression> groupByBuilder = ImmutableList.builder();
         for (Integer index : groupByKeysIndex) {
             groupByBuilder.add(this.plan.getOutput().get(index));
@@ -217,5 +249,9 @@ public class LogicalPlanBuilder {
         LogicalAssertNumRows<LogicalPlan> assertNumRows = new LogicalAssertNumRows<>(
                 new AssertNumRowsElement(numRows, "", assertion), this.plan);
         return from(assertNumRows);
+    }
+
+    public LogicalPlanBuilder intersect(List<Plan> children) {
+        return from(new LogicalIntersect(Qualifier.DISTINCT, children));
     }
 }

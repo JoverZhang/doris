@@ -20,14 +20,10 @@
 #include <stdint.h>
 
 #include "operator.h"
-#include "pipeline/pipeline_x/operator.h"
-#include "vec/sink/vresult_sink.h"
 #include "vec/sink/writer/vjdbc_table_writer.h"
 
-namespace doris {
-class DataSink;
-
-namespace pipeline {
+namespace doris::pipeline {
+#include "common/compile_check_begin.h"
 
 class JdbcTableSinkOperatorX;
 class JdbcTableSinkLocalState final
@@ -49,15 +45,14 @@ public:
     JdbcTableSinkOperatorX(const RowDescriptor& row_desc, int operator_id,
                            const std::vector<TExpr>& select_exprs);
     Status init(const TDataSink& thrift_sink) override;
-    Status prepare(RuntimeState* state) override;
     Status open(RuntimeState* state) override;
 
-    Status sink(RuntimeState* state, vectorized::Block* in_block,
-                SourceState source_state) override;
+    Status sink(RuntimeState* state, vectorized::Block* in_block, bool eos) override;
 
 private:
     friend class JdbcTableSinkLocalState;
     template <typename Writer, typename Parent>
+        requires(std::is_base_of_v<vectorized::AsyncResultWriter, Writer>)
     friend class AsyncWriterSink;
 
     const RowDescriptor& _row_desc;
@@ -65,5 +60,5 @@ private:
     vectorized::VExprContextSPtrs _output_vexpr_ctxs;
 };
 
-} // namespace pipeline
-} // namespace doris
+#include "common/compile_check_end.h"
+} // namespace doris::pipeline

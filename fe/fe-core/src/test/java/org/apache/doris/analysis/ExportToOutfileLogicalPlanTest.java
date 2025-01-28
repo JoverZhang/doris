@@ -17,6 +17,7 @@
 
 package org.apache.doris.analysis;
 
+import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.UserException;
 import org.apache.doris.load.ExportJob;
@@ -47,6 +48,12 @@ public class ExportToOutfileLogicalPlanTest extends TestWithFeService {
     private String dbName = "testDb";
     private String tblName = "table1";
 
+    private final boolean defaultEnableAdvanceNextId = Config.enable_advance_next_id; // backup
+
+    {
+        enableAdvanceNextId = false;
+    }
+
     /**
      * create a database and a table
      *
@@ -65,6 +72,7 @@ public class ExportToOutfileLogicalPlanTest extends TestWithFeService {
                 + "PARTITION p4 VALUES LESS THAN (\"50\")\n" + ")\n"
                 + " distributed by hash(k1) buckets 10\n"
                 + "properties(\"replication_num\" = \"1\");");
+        Config.enable_advance_next_id = defaultEnableAdvanceNextId; // restore
     }
 
     /**
@@ -79,7 +87,10 @@ public class ExportToOutfileLogicalPlanTest extends TestWithFeService {
     public void testNormal() throws UserException {
         // The origin export sql
         String exportSql = "EXPORT TABLE testDb.table1\n"
-                + "TO \"file:///tmp/exp_\";";
+                + "TO \"file:///tmp/exp_\" "
+                + "PROPERTIES(\n"
+                + "\"data_consistency\" = \"none\"\n"
+                + ");";
 
         List<Long> currentTablets1 = Arrays.asList(10010L, 10012L, 10014L, 10016L, 10018L, 10020L, 10022L, 10024L,
                 10026L, 10028L);
@@ -126,7 +137,8 @@ public class ExportToOutfileLogicalPlanTest extends TestWithFeService {
         String exportSql = "EXPORT TABLE testDb.table1\n"
                 + "TO \"file:///tmp/exp_\" "
                 + "PROPERTIES(\n"
-                + "\"parallelism\" = \"4\"\n"
+                + "\"parallelism\" = \"4\",\n"
+                + "\"data_consistency\" = \"none\"\n"
                 + ");";
 
         // This export sql should generate 4 array, and there should be 1 outfile sql in per array.
@@ -180,7 +192,8 @@ public class ExportToOutfileLogicalPlanTest extends TestWithFeService {
         String exportSql = "EXPORT TABLE testDb.table1\n"
                 + "TO \"file:///tmp/exp_\" "
                 + "PROPERTIES(\n"
-                + "\"parallelism\" = \"3\"\n"
+                + "\"parallelism\" = \"3\",\n"
+                + "\"data_consistency\" = \"none\"\n"
                 + ");";
 
         // This export sql should generate 4 array, and there should be 1 outfile sql in per array.
@@ -240,7 +253,8 @@ public class ExportToOutfileLogicalPlanTest extends TestWithFeService {
         String exportSql = "EXPORT TABLE testDb.table1 PARTITION (p1)\n"
                 + "TO \"file:///tmp/exp_\" "
                 + "PROPERTIES(\n"
-                + "\"parallelism\" = \"4\"\n"
+                + "\"parallelism\" = \"4\",\n"
+                + "\"data_consistency\" = \"none\"\n"
                 + ");";
 
         // This export sql should generate 4 array, and there should be 1 outfile sql in per array.
@@ -293,7 +307,8 @@ public class ExportToOutfileLogicalPlanTest extends TestWithFeService {
         String exportSql = "EXPORT TABLE testDb.table1 PARTITION (p1, p4)\n"
                 + "TO \"file:///tmp/exp_\" "
                 + "PROPERTIES(\n"
-                + "\"parallelism\" = \"4\"\n"
+                + "\"parallelism\" = \"4\",\n"
+                + "\"data_consistency\" = \"none\"\n"
                 + ");";
 
         // This export sql should generate 4 array, and there should be 1 outfile sql in per array.
@@ -344,7 +359,8 @@ public class ExportToOutfileLogicalPlanTest extends TestWithFeService {
         String exportSql = "EXPORT TABLE testDb.table1 PARTITION (p1)\n"
                 + "TO \"file:///tmp/exp_\" "
                 + "PROPERTIES(\n"
-                + "\"parallelism\" = \"20\"\n"
+                + "\"parallelism\" = \"20\",\n"
+                + "\"data_consistency\" = \"none\"\n"
                 + ");";
 
         // This export sql should generate 10 array because parallelism is less than the number of tablets,

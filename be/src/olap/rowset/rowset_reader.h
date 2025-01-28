@@ -40,7 +40,7 @@ struct RowSetSplits {
     // if segment_offsets is not empty, means we only scan
     // [pair.first, pair.second) segment in rs_reader, only effective in dup key
     // and pipeline
-    std::pair<int, int> segment_offsets;
+    std::pair<int64_t, int64_t> segment_offsets;
 
     // RowRanges of each segment.
     std::vector<RowRanges> segment_row_ranges;
@@ -74,6 +74,8 @@ public:
 
     virtual int64_t filtered_rows() = 0;
 
+    virtual uint64_t merged_rows() = 0;
+
     virtual RowsetTypePB type() const = 0;
 
     virtual int64_t newest_write_timestamp() = 0;
@@ -81,13 +83,11 @@ public:
         return Status::NotSupported("to be implemented");
     }
 
-    virtual Status get_segment_num_rows(std::vector<uint32_t>* segment_num_rows) {
-        return Status::NotSupported("to be implemented");
-    }
-
     virtual bool update_profile(RuntimeProfile* profile) = 0;
 
     virtual RowsetReaderSharedPtr clone() = 0;
+
+    virtual void set_topn_limit(size_t topn_limit) = 0;
 };
 
 } // namespace doris

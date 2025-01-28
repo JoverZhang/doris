@@ -17,6 +17,8 @@
 
 package org.apache.doris.nereids.trees.plans.commands;
 
+import org.apache.doris.analysis.RedirectStatus;
+import org.apache.doris.analysis.StmtType;
 import org.apache.doris.nereids.analyzer.UnboundFunction;
 import org.apache.doris.nereids.trees.plans.PlanType;
 import org.apache.doris.nereids.trees.plans.commands.call.CallFunc;
@@ -36,18 +38,20 @@ public class CallCommand extends Command implements ForwardWithSync {
     public static final Logger LOG = LogManager.getLogger(CallCommand.class);
 
     private final UnboundFunction unboundFunction;
+    private final String originSql;
 
     /**
      * constructor
      */
-    public CallCommand(UnboundFunction unboundFunction) {
+    public CallCommand(UnboundFunction unboundFunction, String originSql) {
         super(PlanType.CALL_COMMAND);
         this.unboundFunction = Objects.requireNonNull(unboundFunction, "function is null");
+        this.originSql = originSql;
     }
 
     @Override
     public void run(ConnectContext ctx, StmtExecutor executor) throws Exception {
-        CallFunc analyzedFunc = CallFunc.getFunc(ctx.getCurrentUserIdentity(), unboundFunction);
+        CallFunc analyzedFunc = CallFunc.getFunc(ctx, ctx.getCurrentUserIdentity(), unboundFunction, originSql);
         analyzedFunc.run();
     }
 
@@ -56,4 +60,20 @@ public class CallCommand extends Command implements ForwardWithSync {
         return visitor.visitCallCommand(this, context);
     }
 
+    @Override
+    public StmtType stmtType() {
+        return StmtType.CALL;
+    }
+
+    @Override
+    public RedirectStatus toRedirectStatus() {
+        // Some of call statements may need to be redirected, some may not
+        String funcName = unboundFunction.getName().toUpperCase();
+        switch (funcName) {
+            case "FLUSH_AUDIT_LOG":
+                return RedirectStatus.NO_FORWARD;
+            default:
+                return RedirectStatus.FORWARD_WITH_SYNC;
+        }
+    }
 }

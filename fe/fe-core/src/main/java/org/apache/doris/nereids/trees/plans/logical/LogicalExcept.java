@@ -18,7 +18,8 @@
 package org.apache.doris.nereids.trees.plans.logical;
 
 import org.apache.doris.nereids.memo.GroupExpression;
-import org.apache.doris.nereids.properties.FunctionalDependencies;
+import org.apache.doris.nereids.properties.DataTrait;
+import org.apache.doris.nereids.properties.DataTrait.Builder;
 import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.trees.expressions.NamedExpression;
 import org.apache.doris.nereids.trees.expressions.Slot;
@@ -35,7 +36,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.function.Supplier;
 
 /**
  * Logical Except.
@@ -104,22 +104,39 @@ public class LogicalExcept extends LogicalSetOperation {
                 Optional.empty(), Optional.empty(), children);
     }
 
-    @Override
-    public FunctionalDependencies computeFuncDeps(Supplier<List<Slot>> outputSupplier) {
-        FunctionalDependencies.Builder builder = new FunctionalDependencies
-                .Builder(child(0).getLogicalProperties().getFunctionalDependencies());
+    private Map<Slot, Slot> constructReplaceMapForChild(int index) {
         Map<Slot, Slot> replaceMap = new HashMap<>();
-        List<Slot> output = outputSupplier.get();
-        List<? extends Slot> originalOutputs = regularChildrenOutputs.isEmpty()
-                ? child(0).getOutput()
-                : regularChildrenOutputs.get(0);
+        List<Slot> output = getOutput();
         for (int i = 0; i < output.size(); i++) {
-            replaceMap.put(originalOutputs.get(i), output.get(i));
+            replaceMap.put(regularChildrenOutputs.get(index).get(i), output.get(i));
         }
-        builder.replace(replaceMap);
+        return replaceMap;
+    }
+
+    @Override
+    public void computeUnique(Builder builder) {
+        builder.addUniqueSlot(child(0).getLogicalProperties().getTrait());
         if (qualifier == Qualifier.DISTINCT) {
-            builder.addUniqueSlot(ImmutableSet.copyOf(outputSupplier.get()));
+            builder.addUniqueSlot(ImmutableSet.copyOf(getOutput()));
         }
-        return builder.build();
+        builder.replaceUniqueBy(constructReplaceMapForChild(0));
+    }
+
+    @Override
+    public void computeEqualSet(DataTrait.Builder builder) {
+        builder.addEqualSet(child(0).getLogicalProperties().getTrait());
+        builder.replaceEqualSetBy(constructReplaceMapForChild(0));
+    }
+
+    @Override
+    public void computeFd(DataTrait.Builder builder) {
+        builder.addFuncDepsDG(child(0).getLogicalProperties().getTrait());
+        builder.replaceFuncDepsBy(constructReplaceMapForChild(0));
+    }
+
+    @Override
+    public void computeUniform(Builder builder) {
+        builder.addUniformSlot(child(0).getLogicalProperties().getTrait());
+        builder.replaceUniformBy(constructReplaceMapForChild(0));
     }
 }

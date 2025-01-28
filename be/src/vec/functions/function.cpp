@@ -23,7 +23,6 @@
 #include <algorithm>
 #include <memory>
 #include <numeric>
-#include <vector>
 
 #include "vec/aggregate_functions/aggregate_function.h"
 #include "vec/columns/column.h"
@@ -42,7 +41,7 @@
 namespace doris::vectorized {
 
 ColumnPtr wrap_in_nullable(const ColumnPtr& src, const Block& block, const ColumnNumbers& args,
-                           size_t result, size_t input_rows_count) {
+                           uint32_t result, size_t input_rows_count) {
     ColumnPtr result_null_map_column;
     /// If result is already nullable.
     ColumnPtr src_not_nullable = src;
@@ -62,7 +61,7 @@ ColumnPtr wrap_in_nullable(const ColumnPtr& src, const Block& block, const Colum
         if (const auto* nullable = assert_cast<const ColumnNullable*>(elem.column.get());
             nullable->has_null()) {
             const ColumnPtr& null_map_column = nullable->get_null_map_column_ptr();
-            if (!result_null_map_column) {
+            if (!result_null_map_column) { // NOLINT(bugprone-use-after-move)
                 result_null_map_column = null_map_column->clone_resized(input_rows_count);
                 continue;
             }
@@ -94,18 +93,18 @@ ColumnPtr wrap_in_nullable(const ColumnPtr& src, const Block& block, const Colum
     return ColumnNullable::create(src_not_nullable, result_null_map_column);
 }
 
-bool get_null_presence(const Block& block, const ColumnNumbers& args) {
+bool have_null_column(const Block& block, const ColumnNumbers& args) {
     return std::ranges::any_of(args, [&block](const auto& elem) {
         return block.get_by_position(elem).type->is_nullable();
     });
 }
 
-bool get_null_presence(const ColumnsWithTypeAndName& args) {
+bool have_null_column(const ColumnsWithTypeAndName& args) {
     return std::ranges::any_of(args, [](const auto& elem) { return elem.type->is_nullable(); });
 }
 
 inline Status PreparedFunctionImpl::_execute_skipped_constant_deal(
-        FunctionContext* context, Block& block, const ColumnNumbers& args, size_t result,
+        FunctionContext* context, Block& block, const ColumnNumbers& args, uint32_t result,
         size_t input_rows_count, bool dry_run) const {
     bool executed = false;
     RETURN_IF_ERROR(default_implementation_for_nulls(context, block, args, result, input_rows_count,
@@ -122,7 +121,7 @@ inline Status PreparedFunctionImpl::_execute_skipped_constant_deal(
 }
 
 Status PreparedFunctionImpl::default_implementation_for_constant_arguments(
-        FunctionContext* context, Block& block, const ColumnNumbers& args, size_t result,
+        FunctionContext* context, Block& block, const ColumnNumbers& args, uint32_t result,
         size_t input_rows_count, bool dry_run, bool* executed) const {
     *executed = false;
     ColumnNumbers args_expect_const = get_arguments_that_are_always_constant();
@@ -141,7 +140,7 @@ Status PreparedFunctionImpl::default_implementation_for_constant_arguments(
         return Status::OK();
     }
 
-    // now all columns is const.
+    // now all columns are const.
     Block temporary_block;
 
     size_t arguments_size = args.size();
@@ -179,14 +178,14 @@ Status PreparedFunctionImpl::default_implementation_for_constant_arguments(
     } else {
         result_column = temporary_block.get_by_position(arguments_size).column;
     }
-
+    // We shuold handle the case where the result column is also a ColumnConst.
     block.get_by_position(result).column = ColumnConst::create(result_column, input_rows_count);
     *executed = true;
     return Status::OK();
 }
 
 Status PreparedFunctionImpl::default_implementation_for_nulls(
-        FunctionContext* context, Block& block, const ColumnNumbers& args, size_t result,
+        FunctionContext* context, Block& block, const ColumnNumbers& args, uint32_t result,
         size_t input_rows_count, bool dry_run, bool* executed) const {
     *executed = false;
     if (args.empty() || !use_default_implementation_for_nulls()) {
@@ -202,20 +201,22 @@ Status PreparedFunctionImpl::default_implementation_for_nulls(
         return Status::OK();
     }
 
-    if (get_null_presence(block, args)) {
+    if (have_null_column(block, args)) {
         bool need_to_default = need_replace_null_data_to_default();
         if (context) {
             need_to_default &= context->check_overflow_for_decimal();
         }
+        // extract nested column from nulls
         ColumnNumbers new_args;
         for (auto arg : args) {
             new_args.push_back(block.columns());
             block.insert(block.get_by_position(arg).get_nested(need_to_default));
             DCHECK(!block.get_by_position(new_args.back()).column->is_nullable());
         }
-
         RETURN_IF_ERROR(execute_without_low_cardinality_columns(context, block, new_args, result,
                                                                 block.rows(), dry_run));
+        // After run with nested, wrap them in null. Before this, block.get_by_position(result).type
+        // is not compatible with get_by_position(result).column
         block.get_by_position(result).column = wrap_in_nullable(
                 block.get_by_position(result).column, block, args, result, input_rows_count);
 
@@ -230,7 +231,7 @@ Status PreparedFunctionImpl::default_implementation_for_nulls(
 }
 
 Status PreparedFunctionImpl::execute_without_low_cardinality_columns(
-        FunctionContext* context, Block& block, const ColumnNumbers& args, size_t result,
+        FunctionContext* context, Block& block, const ColumnNumbers& args, uint32_t result,
         size_t input_rows_count, bool dry_run) const {
     bool executed = false;
 
@@ -244,7 +245,7 @@ Status PreparedFunctionImpl::execute_without_low_cardinality_columns(
 }
 
 Status PreparedFunctionImpl::execute(FunctionContext* context, Block& block,
-                                     const ColumnNumbers& args, size_t result,
+                                     const ColumnNumbers& args, uint32_t result,
                                      size_t input_rows_count, bool dry_run) const {
     return execute_without_low_cardinality_columns(context, block, args, result, input_rows_count,
                                                    dry_run);
@@ -267,7 +268,7 @@ DataTypePtr FunctionBuilderImpl::get_return_type_without_low_cardinality(
     check_number_of_arguments(arguments.size());
 
     if (!arguments.empty() && use_default_implementation_for_nulls()) {
-        if (get_null_presence(arguments)) {
+        if (have_null_column(arguments)) {
             ColumnNumbers numbers(arguments.size());
             std::iota(numbers.begin(), numbers.end(), 0);
             auto [nested_block, _] =
@@ -284,14 +285,6 @@ DataTypePtr FunctionBuilderImpl::get_return_type_without_low_cardinality(
 DataTypePtr FunctionBuilderImpl::get_return_type(const ColumnsWithTypeAndName& arguments) const {
     if (use_default_implementation_for_low_cardinality_columns()) {
         ColumnsWithTypeAndName args_without_low_cardinality(arguments);
-
-        for (ColumnWithTypeAndName& arg : args_without_low_cardinality) {
-            bool is_const = arg.column && is_column_const(*arg.column);
-            if (is_const) {
-                arg.column = assert_cast<const ColumnConst&>(*arg.column).remove_low_cardinality();
-            }
-        }
-
         auto type_without_low_cardinality =
                 get_return_type_without_low_cardinality(args_without_low_cardinality);
 

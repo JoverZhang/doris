@@ -38,9 +38,9 @@ export TP_DIR="${curdir}"
 
 # include custom environment variables
 if [[ -f "${DORIS_HOME}/env.sh" ]]; then
-    export BUILD_THIRDPARTY_WIP=1
+    export DO_NOT_CHECK_JAVA_ENV=1
     . "${DORIS_HOME}/env.sh"
-    export BUILD_THIRDPARTY_WIP=
+    export DO_NOT_CHECK_JAVA_ENV=
 fi
 
 # Check args
@@ -72,6 +72,8 @@ if [[ "${KERNEL}" == 'Darwin' ]]; then
 else
     PARALLEL="$(($(nproc) / 4 + 1))"
 fi
+
+BUILD_AZURE="ON"
 
 while true; do
     case "$1" in
@@ -119,6 +121,10 @@ if [[ "${HELP}" -eq 1 ]]; then
     usage
 fi
 
+if [[ -n "${DISABLE_BUILD_AZURE}" ]]; then
+    BUILD_AZURE='OFF'
+fi
+
 echo "Get params:
     PARALLEL            -- ${PARALLEL}
     CLEAN               -- ${CLEAN}
@@ -147,7 +153,7 @@ if [[ "${CLEAN}" -eq 1 ]] && [[ -d "${TP_SOURCE_DIR}" ]]; then
 fi
 
 # Download thirdparties.
-"${TP_DIR}/download-thirdparty.sh"
+eval "${TP_DIR}/download-thirdparty.sh ${packages[*]}"
 
 export LD_LIBRARY_PATH="${TP_DIR}/installed/lib:${LD_LIBRARY_PATH}"
 
@@ -434,7 +440,7 @@ build_protobuf() {
         -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
         -Dprotobuf_BUILD_SHARED_LIBS=OFF \
         -Dprotobuf_BUILD_TESTS=OFF \
-        -Dprotobuf_WITH_ZLIB_DEFAULT=ON \
+        -DZLIB_LIBRARY="${TP_LIB_DIR}/libz.a" \
         -Dprotobuf_ABSL_PROVIDER=package \
         -DCMAKE_INSTALL_PREFIX="${TP_INSTALL_DIR}" ../..
 
@@ -627,7 +633,7 @@ build_bzip() {
     check_if_source_exist "${BZIP_SOURCE}"
     cd "${TP_SOURCE_DIR}/${BZIP_SOURCE}"
 
-    make -j "${PARALLEL}" install PREFIX="${TP_INSTALL_DIR}"
+    make -j "${PARALLEL}" install PREFIX="${TP_INSTALL_DIR}" CFLAGS="-fPIC"
 }
 
 # lzo2
@@ -642,6 +648,13 @@ build_lzo2() {
     make -j "${PARALLEL}"
     make install
     strip_lib liblzo2.a
+}
+
+# brotli
+build_brotli() {
+    check_if_source_exist "${BROTLI_SOURCE}"
+    # brotli has been builded in build_arrow, so just copy headers
+    cp -r "${TP_SOURCE_DIR}/${BROTLI_SOURCE}/c/include/brotli" "${TP_INCLUDE_DIR}/"
 }
 
 # curl
@@ -901,7 +914,7 @@ build_librdkafka() {
 }
 
 # libunixodbc
-build_libunixodbc() {
+build_odbc() {
     check_if_source_exist "${ODBC_SOURCE}"
 
     cd "${TP_SOURCE_DIR}/${ODBC_SOURCE}"
@@ -1006,7 +1019,6 @@ build_arrow() {
     export ARROW_LZ4_URL="${TP_SOURCE_DIR}/${LZ4_NAME}"
     export ARROW_FLATBUFFERS_URL="${TP_SOURCE_DIR}/${FLATBUFFERS_NAME}"
     export ARROW_ZSTD_URL="${TP_SOURCE_DIR}/${ZSTD_NAME}"
-    export ARROW_JEMALLOC_URL="${TP_SOURCE_DIR}/${JEMALLOC_ARROW_NAME}"
     export ARROW_Thrift_URL="${TP_SOURCE_DIR}/${THRIFT_NAME}"
     export ARROW_SNAPPY_URL="${TP_SOURCE_DIR}/${SNAPPY_NAME}"
     export ARROW_ZLIB_URL="${TP_SOURCE_DIR}/${ZLIB_NAME}"
@@ -1040,13 +1052,13 @@ build_arrow() {
         -DBoost_USE_STATIC_RUNTIME=ON \
         -DARROW_GFLAGS_USE_SHARED=OFF \
         -Dgflags_ROOT="${TP_INSTALL_DIR}" \
-        -DGLOG_ROOT="${TP_INSTALL_DIR}" \
-        -DRE2_ROOT="${TP_INSTALL_DIR}" \
+        -Dglog_ROOT="${TP_INSTALL_DIR}" \
+        -Dre2_ROOT="${TP_INSTALL_DIR}" \
         -DZLIB_SOURCE=SYSTEM \
         -DZLIB_LIBRARY="${TP_INSTALL_DIR}/lib/libz.a" -DZLIB_INCLUDE_DIR="${TP_INSTALL_DIR}/include" \
         -DRapidJSON_SOURCE=SYSTEM \
         -DRapidJSON_ROOT="${TP_INSTALL_DIR}" \
-        -DORC_ROOT="${TP_INSTALL_DIR}" \
+        -Dorc_ROOT="${TP_INSTALL_DIR}" \
         -Dxsimd_SOURCE=BUNDLED \
         -DBrotli_SOURCE=BUNDLED \
         -DARROW_LZ4_USE_SHARED=OFF \
@@ -1057,8 +1069,9 @@ build_arrow() {
         -Dzstd_SOURCE=SYSTEM \
         -DSnappy_LIB="${TP_INSTALL_DIR}/lib/libsnappy.a" -DSnappy_INCLUDE_DIR="${TP_INSTALL_DIR}/include" \
         -DSnappy_SOURCE=SYSTEM \
-        -DBOOST_ROOT="${TP_INSTALL_DIR}" --no-warn-unused-cli \
-        -Djemalloc_SOURCE=BUNDLED \
+        -DBoost_ROOT="${TP_INSTALL_DIR}" --no-warn-unused-cli \
+        -DARROW_JEMALLOC=OFF -DARROW_MIMALLOC=OFF \
+        -DJEMALLOC_HOME="${TP_INSTALL_DIR}" \
         -DARROW_THRIFT_USE_SHARED=OFF \
         -DThrift_SOURCE=SYSTEM \
         -DThrift_ROOT="${TP_INSTALL_DIR}" ..
@@ -1067,15 +1080,11 @@ build_arrow() {
     "${BUILD_SYSTEM}" install
 
     #copy dep libs
-    cp -rf ./jemalloc_ep-prefix/src/jemalloc_ep/dist/lib/libjemalloc_pic.a "${TP_INSTALL_DIR}/lib64/libjemalloc_arrow.a"
     cp -rf ./brotli_ep/src/brotli_ep-install/lib/libbrotlienc-static.a "${TP_INSTALL_DIR}/lib64/libbrotlienc.a"
     cp -rf ./brotli_ep/src/brotli_ep-install/lib/libbrotlidec-static.a "${TP_INSTALL_DIR}/lib64/libbrotlidec.a"
     cp -rf ./brotli_ep/src/brotli_ep-install/lib/libbrotlicommon-static.a "${TP_INSTALL_DIR}/lib64/libbrotlicommon.a"
     strip_lib libarrow.a
-    strip_lib libjemalloc_arrow.a
     strip_lib libparquet.a
-
-    cp -rf "${TP_INSTALL_DIR}/lib64/libjemalloc_arrow.a" "${TP_INSTALL_DIR}/lib64/libjemalloc.a" # TODO delete
 }
 
 # abseil
@@ -1124,6 +1133,7 @@ build_bitshuffle() {
     check_if_source_exist "${BITSHUFFLE_SOURCE}"
     local ld="${DORIS_BIN_UTILS}/ld"
     local ar="${DORIS_BIN_UTILS}/ar"
+    MACHINE_OS=$(uname -s)
 
     if [[ ! -f "${ld}" ]]; then ld="$(command -v ld)"; fi
     if [[ ! -f "${ar}" ]]; then ar="$(command -v ar)"; fi
@@ -1139,7 +1149,7 @@ build_bitshuffle() {
     MACHINE_TYPE="$(uname -m)"
     # Becuase aarch64 don't support avx2, disable it.
     if [[ "${MACHINE_TYPE}" == "aarch64" || "${MACHINE_TYPE}" == 'arm64' ]]; then
-        arches=('default')
+        arches=('default' 'neon')
     fi
 
     to_link=""
@@ -1151,6 +1161,9 @@ build_bitshuffle() {
         if [[ "${arch}" == "avx512" ]]; then
             arch_flag="-mavx512bw -mavx512f"
         fi
+        if [[ "${MACHINE_OS}" != "Darwin" ]] && [[ "${arch}" == "neon" ]]; then
+            arch_flag="-march=armv8-a+crc"
+        fi
         tmp_obj="bitshuffle_${arch}_tmp.o"
         dst_obj="bitshuffle_${arch}.o"
         "${CC}" ${EXTRA_CFLAGS:+${EXTRA_CFLAGS}} ${arch_flag:+${arch_flag}} -std=c99 "-I${PREFIX}/include/lz4" -O3 -DNDEBUG -c \
@@ -1160,7 +1173,7 @@ build_bitshuffle() {
         # Merge the object files together to produce a combined .o file.
         "${ld}" -r -o "${tmp_obj}" bitshuffle_core.o bitshuffle.o iochain.o
         # For the AVX2 symbols, suffix them.
-        if [[ "${arch}" == "avx2" ]] || [[ "${arch}" == "avx512" ]]; then
+        if [[ "${MACHINE_OS}" != "Darwin" ]] && { [[ "${arch}" == "avx2" ]] || [[ "${arch}" == "avx512" ]] || [[ "${arch}" == "neon" ]]; }; then
             local nm="${DORIS_BIN_UTILS}/nm"
             local objcopy="${DORIS_BIN_UTILS}/objcopy"
 
@@ -1496,7 +1509,7 @@ build_hdfs3() {
 }
 
 # jemalloc
-build_jemalloc() {
+build_jemalloc_doris() {
     check_if_source_exist "${JEMALLOC_DORIS_SOURCE}"
     cd "${TP_SOURCE_DIR}/${JEMALLOC_DORIS_SOURCE}"
 
@@ -1516,6 +1529,9 @@ build_jemalloc() {
         WITH_LG_PAGE=''
     fi
 
+    # It is not easy to remove `with-jemalloc-prefix`, which may affect the compatibility between third-party and old version codes.
+    # Also, will building failed on Mac, it said can't find mallctl symbol. because jemalloc's default prefix on macOS is "je_", not "".
+    # Maybe can use alias instead of overwrite.
     CFLAGS="${cflags}" ../configure --prefix="${TP_INSTALL_DIR}" --with-install-suffix="_doris" "${WITH_LG_PAGE}" \
         --with-jemalloc-prefix=je --enable-prof --disable-cxx --disable-libdl --disable-shared
 
@@ -1675,6 +1691,8 @@ build_hadoop_libs() {
     echo "THIRDPARTY_INSTALLED=${TP_INSTALL_DIR}" >env.sh
     ./build.sh
 
+    rm -rf "${TP_INSTALL_DIR}/include/hadoop_hdfs/"
+    rm -rf "${TP_INSTALL_DIR}/lib/hadoop_hdfs/"
     mkdir -p "${TP_INSTALL_DIR}/include/hadoop_hdfs/"
     mkdir -p "${TP_INSTALL_DIR}/lib/hadoop_hdfs/"
     cp -r ./hadoop-dist/target/hadoop-libhdfs-3.3.6/* "${TP_INSTALL_DIR}/lib/hadoop_hdfs/"
@@ -1682,21 +1700,6 @@ build_hadoop_libs() {
     rm -rf "${TP_INSTALL_DIR}/lib/hadoop_hdfs/native/*.a"
     find ./hadoop-dist/target/hadoop-3.3.6/lib/native/ -type f ! -name '*.a' -exec cp {} "${TP_INSTALL_DIR}/lib/hadoop_hdfs/native/" \;
     find ./hadoop-dist/target/hadoop-3.3.6/lib/native/ -type l -exec cp -P {} "${TP_INSTALL_DIR}/lib/hadoop_hdfs/native/" \;
-}
-
-# dragonbox
-build_dragonbox() {
-    check_if_source_exist "${DRAGONBOX_SOURCE}"
-    cd "${TP_SOURCE_DIR}/${DRAGONBOX_SOURCE}"
-
-    rm -rf "${BUILD_DIR}"
-    mkdir -p "${BUILD_DIR}"
-    cd "${BUILD_DIR}"
-
-    "${CMAKE_CMD}" -G "${GENERATOR}" -DCMAKE_INSTALL_PREFIX="${TP_INSTALL_DIR}" -DDRAGONBOX_INSTALL_TO_CHARS=ON ..
-
-    "${BUILD_SYSTEM}" -j "${PARALLEL}"
-    "${BUILD_SYSTEM}" install
 }
 
 # AvxToNeon
@@ -1752,7 +1755,7 @@ build_libuuid() {
     check_if_source_exist "${LIBUUID_SOURCE}"
     cd "${TP_SOURCE_DIR}/${LIBUUID_SOURCE}"
     CC=gcc ./configure --prefix="${TP_INSTALL_DIR}" --disable-shared --enable-static
-    make -j "${PARALLEL}"
+    make -j "${PARALLEL}" CFLAGS="-fPIC"
     make install
 }
 
@@ -1769,14 +1772,92 @@ build_ali_sdk() {
     CPPFLAGS="-I${TP_INCLUDE_DIR}" \
         CXXFLAGS="-I${TP_INCLUDE_DIR}" \
         LDFLAGS="-L${TP_LIB_DIR}" \
-        "${CMAKE_CMD}" -G "${GENERATOR}" -DBUILD_SHARED_LIBS=OFF -DBUILD_PRODUCT=core -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="${TP_INSTALL_DIR}" ..
+        "${CMAKE_CMD}" -G "${GENERATOR}" -DBUILD_PRODUCT=core -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="${TP_INSTALL_DIR}" \
+        -DTP_INSTALL_DIR="${TP_INSTALL_DIR}" ..
     "${BUILD_SYSTEM}" -j "${PARALLEL}"
     "${BUILD_SYSTEM}" install
 }
 
+# base64
+build_base64() {
+    check_if_source_exist "${BASE64_SOURCE}"
+    cd "${TP_SOURCE_DIR}/${BASE64_SOURCE}"
+
+    rm -rf "${BUILD_DIR}"
+    mkdir -p "${BUILD_DIR}"
+    cd "${BUILD_DIR}"
+
+    "${CMAKE_CMD}" -G "${GENERATOR}" -DCMAKE_INSTALL_PREFIX="${TP_INSTALL_DIR}" -DCMAKE_BUILD_TYPE=Release ..
+    MACHINE_TYPE="$(uname -m)"
+    if [[ "${MACHINE_TYPE}" == "aarch64" || "${MACHINE_TYPE}" == 'arm64' ]]; then
+        CFLAGS="--target=aarch64-linux-gnu -march=armv8-a+crc" NEON64_CFLAGS=" "
+    else
+        AVX2_CFLAGS=-mavx2 SSSE3_CFLAGS=-mssse3 SSE41_CFLAGS=-msse4.1 SSE42_CFLAGS=-msse4.2 AVX_CFLAGS=-mavx
+    fi
+    "${BUILD_SYSTEM}" -j "${PARALLEL}"
+    "${BUILD_SYSTEM}" install
+}
+
+# azure blob storage
+build_azure() {
+    if [[ "${BUILD_AZURE}" == "OFF" ]]; then
+        echo "Skip build azure"
+    else
+        check_if_source_exist "${AZURE_SOURCE}"
+        cd "${TP_SOURCE_DIR}/${AZURE_SOURCE}"
+        azure_dir=$(pwd)
+
+        rm -rf "${BUILD_DIR}"
+        mkdir -p "${BUILD_DIR}"
+        cd "${BUILD_DIR}"
+
+        # We need use openssl 1.1.1n, which is already carried in vcpkg-custom-ports
+        AZURE_PORTS="vcpkg-custom-ports"
+        AZURE_MANIFEST_DIR="."
+
+        "${CMAKE_CMD}" -G "${GENERATOR}" -DVCPKG_MANIFEST_MODE=ON -DVCPKG_OVERLAY_PORTS="${azure_dir}/${AZURE_PORTS}" -DVCPKG_MANIFEST_DIR="${azure_dir}/${AZURE_MANIFEST_DIR}" -DWARNINGS_AS_ERRORS=FALSE -DCMAKE_INSTALL_PREFIX="${TP_INSTALL_DIR}" -DCMAKE_BUILD_TYPE=Release ..
+        "${BUILD_SYSTEM}" -j "${PARALLEL}"
+        "${BUILD_SYSTEM}" install
+    fi
+}
+
+# dragonbox
+build_dragonbox() {
+    check_if_source_exist "${DRAGONBOX_SOURCE}"
+    cd "${TP_SOURCE_DIR}/${DRAGONBOX_SOURCE}"
+
+    rm -rf "${BUILD_DIR}"
+    mkdir -p "${BUILD_DIR}"
+    cd "${BUILD_DIR}"
+
+    "${CMAKE_CMD}" -G "${GENERATOR}" -DCMAKE_INSTALL_PREFIX="${TP_INSTALL_DIR}" -DDRAGONBOX_INSTALL_TO_CHARS=ON ..
+
+    "${BUILD_SYSTEM}" -j "${PARALLEL}"
+    "${BUILD_SYSTEM}" install
+}
+
+# icu
+build_icu() {
+    check_if_source_exist "${ICU_SOURCE}"
+    cd "${TP_SOURCE_DIR}/${ICU_SOURCE}/icu4c/source"
+
+    rm -rf "${BUILD_DIR}"
+    mkdir -p "${BUILD_DIR}"
+    cd "${BUILD_DIR}"
+
+    ../configure --prefix="${TP_INSTALL_DIR}" \
+        --disable-shared \
+        --enable-static \
+        --disable-samples \
+        --disable-tests
+
+    make -j "${PARALLEL}"
+    make install
+}
+
 if [[ "${#packages[@]}" -eq 0 ]]; then
     packages=(
-        libunixodbc
+        odbc
         openssl
         libevent
         zlib
@@ -1799,7 +1880,7 @@ if [[ "${#packages[@]}" -eq 0 ]]; then
         thrift
         leveldb
         brpc
-        jemalloc
+        jemalloc_doris
         rocksdb
         krb5 # before cyrus_sasl
         cyrus_sasl
@@ -1835,11 +1916,15 @@ if [[ "${#packages[@]}" -eq 0 ]]; then
         concurrentqueue
         fast_float
         libunwind
-        dragonbox
         avx2neon
         libdeflate
         streamvbyte
         ali_sdk
+        base64
+        azure
+        dragonbox
+        brotli
+        icu
     )
     if [[ "$(uname -s)" == 'Darwin' ]]; then
         read -r -a packages <<<"binutils gettext ${packages[*]}"

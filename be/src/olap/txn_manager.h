@@ -36,7 +36,6 @@
 
 #include "common/status.h"
 #include "olap/olap_common.h"
-#include "olap/partial_update_info.h"
 #include "olap/rowset/pending_rowset_helper.h"
 #include "olap/rowset/rowset.h"
 #include "olap/rowset/rowset_meta.h"
@@ -52,6 +51,7 @@ namespace doris {
 class DeltaWriter;
 class OlapMeta;
 struct TabletPublishStatistics;
+struct PartialUpdateInfo;
 
 enum class TxnState {
     NOT_FOUND = 0,
@@ -61,8 +61,70 @@ enum class TxnState {
     ABORTED = 4,
     DELETED = 5,
 };
+enum class PublishStatus { INIT = 0, PREPARE = 1, SUCCEED = 2 };
 
-struct TabletTxnInfo;
+struct TxnPublishInfo {
+    int64_t publish_version {-1};
+    int64_t base_compaction_cnt {-1};
+    int64_t cumulative_compaction_cnt {-1};
+    int64_t cumulative_point {-1};
+};
+
+struct TabletTxnInfo {
+    PUniqueId load_id;
+    RowsetSharedPtr rowset;
+    PendingRowsetGuard pending_rs_guard;
+    bool unique_key_merge_on_write {false};
+    DeleteBitmapPtr delete_bitmap;
+    // records rowsets calc in commit txn
+    RowsetIdUnorderedSet rowset_ids;
+    int64_t creation_time;
+    bool ingest {false};
+    std::shared_ptr<PartialUpdateInfo> partial_update_info;
+
+    // for cloud only, used to determine if a retry CloudTabletCalcDeleteBitmapTask
+    // needs to re-calculate the delete bitmap
+    std::shared_ptr<PublishStatus> publish_status;
+    TxnPublishInfo publish_info;
+
+    // for cloud only, used to calculate delete bitmap for txn load
+    bool is_txn_load = false;
+    std::vector<RowsetSharedPtr> invisible_rowsets;
+    int64_t lock_id;
+    int64_t next_visible_version;
+
+    TxnState state {TxnState::PREPARED};
+    TabletTxnInfo() = default;
+
+    TabletTxnInfo(PUniqueId load_id, RowsetSharedPtr rowset)
+            : load_id(std::move(load_id)),
+              rowset(std::move(rowset)),
+              creation_time(UnixSeconds()) {}
+
+    TabletTxnInfo(PUniqueId load_id, RowsetSharedPtr rowset, bool ingest_arg)
+            : load_id(std::move(load_id)),
+              rowset(std::move(rowset)),
+              creation_time(UnixSeconds()),
+              ingest(ingest_arg) {}
+
+    TabletTxnInfo(PUniqueId load_id, RowsetSharedPtr rowset, bool merge_on_write,
+                  DeleteBitmapPtr delete_bitmap, RowsetIdUnorderedSet ids)
+            : load_id(std::move(load_id)),
+              rowset(std::move(rowset)),
+              unique_key_merge_on_write(merge_on_write),
+              delete_bitmap(std::move(delete_bitmap)),
+              rowset_ids(std::move(ids)),
+              creation_time(UnixSeconds()) {}
+
+    void prepare() { state = TxnState::PREPARED; }
+    void commit() { state = TxnState::COMMITTED; }
+    void rollback() { state = TxnState::ROLLEDBACK; }
+    void abort() {
+        if (state == TxnState::PREPARED) {
+            state = TxnState::ABORTED;
+        }
+    }
+};
 
 struct CommitTabletTxnInfo {
     TTransactionId transaction_id {0};
@@ -88,6 +150,11 @@ public:
         delete[] _txn_tablet_delta_writer_map_locks;
     }
 
+    class CacheValue : public LRUCacheValueBase {
+    public:
+        int64_t value;
+    };
+
     // add a txn to manager
     // partition id is useful in publish version stage because version is associated with partition
     Status prepare_txn(TPartitionId partition_id, const Tablet& tablet,
@@ -100,8 +167,8 @@ public:
 
     Status commit_txn(TPartitionId partition_id, const Tablet& tablet,
                       TTransactionId transaction_id, const PUniqueId& load_id,
-                      const RowsetSharedPtr& rowset_ptr, PendingRowsetGuard guard,
-                      bool is_recovery);
+                      const RowsetSharedPtr& rowset_ptr, PendingRowsetGuard guard, bool is_recovery,
+                      std::shared_ptr<PartialUpdateInfo> partial_update_info = nullptr);
 
     Status publish_txn(TPartitionId partition_id, const TabletSharedPtr& tablet,
                        TTransactionId transaction_id, const Version& version,
@@ -116,8 +183,8 @@ public:
 
     Status commit_txn(OlapMeta* meta, TPartitionId partition_id, TTransactionId transaction_id,
                       TTabletId tablet_id, TabletUid tablet_uid, const PUniqueId& load_id,
-                      const RowsetSharedPtr& rowset_ptr, PendingRowsetGuard guard,
-                      bool is_recovery);
+                      const RowsetSharedPtr& rowset_ptr, PendingRowsetGuard guard, bool is_recovery,
+                      std::shared_ptr<PartialUpdateInfo> partial_update_info = nullptr);
 
     // remove a txn from txn manager
     // not persist rowset meta because
@@ -170,7 +237,7 @@ public:
                                        const RowsetIdUnorderedSet& rowset_ids,
                                        std::shared_ptr<PartialUpdateInfo> partial_update_info);
     void get_all_commit_tablet_txn_info_by_tablet(
-            const TabletSharedPtr& tablet, CommitTabletTxnInfoVec* commit_tablet_txn_info_vec);
+            const Tablet& tablet, CommitTabletTxnInfoVec* commit_tablet_txn_info_vec);
 
     int64_t get_txn_by_tablet_version(int64_t tablet_id, int64_t version);
     void update_tablet_version_txn(int64_t tablet_id, int64_t version, int64_t txn_id);

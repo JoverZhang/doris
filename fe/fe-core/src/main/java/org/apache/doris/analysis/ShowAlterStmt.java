@@ -48,7 +48,7 @@ import java.util.List;
  *      SHOW ALTER TABLE [COLUMN | ROLLUP] [FROM dbName] [WHERE TableName="xxx"]
  *      [ORDER BY CreateTime DESC] [LIMIT [offset,]rows]
  */
-public class ShowAlterStmt extends ShowStmt {
+public class ShowAlterStmt extends ShowStmt implements NotFallbackInParser {
     private static final Logger LOG = LogManager.getLogger(ShowAlterStmt.class);
 
     public static enum AlterType {
@@ -204,7 +204,9 @@ public class ShowAlterStmt extends ShowStmt {
             throw new UserException("SHOW " + type.name() + " does not implement yet");
         }
 
-        LOG.debug("process SHOW PROC '{}';", sb.toString());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("process SHOW PROC '{}';", sb.toString());
+        }
         // create show proc stmt
         // '/jobs/db_name/rollup|schema_change/
         node = ProcService.getInstance().open(sb.toString());

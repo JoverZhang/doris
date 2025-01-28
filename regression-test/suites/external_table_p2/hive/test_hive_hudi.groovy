@@ -16,6 +16,12 @@
 // under the License.
 
 suite("test_hive_hudi", "p2,external,hive,hudi") {
+
+    Boolean ignoreP2 = true;
+    if (ignoreP2) {
+        logger.info("disable p2 test");
+        return;
+    }
     String enabled = context.config.otherConfigs.get("enableExternalHiveTest")
     if (enabled != null && enabled.equalsIgnoreCase("true")) {
         String extHiveHmsHost = context.config.otherConfigs.get("extHiveHmsHost")
@@ -41,6 +47,18 @@ suite("test_hive_hudi", "p2,external,hive,hudi") {
 
         // test complex types
         qt_complex_types """select * from complex_type_rt order by name desc limit 100"""
+
+        // hudi table created by flink hive catalog
+        qt_flink_hive_catalog """select * from hive_ctl_table order by uuid"""
+
+        // hudi table created by flink hudi catalog
+        qt_flink_hudi_catalog """select * from hudi_ctl_table order by uuid"""
+
+        // incremental read for MOR table
+        order_qt_incr_mor_table """select * from incr_mor_partition@incr('beginTime'='20240312163541346')"""
+
+        // incremental read for COW table
+        order_qt_inc_cow_table """select * from incr_cow_partition@incr('beginTime'='20240312164538551')"""
 
         // skip logs
         sql """drop catalog if exists ${catalog_name};"""

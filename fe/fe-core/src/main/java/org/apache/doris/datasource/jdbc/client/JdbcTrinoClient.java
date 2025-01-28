@@ -18,12 +18,11 @@
 package org.apache.doris.datasource.jdbc.client;
 
 import org.apache.doris.catalog.ArrayType;
-import org.apache.doris.catalog.PrimitiveType;
 import org.apache.doris.catalog.ScalarType;
 import org.apache.doris.catalog.Type;
+import org.apache.doris.datasource.jdbc.util.JdbcFieldSchema;
 
-import java.sql.Connection;
-import java.sql.SQLException;
+import java.util.Optional;
 
 public class JdbcTrinoClient extends JdbcClient {
     protected JdbcTrinoClient(JdbcClientConfig jdbcClientConfig) {
@@ -31,18 +30,8 @@ public class JdbcTrinoClient extends JdbcClient {
     }
 
     @Override
-    protected String getDatabaseQuery() {
-        return "SHOW SCHEMAS";
-    }
-
-    @Override
-    protected String getCatalogName(Connection conn) throws SQLException {
-        return conn.getCatalog();
-    }
-
-    @Override
     protected Type jdbcTypeToDoris(JdbcFieldSchema fieldSchema) {
-        String trinoType = fieldSchema.getDataTypeName();
+        String trinoType = fieldSchema.getDataTypeName().orElse("unknown");
         switch (trinoType) {
             case "integer":
                 return Type.INT;
@@ -60,6 +49,8 @@ public class JdbcTrinoClient extends JdbcClient {
                 return Type.BOOLEAN;
             case "date":
                 return ScalarType.createDateV2Type();
+            case "json":
+                return ScalarType.createStringType();
             default:
                 break;
         }
@@ -73,13 +64,11 @@ public class JdbcTrinoClient extends JdbcClient {
         }
 
         if (trinoType.startsWith("char")) {
-            ScalarType charType = ScalarType.createType(PrimitiveType.CHAR);
-            charType.setLength(fieldSchema.columnSize);
-            return charType;
+            return ScalarType.createCharType(fieldSchema.requiredColumnSize());
         }
 
         if (trinoType.startsWith("timestamp")) {
-            int scale = fieldSchema.getDecimalDigits();
+            int scale = fieldSchema.getDecimalDigits().orElse(0);
             if (scale > 6) {
                 scale = 6;
             }
@@ -88,12 +77,12 @@ public class JdbcTrinoClient extends JdbcClient {
 
         if (trinoType.startsWith("array")) {
             String trinoArrType = trinoType.substring(6, trinoType.length() - 1);
-            fieldSchema.setDataTypeName(trinoArrType);
+            fieldSchema.setDataTypeName(Optional.of(trinoArrType));
             Type type = jdbcTypeToDoris(fieldSchema);
             return ArrayType.create(type, true);
         }
 
-        if (trinoType.startsWith("varchar")) {
+        if (trinoType.startsWith("varchar") || trinoType.startsWith("time")) {
             return ScalarType.createStringType();
         }
 

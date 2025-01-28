@@ -17,32 +17,37 @@
 
 package org.apache.doris.nereids.trees.plans.physical;
 
-import org.apache.doris.common.IdGenerator;
-import org.apache.doris.nereids.CascadesContext;
 import org.apache.doris.nereids.memo.GroupExpression;
-import org.apache.doris.nereids.processor.post.RuntimeFilterContext;
-import org.apache.doris.nereids.processor.post.RuntimeFilterGenerator;
+import org.apache.doris.nereids.properties.DataTrait;
 import org.apache.doris.nereids.properties.LogicalProperties;
+import org.apache.doris.nereids.properties.OrderKey;
 import org.apache.doris.nereids.properties.PhysicalProperties;
 import org.apache.doris.nereids.properties.RequireProperties;
 import org.apache.doris.nereids.properties.RequirePropertiesSupplier;
+import org.apache.doris.nereids.trees.expressions.AggregateExpression;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.NamedExpression;
 import org.apache.doris.nereids.trees.expressions.Slot;
+import org.apache.doris.nereids.trees.expressions.VirtualSlotReference;
+import org.apache.doris.nereids.trees.expressions.functions.agg.AggregateFunction;
 import org.apache.doris.nereids.trees.expressions.functions.agg.AggregateParam;
+import org.apache.doris.nereids.trees.expressions.functions.agg.Count;
+import org.apache.doris.nereids.trees.expressions.functions.agg.Ndv;
+import org.apache.doris.nereids.trees.expressions.functions.agg.NullableAggregateFunction;
 import org.apache.doris.nereids.trees.plans.AggMode;
 import org.apache.doris.nereids.trees.plans.AggPhase;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.PlanType;
 import org.apache.doris.nereids.trees.plans.algebra.Aggregate;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
+import org.apache.doris.nereids.util.ExpressionUtils;
+import org.apache.doris.nereids.util.MutableState;
 import org.apache.doris.nereids.util.Utils;
-import org.apache.doris.planner.RuntimeFilterId;
 import org.apache.doris.statistics.Statistics;
-import org.apache.doris.thrift.TRuntimeFilterType;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
 
 import java.util.List;
 import java.util.Objects;
@@ -97,8 +102,9 @@ public class PhysicalHashAggregate<CHILD_TYPE extends Plan> extends PhysicalUnar
         super(PlanType.PHYSICAL_HASH_AGGREGATE, groupExpression, logicalProperties, child);
         this.groupByExpressions = ImmutableList.copyOf(
                 Objects.requireNonNull(groupByExpressions, "groupByExpressions cannot be null"));
-        this.outputExpressions = ImmutableList.copyOf(
-                Objects.requireNonNull(outputExpressions, "outputExpressions cannot be null"));
+        this.outputExpressions = adjustNullableForOutputs(
+                Objects.requireNonNull(outputExpressions, "outputExpressions cannot be null"),
+                groupByExpressions.isEmpty());
         this.partitionExpressions = Objects.requireNonNull(
                 partitionExpressions, "partitionExpressions cannot be null");
         this.aggregateParam = Objects.requireNonNull(aggregateParam, "aggregate param cannot be null");
@@ -124,8 +130,9 @@ public class PhysicalHashAggregate<CHILD_TYPE extends Plan> extends PhysicalUnar
                 child);
         this.groupByExpressions = ImmutableList.copyOf(
                 Objects.requireNonNull(groupByExpressions, "groupByExpressions cannot be null"));
-        this.outputExpressions = ImmutableList.copyOf(
-                Objects.requireNonNull(outputExpressions, "outputExpressions cannot be null"));
+        this.outputExpressions = adjustNullableForOutputs(
+                Objects.requireNonNull(outputExpressions, "outputExpressions cannot be null"),
+                groupByExpressions.isEmpty());
         this.partitionExpressions = Objects.requireNonNull(
                 partitionExpressions, "partitionExpressions cannot be null");
         this.aggregateParam = Objects.requireNonNull(aggregateParam, "aggregate param cannot be null");
@@ -194,15 +201,18 @@ public class PhysicalHashAggregate<CHILD_TYPE extends Plan> extends PhysicalUnar
 
     @Override
     public String toString() {
+        TopnPushInfo topnPushInfo = (TopnPushInfo) getMutableState(
+                MutableState.KEY_PUSH_TOPN_TO_AGG).orElseGet(() -> null);
         return Utils.toSqlString("PhysicalHashAggregate[" + id.asInt() + "]" + getGroupIdWithPrefix(),
+                "stats", statistics,
                 "aggPhase", aggregateParam.aggPhase,
                 "aggMode", aggregateParam.aggMode,
                 "maybeUseStreaming", maybeUsingStream,
                 "groupByExpr", groupByExpressions,
                 "outputExpr", outputExpressions,
                 "partitionExpr", partitionExpressions,
-                "requireProperties", requireProperties,
-                "stats", statistics
+                "topnFilter", topnPushInfo != null,
+                "topnPushDown", getMutableState(MutableState.KEY_PUSH_TOPN_TO_AGG).isPresent()
         );
     }
 
@@ -229,6 +239,13 @@ public class PhysicalHashAggregate<CHILD_TYPE extends Plan> extends PhysicalUnar
     public int hashCode() {
         return Objects.hash(groupByExpressions, outputExpressions, partitionExpressions,
                 aggregateParam, maybeUsingStream, requireProperties);
+    }
+
+    public PhysicalHashAggregate<Plan> withGroupByExpressions(List<Expression> newGroupByExpressions) {
+        return new PhysicalHashAggregate<>(newGroupByExpressions, outputExpressions, partitionExpressions,
+                aggregateParam, maybeUsingStream, groupExpression, getLogicalProperties(),
+                requireProperties, physicalProperties, statistics,
+                child());
     }
 
     @Override
@@ -292,30 +309,6 @@ public class PhysicalHashAggregate<CHILD_TYPE extends Plan> extends PhysicalUnar
     }
 
     @Override
-    public boolean pushDownRuntimeFilter(CascadesContext context, IdGenerator<RuntimeFilterId> generator,
-            AbstractPhysicalJoin<?, ?> builderNode, Expression src, Expression probeExpr,
-            TRuntimeFilterType type, long buildSideNdv, int exprOrder) {
-        RuntimeFilterContext ctx = context.getRuntimeFilterContext();
-        // currently, we can ensure children in the two side are corresponding to the equal_to's.
-        // so right maybe an expression and left is a slot
-        Slot probeSlot = RuntimeFilterGenerator.checkTargetChild(probeExpr);
-
-        // aliasTransMap doesn't contain the key, means that the path from the scan to the join
-        // contains join with denied join type. for example: a left join b on a.id = b.id
-        if (!RuntimeFilterGenerator.checkPushDownPreconditionsForJoin(builderNode, ctx, probeSlot)) {
-            return false;
-        }
-        PhysicalRelation scan = ctx.getAliasTransferPair(probeSlot).first;
-        if (!RuntimeFilterGenerator.checkPushDownPreconditionsForRelation(this, scan)) {
-            return false;
-        }
-
-        AbstractPhysicalPlan child = (AbstractPhysicalPlan) child(0);
-        return child.pushDownRuntimeFilter(context, generator, builderNode,
-                src, probeExpr, type, buildSideNdv, exprOrder);
-    }
-
-    @Override
     public List<Slot> computeOutput() {
         return outputExpressions.stream()
                 .map(NamedExpression::toSlot)
@@ -328,5 +321,156 @@ public class PhysicalHashAggregate<CHILD_TYPE extends Plan> extends PhysicalUnar
                 aggregateParam, maybeUsingStream, groupExpression, null,
                 requireProperties, physicalProperties, statistics,
                 child());
+    }
+
+    /**
+     * used to push limit down to localAgg
+     */
+    public static class TopnPushInfo {
+        public List<OrderKey> orderkeys;
+        public long limit;
+
+        public TopnPushInfo(List<OrderKey> orderkeys, long limit) {
+            this.orderkeys = ImmutableList.copyOf(orderkeys);
+            this.limit = limit;
+        }
+
+        @Override
+        public String toString() {
+            StringBuilder builder = new StringBuilder("[");
+            builder.append("orderkeys=").append(orderkeys);
+            builder.append(", limit=").append(limit);
+            builder.append("]");
+            return builder.toString();
+        }
+    }
+
+    public TopnPushInfo getTopnPushInfo() {
+        Optional<Object> obj = getMutableState(MutableState.KEY_PUSH_TOPN_TO_AGG);
+        if (obj.isPresent() && obj.get() instanceof TopnPushInfo) {
+            return (TopnPushInfo) obj.get();
+        }
+        return null;
+    }
+
+    public PhysicalHashAggregate<CHILD_TYPE> setTopnPushInfo(TopnPushInfo topnPushInfo) {
+        setMutableState(MutableState.KEY_PUSH_TOPN_TO_AGG, topnPushInfo);
+        return this;
+    }
+
+    /**
+     * sql: select sum(distinct c1) from t;
+     * assume c1 is not null, because there is no group by
+     * sum(distinct c1)'s nullable is alwasNullable in rewritten phase.
+     * But in implementation phase, we may create 3 phase agg with group by key c1.
+     * And the sum(distinct c1)'s nullability should be changed depending on if there is any group by expressions.
+     * This pr update the agg function's nullability accordingly
+     */
+    private List<NamedExpression> adjustNullableForOutputs(List<NamedExpression> outputs, boolean alwaysNullable) {
+        return ExpressionUtils.rewriteDownShortCircuit(outputs, output -> {
+            if (output instanceof AggregateExpression) {
+                AggregateFunction function = ((AggregateExpression) output).getFunction();
+                if (function instanceof NullableAggregateFunction
+                        && ((NullableAggregateFunction) function).isAlwaysNullable() != alwaysNullable) {
+                    AggregateParam param = ((AggregateExpression) output).getAggregateParam();
+                    Expression child = ((AggregateExpression) output).child();
+                    AggregateFunction newFunction = ((NullableAggregateFunction) function)
+                            .withAlwaysNullable(alwaysNullable);
+                    if (function == child) {
+                        // function is also child
+                        child = newFunction;
+                    }
+                    return new AggregateExpression(newFunction, param, child);
+                }
+            }
+            return output;
+        });
+    }
+
+    private boolean isUniqueGroupByUnique(NamedExpression namedExpression) {
+        if (namedExpression.children().size() != 1) {
+            return false;
+        }
+        Expression agg = namedExpression.child(0);
+        return ExpressionUtils.isInjectiveAgg(agg)
+                && child().getLogicalProperties().getTrait().isUniqueAndNotNull(agg.getInputSlots());
+    }
+
+    private boolean isUniformGroupByUnique(NamedExpression namedExpression) {
+        if (namedExpression.children().size() != 1) {
+            return false;
+        }
+        Expression agg = namedExpression.child(0);
+        return agg instanceof Count || agg instanceof Ndv;
+    }
+
+    @Override
+    public void computeUnique(DataTrait.Builder builder) {
+        if (groupByExpressions.stream().anyMatch(s -> s instanceof VirtualSlotReference)) {
+            // roll up may generate new data
+            return;
+        }
+        DataTrait childFd = child(0).getLogicalProperties().getTrait();
+        ImmutableSet<Slot> groupByKeys = groupByExpressions.stream()
+                .map(s -> (Slot) s)
+                .collect(ImmutableSet.toImmutableSet());
+        // when group by all tuples, the result only have one row
+        if (groupByExpressions.isEmpty() || childFd.isUniformAndNotNull(groupByKeys)) {
+            getOutput().forEach(builder::addUniqueSlot);
+            return;
+        }
+
+        // propagate all unique slots
+        builder.addUniqueSlot(childFd);
+
+        // group by keys is unique
+        builder.addUniqueSlot(groupByKeys);
+
+        // group by unique may has unique aggregate result
+        if (childFd.isUniqueAndNotNull(groupByKeys)) {
+            for (NamedExpression namedExpression : getOutputExpressions()) {
+                if (isUniqueGroupByUnique(namedExpression)) {
+                    builder.addUniqueSlot(namedExpression.toSlot());
+                }
+            }
+        }
+    }
+
+    @Override
+    public void computeUniform(DataTrait.Builder builder) {
+        // always propagate uniform
+        DataTrait childFd = child(0).getLogicalProperties().getTrait();
+        builder.addUniformSlot(childFd);
+
+        if (groupByExpressions.stream().anyMatch(s -> s instanceof VirtualSlotReference)) {
+            // roll up may generate new data
+            return;
+        }
+        ImmutableSet<Slot> groupByKeys = groupByExpressions.stream()
+                .map(s -> (Slot) s)
+                .collect(ImmutableSet.toImmutableSet());
+        // when group by all tuples, the result only have one row
+        if (groupByExpressions.isEmpty() || childFd.isUniformAndNotNull(groupByKeys)) {
+            getOutput().forEach(builder::addUniformSlot);
+            return;
+        }
+
+        if (childFd.isUniqueAndNotNull(groupByKeys)) {
+            for (NamedExpression namedExpression : getOutputExpressions()) {
+                if (isUniformGroupByUnique(namedExpression)) {
+                    builder.addUniformSlot(namedExpression.toSlot());
+                }
+            }
+        }
+    }
+
+    @Override
+    public void computeEqualSet(DataTrait.Builder builder) {
+        builder.addEqualSet(child().getLogicalProperties().getTrait());
+    }
+
+    @Override
+    public void computeFd(DataTrait.Builder builder) {
+        builder.addFuncDepsDG(child().getLogicalProperties().getTrait());
     }
 }

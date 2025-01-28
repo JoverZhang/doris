@@ -138,7 +138,7 @@ public class DiskRebalanceTest {
 
     private void generateStatisticsAndPathSlots() {
         LoadStatisticForTag loadStatistic = new LoadStatisticForTag(Tag.DEFAULT_BACKEND_TAG, systemInfoService,
-                invertedIndex);
+                invertedIndex, null);
         loadStatistic.init();
         statisticMap = Maps.newHashMap();
         statisticMap.put(Tag.DEFAULT_BACKEND_TAG, loadStatistic);
@@ -171,7 +171,7 @@ public class DiskRebalanceTest {
 
         olapTable = new OlapTable(2, "fake table", new ArrayList<>(), KeysType.DUP_KEYS,
                 new RangePartitionInfo(), new HashDistributionInfo());
-        db.createTable(olapTable);
+        db.registerTable(olapTable);
 
         // 1 table, 3 partitions p0,p1,p2
         MaterializedIndex materializedIndex = new MaterializedIndex(olapTable.getId(), null);
@@ -214,7 +214,7 @@ public class DiskRebalanceTest {
 
         olapTable = new OlapTable(2, "fake table", new ArrayList<>(), KeysType.DUP_KEYS,
                 new RangePartitionInfo(), new HashDistributionInfo());
-        db.createTable(olapTable);
+        db.registerTable(olapTable);
 
         // 1 table, 3 partitions p0,p1,p2
         MaterializedIndex materializedIndex = new MaterializedIndex(olapTable.getId(), null);

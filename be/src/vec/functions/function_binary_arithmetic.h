@@ -42,7 +42,6 @@
 #include "vec/utils/template_helpers.hpp"
 
 namespace doris::vectorized {
-
 // Arithmetic operations: +, -, *, |, &, ^, ~
 // need implement apply(a, b)
 
@@ -166,7 +165,7 @@ struct BinaryOperationImpl {
 
     static ColumnPtr adapt_normal_vector_constant(ColumnPtr column_left, B b) {
         auto column_left_ptr =
-                check_and_get_column<typename Base::Traits::ColumnVectorA>(column_left);
+                check_and_get_column<typename Base::Traits::ColumnVectorA>(column_left.get());
         auto column_result = Base::ColumnVectorResult::create(column_left->size());
         DCHECK(column_left_ptr != nullptr);
 
@@ -183,7 +182,7 @@ struct BinaryOperationImpl {
 
     static ColumnPtr adapt_normal_constant_vector(A a, ColumnPtr column_right) {
         auto column_right_ptr =
-                check_and_get_column<typename Base::Traits::ColumnVectorB>(column_right);
+                check_and_get_column<typename Base::Traits::ColumnVectorB>(column_right.get());
         auto column_result = Base::ColumnVectorResult::create(column_right->size());
         DCHECK(column_right_ptr != nullptr);
 
@@ -200,9 +199,9 @@ struct BinaryOperationImpl {
 
     static ColumnPtr adapt_normal_vector_vector(ColumnPtr column_left, ColumnPtr column_right) {
         auto column_left_ptr =
-                check_and_get_column<typename Base::Traits::ColumnVectorA>(column_left);
+                check_and_get_column<typename Base::Traits::ColumnVectorA>(column_left.get());
         auto column_right_ptr =
-                check_and_get_column<typename Base::Traits::ColumnVectorB>(column_right);
+                check_and_get_column<typename Base::Traits::ColumnVectorB>(column_right.get());
 
         auto column_result = Base::ColumnVectorResult::create(column_left->size());
         DCHECK(column_left_ptr != nullptr && column_right_ptr != nullptr);
@@ -220,12 +219,17 @@ struct BinaryOperationImpl {
     }
 };
 
+#define THROW_DECIMAL_BINARY_OP_OVERFLOW_EXCEPTION(left_value, op_name, right_value, result_value, \
+                                                   result_type_name)                               \
+    throw Exception(ErrorCode::ARITHMETIC_OVERFLOW_ERRROR,                                         \
+                    "Arithmetic overflow: {} {} {} = {}, result type: {}", left_value, op_name,    \
+                    right_value, result_value, result_type_name)
 /// Binary operations for Decimals need scale args
 /// +|- scale one of args (which scale factor is not 1). ScaleR = oneof(Scale1, Scale2);
 /// *   no agrs scale. ScaleR = Scale1 + Scale2;
 /// /   first arg scale. ScaleR = Scale1 (scale_a = DecimalType<B>::get_scale()).
-template <typename LeftDataType, typename RightDataType,
-          template <typename, typename> typename Operation, typename ResultType,
+template <typename LeftDataType, typename RightDataType, typename ResultDataType,
+          template <typename, typename> typename Operation, typename Name, typename ResultType,
           bool is_to_null_type, bool check_overflow>
 struct DecimalBinaryOperation {
     using A = typename LeftDataType::FieldType;
@@ -246,8 +250,9 @@ private:
 
     static void vector_vector(const typename Traits::ArrayA::value_type* __restrict a,
                               const typename Traits::ArrayB::value_type* __restrict b,
-                              typename ArrayC::value_type* c, size_t size,
-                              const ResultType& max_result_number,
+                              typename ArrayC::value_type* c, const LeftDataType& type_left,
+                              const RightDataType& type_right, const ResultDataType& type_result,
+                              size_t size, const ResultType& max_result_number,
                               const ResultType& scale_diff_multiplier) {
         static_assert(OpTraits::is_plus_minus || OpTraits::is_multiply);
         if constexpr (OpTraits::is_multiply && IsDecimalV2<A> && IsDecimalV2<B> &&
@@ -259,7 +264,8 @@ private:
                     [&](auto need_adjust_scale) {
                         for (size_t i = 0; i < size; i++) {
                             c[i] = typename ArrayC::value_type(apply<need_adjust_scale>(
-                                    a[i], b[i], max_result_number, scale_diff_multiplier));
+                                    a[i], b[i], type_left, type_right, type_result,
+                                    max_result_number, scale_diff_multiplier));
                         }
                     },
                     make_bool_variant(need_adjust_scale && check_overflow));
@@ -310,8 +316,9 @@ private:
     }
 
     static void vector_constant(const typename Traits::ArrayA::value_type* __restrict a, B b,
-                                typename ArrayC::value_type* c, size_t size,
-                                const ResultType& max_result_number,
+                                typename ArrayC::value_type* c, const LeftDataType& type_left,
+                                const RightDataType& type_right, const ResultDataType& type_result,
+                                size_t size, const ResultType& max_result_number,
                                 const ResultType& scale_diff_multiplier) {
         static_assert(!OpTraits::is_division);
 
@@ -320,7 +327,8 @@ private:
                 [&](auto need_adjust_scale) {
                     for (size_t i = 0; i < size; ++i) {
                         c[i] = typename ArrayC::value_type(apply<need_adjust_scale>(
-                                a[i], b, max_result_number, scale_diff_multiplier));
+                                a[i], b, type_left, type_right, type_result, max_result_number,
+                                scale_diff_multiplier));
                     }
                 },
                 make_bool_variant(need_adjust_scale));
@@ -343,15 +351,17 @@ private:
     }
 
     static void constant_vector(A a, const typename Traits::ArrayB::value_type* __restrict b,
-                                typename ArrayC::value_type* c, size_t size,
-                                const ResultType& max_result_number,
+                                typename ArrayC::value_type* c, const LeftDataType& type_left,
+                                const RightDataType& type_right, const ResultDataType& type_result,
+                                size_t size, const ResultType& max_result_number,
                                 const ResultType& scale_diff_multiplier) {
         bool need_adjust_scale = scale_diff_multiplier.value > 1;
         std::visit(
                 [&](auto need_adjust_scale) {
                     for (size_t i = 0; i < size; ++i) {
                         c[i] = typename ArrayC::value_type(apply<need_adjust_scale>(
-                                a, b[i], max_result_number, scale_diff_multiplier));
+                                a, b[i], type_left, type_right, type_result, max_result_number,
+                                scale_diff_multiplier));
                     }
                 },
                 make_bool_variant(need_adjust_scale));
@@ -373,9 +383,13 @@ private:
         }
     }
 
-    static ResultType constant_constant(A a, B b, const ResultType& max_result_number,
+    static ResultType constant_constant(A a, B b, const LeftDataType& type_left,
+                                        const RightDataType& type_right,
+                                        const ResultDataType& type_result,
+                                        const ResultType& max_result_number,
                                         const ResultType& scale_diff_multiplier) {
-        return ResultType(apply<true>(a, b, max_result_number, scale_diff_multiplier));
+        return ResultType(apply<true>(a, b, type_left, type_right, type_result, max_result_number,
+                                      scale_diff_multiplier));
     }
 
     static ResultType constant_constant(A a, B b, UInt8& is_null,
@@ -393,15 +407,23 @@ private:
     }
 
 public:
-    static ColumnPtr adapt_decimal_constant_constant(A a, B b, const ResultType& max_result_number,
+    static ColumnPtr adapt_decimal_constant_constant(A a, B b, const LeftDataType& type_left,
+                                                     const RightDataType& type_right,
+                                                     const ResultType& max_result_number,
                                                      const ResultType& scale_diff_multiplier,
                                                      DataTypePtr res_data_type) {
+        auto type_result =
+                assert_cast<const DataTypeDecimal<ResultType>&, TypeCheckOnRelease::DISABLE>(
+                        *res_data_type);
         auto column_result = ColumnDecimal<ResultType>::create(
-                1, assert_cast<const DataTypeDecimal<ResultType>&>(*res_data_type).get_scale());
+                1, assert_cast<const DataTypeDecimal<ResultType>&, TypeCheckOnRelease::DISABLE>(
+                           *res_data_type)
+                           .get_scale());
 
         if constexpr (check_overflow && !is_to_null_type &&
                       ((!OpTraits::is_multiply && !OpTraits::is_plus_minus))) {
-            LOG(FATAL) << "Invalid function type!";
+            throw doris::Exception(ErrorCode::INTERNAL_ERROR,
+                                   "adapt_decimal_constant_constant Invalid function type!");
             return column_result;
         } else if constexpr (is_to_null_type) {
             auto null_map = ColumnUInt8::create(1, 0);
@@ -410,24 +432,34 @@ public:
             return ColumnNullable::create(std::move(column_result), std::move(null_map));
         } else {
             column_result->get_element(0) =
-                    constant_constant(a, b, max_result_number, scale_diff_multiplier);
+                    constant_constant(a, b, type_left, type_right, type_result, max_result_number,
+                                      scale_diff_multiplier);
             return column_result;
         }
     }
 
     static ColumnPtr adapt_decimal_vector_constant(ColumnPtr column_left, B b,
+                                                   const LeftDataType& type_left,
+                                                   const RightDataType& type_right,
                                                    const ResultType& max_result_number,
                                                    const ResultType& scale_diff_multiplier,
                                                    DataTypePtr res_data_type) {
-        auto column_left_ptr = check_and_get_column<typename Traits::ColumnVectorA>(column_left);
+        auto type_result =
+                assert_cast<const DataTypeDecimal<ResultType>&, TypeCheckOnRelease::DISABLE>(
+                        *res_data_type);
+        auto column_left_ptr =
+                check_and_get_column<typename Traits::ColumnVectorA>(column_left.get());
         auto column_result = ColumnDecimal<ResultType>::create(
                 column_left->size(),
-                assert_cast<const DataTypeDecimal<ResultType>&>(*res_data_type).get_scale());
+                assert_cast<const DataTypeDecimal<ResultType>&, TypeCheckOnRelease::DISABLE>(
+                        *res_data_type)
+                        .get_scale());
         DCHECK(column_left_ptr != nullptr);
 
         if constexpr (check_overflow && !is_to_null_type &&
                       ((!OpTraits::is_multiply && !OpTraits::is_plus_minus))) {
-            LOG(FATAL) << "Invalid function type!";
+            throw doris::Exception(ErrorCode::INTERNAL_ERROR,
+                                   "adapt_decimal_vector_constant Invalid function type!");
             return column_result;
         } else if constexpr (is_to_null_type) {
             auto null_map = ColumnUInt8::create(column_left->size(), 0);
@@ -436,24 +468,34 @@ public:
             return ColumnNullable::create(std::move(column_result), std::move(null_map));
         } else {
             vector_constant(column_left_ptr->get_data().data(), b, column_result->get_data().data(),
-                            column_left->size(), max_result_number, scale_diff_multiplier);
+                            type_left, type_right, type_result, column_left->size(),
+                            max_result_number, scale_diff_multiplier);
             return column_result;
         }
     }
 
     static ColumnPtr adapt_decimal_constant_vector(A a, ColumnPtr column_right,
+                                                   const LeftDataType& type_left,
+                                                   const RightDataType& type_right,
                                                    const ResultType& max_result_number,
                                                    const ResultType& scale_diff_multiplier,
                                                    DataTypePtr res_data_type) {
-        auto column_right_ptr = check_and_get_column<typename Traits::ColumnVectorB>(column_right);
+        auto type_result =
+                assert_cast<const DataTypeDecimal<ResultType>&, TypeCheckOnRelease::DISABLE>(
+                        *res_data_type);
+        auto column_right_ptr =
+                check_and_get_column<typename Traits::ColumnVectorB>(column_right.get());
         auto column_result = ColumnDecimal<ResultType>::create(
                 column_right->size(),
-                assert_cast<const DataTypeDecimal<ResultType>&>(*res_data_type).get_scale());
+                assert_cast<const DataTypeDecimal<ResultType>&, TypeCheckOnRelease::DISABLE>(
+                        *res_data_type)
+                        .get_scale());
         DCHECK(column_right_ptr != nullptr);
 
         if constexpr (check_overflow && !is_to_null_type &&
                       ((!OpTraits::is_multiply && !OpTraits::is_plus_minus))) {
-            LOG(FATAL) << "Invalid function type!";
+            throw doris::Exception(ErrorCode::INTERNAL_ERROR,
+                                   "adapt_decimal_constant_vector Invalid function type!");
             return column_result;
         } else if constexpr (is_to_null_type) {
             auto null_map = ColumnUInt8::create(column_right->size(), 0);
@@ -463,18 +505,22 @@ public:
             return ColumnNullable::create(std::move(column_result), std::move(null_map));
         } else {
             constant_vector(a, column_right_ptr->get_data().data(),
-                            column_result->get_data().data(), column_right->size(),
-                            max_result_number, scale_diff_multiplier);
+                            column_result->get_data().data(), type_left, type_right, type_result,
+                            column_right->size(), max_result_number, scale_diff_multiplier);
             return column_result;
         }
     }
 
     static ColumnPtr adapt_decimal_vector_vector(ColumnPtr column_left, ColumnPtr column_right,
+                                                 const LeftDataType& type_left,
+                                                 const RightDataType& type_right,
                                                  const ResultType& max_result_number,
                                                  const ResultType& scale_diff_multiplier,
                                                  DataTypePtr res_data_type) {
-        auto column_left_ptr = check_and_get_column<typename Traits::ColumnVectorA>(column_left);
-        auto column_right_ptr = check_and_get_column<typename Traits::ColumnVectorB>(column_right);
+        auto column_left_ptr =
+                check_and_get_column<typename Traits::ColumnVectorA>(column_left.get());
+        auto column_right_ptr =
+                check_and_get_column<typename Traits::ColumnVectorB>(column_right.get());
 
         const auto& type_result = assert_cast<const DataTypeDecimal<ResultType>&>(*res_data_type);
         auto column_result =
@@ -483,7 +529,8 @@ public:
 
         if constexpr (check_overflow && !is_to_null_type &&
                       ((!OpTraits::is_multiply && !OpTraits::is_plus_minus))) {
-            LOG(FATAL) << "Invalid function type!";
+            throw doris::Exception(ErrorCode::INTERNAL_ERROR,
+                                   "adapt_decimal_vector_vector Invalid function type!");
             return column_result;
         } else if constexpr (is_to_null_type) {
             // function divide, modulo and pmod
@@ -494,8 +541,8 @@ public:
             return ColumnNullable::create(std::move(column_result), std::move(null_map));
         } else {
             vector_vector(column_left_ptr->get_data().data(), column_right_ptr->get_data().data(),
-                          column_result->get_data().data(), column_left->size(), max_result_number,
-                          scale_diff_multiplier);
+                          column_result->get_data().data(), type_left, type_right, type_result,
+                          column_left->size(), max_result_number, scale_diff_multiplier);
             return column_result;
         }
     }
@@ -504,19 +551,25 @@ private:
     /// there's implicit type conversion here
     template <bool need_adjust_scale>
     static ALWAYS_INLINE NativeResultType apply(NativeResultType a, NativeResultType b,
+                                                const LeftDataType& type_left,
+                                                const RightDataType& type_right,
+                                                const ResultDataType& type_result,
                                                 const ResultType& max_result_number,
                                                 const ResultType& scale_diff_multiplier) {
         static_assert(OpTraits::is_plus_minus || OpTraits::is_multiply);
         if constexpr (IsDecimalV2<B> || IsDecimalV2<A>) {
             // Now, Doris only support decimal +-*/ decimal.
             if constexpr (check_overflow) {
-                auto res = Op::template apply(DecimalV2Value(a), DecimalV2Value(b)).value();
+                auto res = Op::apply(DecimalV2Value(a), DecimalV2Value(b)).value();
                 if (res > max_result_number.value || res < -max_result_number.value) {
-                    throw Exception(ErrorCode::ARITHMETIC_OVERFLOW_ERRROR, "Arithmetic overflow");
+                    THROW_DECIMAL_BINARY_OP_OVERFLOW_EXCEPTION(
+                            DecimalV2Value(a).to_string(), Name::name,
+                            DecimalV2Value(b).to_string(), DecimalV2Value(res).to_string(),
+                            ResultDataType {}.get_name());
                 }
                 return res;
             } else {
-                return Op::template apply(DecimalV2Value(a), DecimalV2Value(b)).value();
+                return Op::apply(DecimalV2Value(a), DecimalV2Value(b)).value();
             }
         } else {
             NativeResultType res;
@@ -524,8 +577,13 @@ private:
                 // TODO handle overflow gracefully
                 if (UNLIKELY(Op::template apply<NativeResultType>(a, b, res))) {
                     if constexpr (OpTraits::is_plus_minus) {
-                        throw Exception(ErrorCode::ARITHMETIC_OVERFLOW_ERRROR,
-                                        "Arithmetic overflow");
+                        auto result_str =
+                                DataTypeDecimal<Decimal256> {BeConsts::MAX_DECIMAL256_PRECISION,
+                                                             type_result.get_scale()}
+                                        .to_string(Decimal256(res));
+                        THROW_DECIMAL_BINARY_OP_OVERFLOW_EXCEPTION(
+                                type_left.to_string(A(a)), Name::name, type_right.to_string(B(b)),
+                                result_str, type_result.get_name());
                     }
                     // multiply
                     if constexpr (std::is_same_v<NativeResultType, __int128>) {
@@ -543,14 +601,24 @@ private:
                         // check if final result is overflow
                         if (res256 > wide::Int256(max_result_number.value) ||
                             res256 < wide::Int256(-max_result_number.value)) {
-                            throw Exception(ErrorCode::ARITHMETIC_OVERFLOW_ERRROR,
-                                            "Arithmetic overflow");
+                            auto result_str =
+                                    DataTypeDecimal<Decimal256> {BeConsts::MAX_DECIMAL256_PRECISION,
+                                                                 type_result.get_scale()}
+                                            .to_string(Decimal256(res256));
+                            THROW_DECIMAL_BINARY_OP_OVERFLOW_EXCEPTION(
+                                    type_left.to_string(A(a)), Name::name,
+                                    type_right.to_string(B(b)), result_str, type_result.get_name());
                         } else {
                             res = res256;
                         }
                     } else {
-                        throw Exception(ErrorCode::ARITHMETIC_OVERFLOW_ERRROR,
-                                        "Arithmetic overflow");
+                        auto result_str =
+                                DataTypeDecimal<Decimal256> {BeConsts::MAX_DECIMAL256_PRECISION,
+                                                             type_result.get_scale()}
+                                        .to_string(Decimal256(res));
+                        THROW_DECIMAL_BINARY_OP_OVERFLOW_EXCEPTION(
+                                type_left.to_string(A(a)), Name::name, type_right.to_string(B(b)),
+                                result_str, type_result.get_name());
                     }
                 } else {
                     // round to final result precision
@@ -564,8 +632,13 @@ private:
                         }
                     }
                     if (res > max_result_number.value || res < -max_result_number.value) {
-                        throw Exception(ErrorCode::ARITHMETIC_OVERFLOW_ERRROR,
-                                        "Arithmetic overflow");
+                        auto result_str =
+                                DataTypeDecimal<Decimal256> {BeConsts::MAX_DECIMAL256_PRECISION,
+                                                             type_result.get_scale()}
+                                        .to_string(Decimal256(res));
+                        THROW_DECIMAL_BINARY_OP_OVERFLOW_EXCEPTION(
+                                type_left.to_string(A(a)), Name::name, type_right.to_string(B(b)),
+                                result_str, type_result.get_name());
                     }
                 }
                 return res;
@@ -591,25 +664,31 @@ private:
         if constexpr (IsDecimalV2<B> || IsDecimalV2<A>) {
             DecimalV2Value l(a);
             DecimalV2Value r(b);
-            auto ans = Op::template apply(l, r, is_null);
+            auto ans = Op::apply(l, r, is_null);
             using ANS_TYPE = std::decay_t<decltype(ans)>;
             if constexpr (check_overflow && OpTraits::is_division) {
                 if constexpr (std::is_same_v<ANS_TYPE, DecimalV2Value>) {
                     if (ans.value() > max_result_number.value ||
                         ans.value() < -max_result_number.value) {
-                        throw Exception(ErrorCode::ARITHMETIC_OVERFLOW_ERRROR,
-                                        "Arithmetic overflow");
+                        THROW_DECIMAL_BINARY_OP_OVERFLOW_EXCEPTION(
+                                DecimalV2Value(a).to_string(), Name::name,
+                                DecimalV2Value(b).to_string(), DecimalV2Value(ans).to_string(),
+                                ResultDataType {}.get_name());
                     }
                 } else if constexpr (IsDecimalNumber<ANS_TYPE>) {
                     if (ans.value > max_result_number.value ||
                         ans.value < -max_result_number.value) {
-                        throw Exception(ErrorCode::ARITHMETIC_OVERFLOW_ERRROR,
-                                        "Arithmetic overflow");
+                        THROW_DECIMAL_BINARY_OP_OVERFLOW_EXCEPTION(
+                                DecimalV2Value(a).to_string(), Name::name,
+                                DecimalV2Value(b).to_string(), DecimalV2Value(ans).to_string(),
+                                ResultDataType {}.get_name());
                     }
                 } else {
                     if (ans > max_result_number.value || ans < -max_result_number.value) {
-                        throw Exception(ErrorCode::ARITHMETIC_OVERFLOW_ERRROR,
-                                        "Arithmetic overflow");
+                        THROW_DECIMAL_BINARY_OP_OVERFLOW_EXCEPTION(
+                                DecimalV2Value(a).to_string(), Name::name,
+                                DecimalV2Value(b).to_string(), DecimalV2Value(ans).to_string(),
+                                ResultDataType {}.get_name());
                     }
                 }
             }
@@ -714,7 +793,7 @@ struct BinaryOperationTraits {
 };
 
 template <typename LeftDataType, typename RightDataType, typename ExpectedResultDataType,
-          template <typename, typename> class Operation, bool is_to_null_type,
+          template <typename, typename> class Operation, typename Name, bool is_to_null_type,
           bool check_overflow_for_decimal>
 struct ConstOrVectorAdapter {
     static constexpr bool result_is_decimal =
@@ -727,8 +806,8 @@ struct ConstOrVectorAdapter {
 
     using OperationImpl = std::conditional_t<
             IsDataTypeDecimal<ResultDataType>,
-            DecimalBinaryOperation<LeftDataType, RightDataType, Operation, ResultType,
-                                   is_to_null_type, check_overflow_for_decimal>,
+            DecimalBinaryOperation<LeftDataType, RightDataType, ResultDataType, Operation, Name,
+                                   ResultType, is_to_null_type, check_overflow_for_decimal>,
             BinaryOperationImpl<A, B, Operation<A, B>, is_to_null_type, ResultType>>;
 
     static ColumnPtr execute(ColumnPtr column_left, ColumnPtr column_right,
@@ -772,8 +851,8 @@ private:
     static ColumnPtr constant_constant(ColumnPtr column_left, ColumnPtr column_right,
                                        const LeftDataType& type_left,
                                        const RightDataType& type_right, DataTypePtr res_data_type) {
-        auto column_left_ptr = check_and_get_column<ColumnConst>(column_left);
-        auto column_right_ptr = check_and_get_column<ColumnConst>(column_right);
+        const auto* column_left_ptr = check_and_get_column<ColumnConst>(column_left.get());
+        const auto* column_right_ptr = check_and_get_column<ColumnConst>(column_right.get());
         DCHECK(column_left_ptr != nullptr && column_right_ptr != nullptr);
 
         ColumnPtr column_result = nullptr;
@@ -785,8 +864,8 @@ private:
 
             column_result = OperationImpl::adapt_decimal_constant_constant(
                     column_left_ptr->template get_value<A>(),
-                    column_right_ptr->template get_value<B>(), max_and_multiplier.first,
-                    max_and_multiplier.second, res_data_type);
+                    column_right_ptr->template get_value<B>(), type_left, type_right,
+                    max_and_multiplier.first, max_and_multiplier.second, res_data_type);
 
         } else {
             column_result = OperationImpl::adapt_normal_constant_constant(
@@ -800,7 +879,7 @@ private:
     static ColumnPtr vector_constant(ColumnPtr column_left, ColumnPtr column_right,
                                      const LeftDataType& type_left, const RightDataType& type_right,
                                      DataTypePtr res_data_type) {
-        auto column_right_ptr = check_and_get_column<ColumnConst>(column_right);
+        const auto* column_right_ptr = check_and_get_column<ColumnConst>(column_right.get());
         DCHECK(column_right_ptr != nullptr);
 
         if constexpr (result_is_decimal) {
@@ -808,8 +887,8 @@ private:
                     assert_cast<const DataTypeDecimal<ResultType>&>(*res_data_type);
             auto max_and_multiplier = get_max_and_multiplier(type_left, type_right, type_result);
             return OperationImpl::adapt_decimal_vector_constant(
-                    column_left->get_ptr(), column_right_ptr->template get_value<B>(),
-                    max_and_multiplier.first, max_and_multiplier.second, res_data_type);
+                    column_left->get_ptr(), column_right_ptr->template get_value<B>(), type_left,
+                    type_right, max_and_multiplier.first, max_and_multiplier.second, res_data_type);
         } else {
             return OperationImpl::adapt_normal_vector_constant(
                     column_left->get_ptr(), column_right_ptr->template get_value<B>());
@@ -819,7 +898,7 @@ private:
     static ColumnPtr constant_vector(ColumnPtr column_left, ColumnPtr column_right,
                                      const LeftDataType& type_left, const RightDataType& type_right,
                                      DataTypePtr res_data_type) {
-        auto column_left_ptr = check_and_get_column<ColumnConst>(column_left);
+        const auto* column_left_ptr = check_and_get_column<ColumnConst>(column_left.get());
         DCHECK(column_left_ptr != nullptr);
 
         if constexpr (result_is_decimal) {
@@ -827,8 +906,8 @@ private:
                     assert_cast<const DataTypeDecimal<ResultType>&>(*res_data_type);
             auto max_and_multiplier = get_max_and_multiplier(type_left, type_right, type_result);
             return OperationImpl::adapt_decimal_constant_vector(
-                    column_left_ptr->template get_value<A>(), column_right->get_ptr(),
-                    max_and_multiplier.first, max_and_multiplier.second, res_data_type);
+                    column_left_ptr->template get_value<A>(), column_right->get_ptr(), type_left,
+                    type_right, max_and_multiplier.first, max_and_multiplier.second, res_data_type);
         } else {
             return OperationImpl::adapt_normal_constant_vector(
                     column_left_ptr->template get_value<A>(), column_right->get_ptr());
@@ -843,8 +922,8 @@ private:
                     assert_cast<const DataTypeDecimal<ResultType>&>(*res_data_type);
             auto max_and_multiplier = get_max_and_multiplier(type_left, type_right, type_result);
             return OperationImpl::adapt_decimal_vector_vector(
-                    column_left->get_ptr(), column_right->get_ptr(), max_and_multiplier.first,
-                    max_and_multiplier.second, res_data_type);
+                    column_left->get_ptr(), column_right->get_ptr(), type_left, type_right,
+                    max_and_multiplier.first, max_and_multiplier.second, res_data_type);
         } else {
             return OperationImpl::adapt_normal_vector_vector(column_left->get_ptr(),
                                                              column_right->get_ptr());
@@ -941,9 +1020,9 @@ public:
                     return false;
                 });
         if (!valid) {
-            LOG(FATAL) << fmt::format("Illegal types {} and {} of arguments of function {}",
-                                      arguments[0]->get_name(), arguments[1]->get_name(),
-                                      get_name());
+            throw Exception(ErrorCode::INTERNAL_ERROR,
+                            "Illegal types {} and {} of arguments of function {}",
+                            arguments[0]->get_name(), arguments[1]->get_name(), get_name());
         }
 
         if constexpr (is_to_null_type) {
@@ -954,7 +1033,7 @@ public:
     }
 
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                        size_t result, size_t input_rows_count) const override {
+                        uint32_t result, size_t input_rows_count) const override {
         auto* left_generic = block.get_by_position(arguments[0]).type.get();
         auto* right_generic = block.get_by_position(arguments[1]).type.get();
         auto* result_generic = block.get_by_position(result).type.get();
@@ -1004,7 +1083,7 @@ public:
                                     LeftDataType, RightDataType,
                                     std::conditional_t<IsDataTypeDecimal<ExpectedResultDataType>,
                                                        ExpectedResultDataType, ResultDataType>,
-                                    Operation, is_to_null_type,
+                                    Operation, Name, is_to_null_type,
                                     true>::execute(block.get_by_position(arguments[0]).column,
                                                    block.get_by_position(arguments[1]).column, left,
                                                    right,
@@ -1016,7 +1095,7 @@ public:
                                     LeftDataType, RightDataType,
                                     std::conditional_t<IsDataTypeDecimal<ExpectedResultDataType>,
                                                        ExpectedResultDataType, ResultDataType>,
-                                    Operation, is_to_null_type,
+                                    Operation, Name, is_to_null_type,
                                     false>::execute(block.get_by_position(arguments[0]).column,
                                                     block.get_by_position(arguments[1]).column,
                                                     left, right,

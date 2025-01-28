@@ -18,15 +18,14 @@
 package org.apache.doris.load;
 
 import org.apache.doris.analysis.OutFileClause;
-import org.apache.doris.analysis.SelectStmt;
 import org.apache.doris.analysis.StatementBase;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.Partition;
-import org.apache.doris.catalog.TableIf.TableType;
 import org.apache.doris.catalog.TabletMeta;
 import org.apache.doris.common.AnalysisException;
+import org.apache.doris.common.Status;
 import org.apache.doris.load.ExportFailMsg.CancelType;
 import org.apache.doris.nereids.analyzer.UnboundRelation;
 import org.apache.doris.nereids.glue.LogicalPlanAdapter;
@@ -37,10 +36,10 @@ import org.apache.doris.qe.QueryState.MysqlStateType;
 import org.apache.doris.qe.StmtExecutor;
 import org.apache.doris.scheduler.exception.JobException;
 import org.apache.doris.scheduler.executor.TransientTaskExecutor;
+import org.apache.doris.thrift.TStatusCode;
 import org.apache.doris.thrift.TUniqueId;
 
 import com.google.common.collect.Lists;
-import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 
 import java.util.List;
@@ -56,7 +55,6 @@ public class ExportTaskExecutor implements TransientTaskExecutor {
 
     ExportJob exportJob;
 
-    @Setter
     Long taskId;
 
     private StmtExecutor stmtExecutor;
@@ -89,8 +87,8 @@ public class ExportTaskExecutor implements TransientTaskExecutor {
             if (isCanceled.get()) {
                 throw new JobException("Export executor has been canceled, task id: {}", taskId);
             }
-            // check the version of tablets
-            if (exportJob.getExportTable().getType() == TableType.OLAP) {
+            // check the version of tablets, skip if the consistency is in partition level.
+            if (exportJob.getExportTable().isManagedTable() && !exportJob.isPartitionConsistency()) {
                 try {
                     Database db = Env.getCurrentEnv().getInternalCatalog().getDbOrAnalysisException(
                             exportJob.getTableName().getDb());
@@ -98,15 +96,10 @@ public class ExportTaskExecutor implements TransientTaskExecutor {
                     table.readLock();
                     try {
                         List<Long> tabletIds;
-                        if (exportJob.getSessionVariables().isEnableNereidsPlanner()) {
-                            LogicalPlanAdapter logicalPlanAdapter = (LogicalPlanAdapter) selectStmtLists.get(idx);
-                            Optional<UnboundRelation> unboundRelation = findUnboundRelation(
-                                    logicalPlanAdapter.getLogicalPlan());
-                            tabletIds = unboundRelation.get().getTabletIds();
-                        } else {
-                            SelectStmt selectStmt = (SelectStmt) selectStmtLists.get(idx);
-                            tabletIds = selectStmt.getTableRefs().get(0).getSampleTabletIds();
-                        }
+                        LogicalPlanAdapter logicalPlanAdapter = (LogicalPlanAdapter) selectStmtLists.get(idx);
+                        Optional<UnboundRelation> unboundRelation = findUnboundRelation(
+                                logicalPlanAdapter.getLogicalPlan());
+                        tabletIds = unboundRelation.get().getTabletIds();
 
                         for (Long tabletId : tabletIds) {
                             TabletMeta tabletMeta = Env.getCurrentEnv().getTabletInvertedIndex().getTabletMeta(
@@ -165,7 +158,7 @@ public class ExportTaskExecutor implements TransientTaskExecutor {
         }
         isCanceled.getAndSet(true);
         if (stmtExecutor != null) {
-            stmtExecutor.cancel();
+            stmtExecutor.cancel(new Status(TStatusCode.CANCELLED, "export task cancelled"));
         }
     }
 
@@ -173,6 +166,8 @@ public class ExportTaskExecutor implements TransientTaskExecutor {
         ConnectContext connectContext = new ConnectContext();
         exportJob.getSessionVariables().setQueryTimeoutS(exportJob.getTimeoutSecond());
         connectContext.setSessionVariable(exportJob.getSessionVariables());
+        // The rollback to the old optimizer is prohibited
+        // Since originStmt is empty, reverting to the old optimizer when the new optimizer is enabled is meaningless.
         connectContext.setEnv(Env.getCurrentEnv());
         connectContext.setDatabase(exportJob.getTableName().getDb());
         connectContext.setQualifiedUser(exportJob.getQualifiedUser());
@@ -188,7 +183,7 @@ public class ExportTaskExecutor implements TransientTaskExecutor {
         OutfileInfo outfileInfo = new OutfileInfo();
         outfileInfo.setFileNumber(resultAttachedInfo.get(OutFileClause.FILE_NUMBER));
         outfileInfo.setTotalRows(resultAttachedInfo.get(OutFileClause.TOTAL_ROWS));
-        outfileInfo.setFileSize(resultAttachedInfo.get(OutFileClause.FILE_SIZE) + "bytes");
+        outfileInfo.setFileSize(resultAttachedInfo.get(OutFileClause.FILE_SIZE));
         outfileInfo.setUrl(resultAttachedInfo.get(OutFileClause.URL));
         return outfileInfo;
     }
@@ -204,5 +199,9 @@ public class ExportTaskExecutor implements TransientTaskExecutor {
             }
         }
         return Optional.empty();
+    }
+
+    public void setTaskId(Long taskId) {
+        this.taskId = taskId;
     }
 }

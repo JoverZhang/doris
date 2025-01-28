@@ -19,25 +19,32 @@ package org.apache.doris.nereids.rules.rewrite;
 
 import org.apache.doris.nereids.rules.Rule;
 import org.apache.doris.nereids.rules.RuleType;
+import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.NamedExpression;
+import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalAggregate;
 import org.apache.doris.nereids.trees.plans.logical.LogicalApply;
 import org.apache.doris.nereids.trees.plans.logical.LogicalFilter;
 import org.apache.doris.nereids.trees.plans.logical.LogicalProject;
+import org.apache.doris.nereids.util.ExpressionUtils;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
 
 import java.util.List;
+import java.util.Set;
 
 /**
  * Swap the order of project and filter under agg in correlated subqueries.
  * <pre>
  * before:
  *              apply
- *         /              \
- * Input(output:b)        agg
+ *         /             \
+ *  Input(output:b)     Filter(this node's existence depends on having clause's existence)
+ *                         |
+ *                        agg
  *                         |
  *                  Project(output:a)
  *                         |
@@ -47,8 +54,10 @@ import java.util.List;
  *
  * after:
  *              apply
- *         /              \
- * Input(output:b)        agg
+ *         /             \
+ *  Input(output:b)     Filter(this node's existence depends on having clause's existence)
+ *                         |
+ *                        agg
  *                         |
  *              Filter(correlated predicate(Input.e = this.f)/Unapply predicate)
  *                         |
@@ -57,27 +66,57 @@ import java.util.List;
  *                         child
  * </pre>
  */
-public class PullUpCorrelatedFilterUnderApplyAggregateProject extends OneRewriteRuleFactory {
+public class PullUpCorrelatedFilterUnderApplyAggregateProject implements RewriteRuleFactory {
     @Override
-    public Rule build() {
-        return logicalApply(any(), logicalAggregate(logicalProject(logicalFilter())))
-                .when(LogicalApply::isCorrelated).then(apply -> {
-                    LogicalAggregate<LogicalProject<LogicalFilter<Plan>>> agg = apply.right();
+    public List<Rule> buildRules() {
+        return ImmutableList.of(logicalApply(any(), logicalAggregate(
+                logicalProject(logicalFilter()))).when(LogicalApply::isCorrelated).then(
+                        PullUpCorrelatedFilterUnderApplyAggregateProject::pullUpCorrelatedFilter)
+                        .toRule(RuleType.PULL_UP_CORRELATED_FILTER_UNDER_APPLY_AGGREGATE_PROJECT),
+                logicalApply(any(), logicalFilter((logicalAggregate(
+                        logicalProject(logicalFilter()))))).when(LogicalApply::isCorrelated).then(
+                                PullUpCorrelatedFilterUnderApplyAggregateProject::pullUpCorrelatedFilter)
+                                .toRule(RuleType.PULL_UP_CORRELATED_FILTER_UNDER_APPLY_FILTER_AGGREGATE_PROJECT));
+    }
 
-                    LogicalProject<LogicalFilter<Plan>> project = agg.child();
-                    LogicalFilter<Plan> filter = project.child();
-                    List<NamedExpression> newProjects = Lists.newArrayList();
-                    newProjects.addAll(project.getProjects());
-                    filter.child().getOutput().forEach(slot -> {
-                        if (!newProjects.contains(slot)) {
-                            newProjects.add(slot);
-                        }
-                    });
+    private static LogicalApply<?, ?> pullUpCorrelatedFilter(LogicalApply<?, ?> apply) {
+        boolean isRightChildAgg = apply.right() instanceof LogicalAggregate;
+        // locate agg node
+        LogicalAggregate<LogicalProject<LogicalFilter<Plan>>> agg = isRightChildAgg
+                ? (LogicalAggregate<LogicalProject<LogicalFilter<Plan>>>) (apply.right())
+                : (LogicalAggregate<LogicalProject<LogicalFilter<Plan>>>) (apply.right().child(0));
 
-                    LogicalProject<Plan> newProject = project.withProjectsAndChild(newProjects, filter.child());
-                    LogicalFilter<Plan> newFilter = new LogicalFilter<>(filter.getConjuncts(), newProject);
-                    LogicalAggregate<Plan> newAgg = agg.withChildren(ImmutableList.of(newFilter));
-                    return apply.withChildren(apply.left(), newAgg);
-                }).toRule(RuleType.PULL_UP_CORRELATED_FILTER_UNDER_APPLY_AGGREGATE_PROJECT);
+        // pull up filter under the project
+        LogicalProject<LogicalFilter<Plan>> project = agg.child();
+        LogicalFilter<Plan> filter = project.child();
+        List<NamedExpression> newProjects = Lists.newArrayList();
+        newProjects.addAll(project.getProjects());
+
+        // filter may use all slots from its child, so add all the slots to newProjects
+        filter.child().getOutput().forEach(slot -> {
+            if (!newProjects.contains(slot)) {
+                newProjects.add(slot);
+            }
+        });
+
+        Set<Slot> correlatedSlots = ExpressionUtils.getInputSlotSet(apply.getCorrelationSlot());
+        Set<Expression> pullUpPredicates = Sets.newLinkedHashSet();
+        Set<Expression> filterPredicates = Sets.newLinkedHashSet();
+        for (Expression conjunct : filter.getConjuncts()) {
+            Set<Slot> conjunctSlots = conjunct.getInputSlots();
+            if (Sets.intersection(conjunctSlots, correlatedSlots).isEmpty()) {
+                filterPredicates.add(conjunct);
+            } else {
+                pullUpPredicates.add(conjunct);
+            }
+        }
+
+        LogicalProject<Plan> newProject = project.withProjectsAndChild(newProjects,
+                filterPredicates.isEmpty() ? filter.child()
+                        : filter.withConjuncts(filterPredicates));
+        LogicalFilter<Plan> newFilter = new LogicalFilter<>(pullUpPredicates, newProject);
+        LogicalAggregate<Plan> newAgg = agg.withChildren(ImmutableList.of(newFilter));
+        return (LogicalApply<?, ?>) (apply.withChildren(apply.left(),
+                isRightChildAgg ? newAgg : apply.right().withChildren(newAgg)));
     }
 }

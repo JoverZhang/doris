@@ -20,13 +20,14 @@ package org.apache.doris.plugin.audit;
 import org.apache.doris.common.AuditLog;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.util.DigitalVersion;
+import org.apache.doris.plugin.AuditEvent;
+import org.apache.doris.plugin.AuditEvent.AuditField;
+import org.apache.doris.plugin.AuditEvent.EventType;
 import org.apache.doris.plugin.AuditPlugin;
 import org.apache.doris.plugin.Plugin;
 import org.apache.doris.plugin.PluginInfo;
 import org.apache.doris.plugin.PluginInfo.PluginType;
 import org.apache.doris.plugin.PluginMgr;
-import org.apache.doris.plugin.audit.AuditEvent.AuditField;
-import org.apache.doris.plugin.audit.AuditEvent.EventType;
 
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
@@ -90,7 +91,9 @@ public class AuditLogBuilder extends Plugin implements AuditPlugin {
                     break;
             }
         } catch (Exception e) {
-            LOG.debug("failed to process audit event", e);
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("failed to process audit event", e);
+            }
         }
     }
 
@@ -113,7 +116,7 @@ public class AuditLogBuilder extends Plugin implements AuditPlugin {
             if (af.value().equals("Time(ms)")) {
                 queryTime = (long) f.get(event);
             }
-            sb.append("|").append(af.value()).append("=").append(String.valueOf(f.get(event)));
+            sb.append("|").append(af.value()).append("=").append(f.get(event));
         }
 
         String auditLog = sb.toString();
@@ -160,4 +163,3 @@ public class AuditLogBuilder extends Plugin implements AuditPlugin {
         AuditLog.getStreamLoadAudit().log(auditLog);
     }
 }
-

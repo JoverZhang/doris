@@ -19,31 +19,42 @@ package org.apache.doris.nereids.trees.plans.commands;
 
 import org.apache.doris.analysis.CreateTableStmt;
 import org.apache.doris.analysis.DropTableStmt;
+import org.apache.doris.analysis.StmtType;
 import org.apache.doris.analysis.TableName;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.ScalarType;
 import org.apache.doris.common.ErrorCode;
+import org.apache.doris.common.FeConstants;
 import org.apache.doris.nereids.NereidsPlanner;
-import org.apache.doris.nereids.analyzer.UnboundTableSink;
+import org.apache.doris.nereids.analyzer.UnboundResultSink;
+import org.apache.doris.nereids.analyzer.UnboundTableSinkCreator;
 import org.apache.doris.nereids.annotation.Developing;
 import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.properties.PhysicalProperties;
 import org.apache.doris.nereids.trees.expressions.NamedExpression;
 import org.apache.doris.nereids.trees.expressions.Slot;
+import org.apache.doris.nereids.trees.expressions.SlotReference;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.PlanType;
 import org.apache.doris.nereids.trees.plans.commands.ExplainCommand.ExplainLevel;
 import org.apache.doris.nereids.trees.plans.commands.info.ColumnDefinition;
 import org.apache.doris.nereids.trees.plans.commands.info.CreateTableInfo;
+import org.apache.doris.nereids.trees.plans.commands.insert.InsertIntoTableCommand;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
+import org.apache.doris.nereids.types.CharType;
 import org.apache.doris.nereids.types.DataType;
 import org.apache.doris.nereids.types.DecimalV2Type;
+import org.apache.doris.nereids.types.NullType;
+import org.apache.doris.nereids.types.StringType;
 import org.apache.doris.nereids.types.TinyIntType;
 import org.apache.doris.nereids.types.VarcharType;
 import org.apache.doris.nereids.types.coercion.CharacterType;
+import org.apache.doris.nereids.util.RelationUtil;
+import org.apache.doris.nereids.util.TypeCoercionUtils;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.QueryState.MysqlStateType;
+import org.apache.doris.qe.SessionVariable;
 import org.apache.doris.qe.StmtExecutor;
 
 import com.google.common.collect.ImmutableList;
@@ -73,30 +84,23 @@ public class CreateTableCommand extends Command implements ForwardWithSync {
 
     @Override
     public void run(ConnectContext ctx, StmtExecutor executor) throws Exception {
-        if (!ctx.getSessionVariable().isEnableNereidsDML()) {
-            try {
-                ctx.getSessionVariable().enableFallbackToOriginalPlannerOnce();
-            } catch (Exception e) {
-                throw new AnalysisException("failed to set fallback to original planner to true", e);
-            }
-            throw new AnalysisException("Nereids DML is disabled, will try to fall back to the original planner");
-        }
         if (!ctasQuery.isPresent()) {
             createTableInfo.validate(ctx);
             CreateTableStmt createTableStmt = createTableInfo.translateToLegacyStmt();
-            LOG.debug("Nereids start to execute the create table command, query id: {}, tableName: {}",
-                    ctx.queryId(), createTableInfo.getTableName());
-            try {
-                Env.getCurrentEnv().createTable(createTableStmt);
-            } catch (Exception e) {
-                throw new AnalysisException(e.getMessage(), e.getCause());
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Nereids start to execute the create table command, query id: {}, tableName: {}",
+                        ctx.queryId(), createTableInfo.getTableName());
             }
+
+            Env.getCurrentEnv().createTable(createTableStmt);
             return;
         }
         LogicalPlan query = ctasQuery.get();
         List<String> ctasCols = createTableInfo.getCtasColumns();
         NereidsPlanner planner = new NereidsPlanner(ctx.getStatementContext());
-        Plan plan = planner.plan(query, PhysicalProperties.ANY, ExplainLevel.NONE);
+        // must disable constant folding by be, because be constant folding may return wrong type
+        ctx.getSessionVariable().setVarOnce(SessionVariable.ENABLE_FOLD_CONSTANT_BY_BE, "false");
+        Plan plan = planner.planWithLock(new UnboundResultSink<>(query), PhysicalProperties.ANY, ExplainLevel.NONE);
         if (ctasCols == null) {
             // we should analyze the plan firstly to get the columns' name.
             ctasCols = plan.getOutput().stream().map(NamedExpression::getName).collect(Collectors.toList());
@@ -109,35 +113,72 @@ public class CreateTableCommand extends Command implements ForwardWithSync {
         for (int i = 0; i < slots.size(); i++) {
             Slot s = slots.get(i);
             DataType dataType = s.getDataType().conversion();
-            if (dataType.isNullType()) {
-                dataType = TinyIntType.INSTANCE;
-            } else if (dataType.isDecimalV2Type()) {
-                dataType = DecimalV2Type.SYSTEM_DEFAULT;
-            } else if (i == 0 && dataType.isStringType()) {
+            if (i == 0 && dataType.isStringType()) {
+                // first column of olap table can not be string type.
+                // So change it to varchar type.
                 dataType = VarcharType.createVarcharType(ScalarType.MAX_VARCHAR_LENGTH);
-            } else if (dataType instanceof CharacterType) {
-                // if column is not come from table, we should set varchar length to max
-                if (!s.isColumnFromTable()) {
-                    dataType = VarcharType.createVarcharType(ScalarType.MAX_VARCHAR_LENGTH);
+            } else {
+                dataType = TypeCoercionUtils.replaceSpecifiedType(dataType,
+                        NullType.class, TinyIntType.INSTANCE);
+                dataType = TypeCoercionUtils.replaceSpecifiedType(dataType,
+                        DecimalV2Type.class, DecimalV2Type.SYSTEM_DEFAULT);
+                if (s.isColumnFromTable()) {
+                    if ((!((SlotReference) s).getTable().isPresent()
+                            || !((SlotReference) s).getTable().get().isManagedTable())) {
+                        if (createTableInfo.getPartitionTableInfo().inIdentifierPartitions(s.getName())
+                                || (createTableInfo.getDistribution() != null
+                                && createTableInfo.getDistribution().inDistributionColumns(s.getName()))) {
+                            // String type can not be used in partition/distributed column,
+                            // so we replace it to varchar
+                            dataType = TypeCoercionUtils.replaceSpecifiedType(dataType,
+                                    CharacterType.class, VarcharType.MAX_VARCHAR_TYPE);
+                        } else {
+                            if (i == 0) {
+                                // first column of olap table can not be string type.
+                                // So change it to varchar type.
+                                dataType = TypeCoercionUtils.replaceSpecifiedType(dataType,
+                                        CharacterType.class, VarcharType.MAX_VARCHAR_TYPE);
+                            } else {
+                                // change varchar/char column from external table to string type
+                                dataType = TypeCoercionUtils.replaceSpecifiedType(dataType,
+                                        CharacterType.class, StringType.INSTANCE);
+                            }
+                        }
+                    }
+                } else {
+                    if (ctx.getSessionVariable().useMaxLengthOfVarcharInCtas) {
+                        dataType = TypeCoercionUtils.replaceSpecifiedType(dataType,
+                                VarcharType.class, VarcharType.MAX_VARCHAR_TYPE);
+                        dataType = TypeCoercionUtils.replaceSpecifiedType(dataType,
+                                CharType.class, VarcharType.MAX_VARCHAR_TYPE);
+                    }
                 }
             }
             // if the column is an expression, we set it to nullable, otherwise according to the nullable of the slot.
             columnsOfQuery.add(new ColumnDefinition(s.getName(), dataType, !s.isColumnFromTable() || s.nullable()));
         }
-        createTableInfo.validateCreateTableAsSelect(columnsOfQuery.build(), ctx);
+        List<String> qualifierTableName = RelationUtil.getQualifierName(ctx, createTableInfo.getTableNameParts());
+        createTableInfo.validateCreateTableAsSelect(qualifierTableName, columnsOfQuery.build(), ctx);
         CreateTableStmt createTableStmt = createTableInfo.translateToLegacyStmt();
-        LOG.debug("Nereids start to execute the ctas command, query id: {}, tableName: {}",
-                ctx.queryId(), createTableInfo.getTableName());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Nereids start to execute the ctas command, query id: {}, tableName: {}",
+                    ctx.queryId(), createTableInfo.getTableName());
+        }
         try {
-            Env.getCurrentEnv().createTable(createTableStmt);
+            if (Env.getCurrentEnv().createTable(createTableStmt)) {
+                return;
+            }
         } catch (Exception e) {
             throw new AnalysisException(e.getMessage(), e.getCause());
         }
 
-        query = new UnboundTableSink<>(createTableInfo.getTableNameParts(), ImmutableList.of(), ImmutableList.of(),
-                ImmutableList.of(), query);
+        query = UnboundTableSinkCreator.createUnboundTableSink(createTableInfo.getTableNameParts(),
+                ImmutableList.of(), ImmutableList.of(), ImmutableList.of(), query);
         try {
-            new InsertIntoTableCommand(query, Optional.empty()).run(ctx, executor);
+            if (!FeConstants.runningUnitTest) {
+                new InsertIntoTableCommand(query, Optional.empty(), Optional.empty(), Optional.empty()).run(
+                        ctx, executor);
+            }
             if (ctx.getState().getStateType() == MysqlStateType.ERR) {
                 handleFallbackFailedCtas(ctx);
             }
@@ -150,7 +191,7 @@ public class CreateTableCommand extends Command implements ForwardWithSync {
     void handleFallbackFailedCtas(ConnectContext ctx) {
         try {
             Env.getCurrentEnv().dropTable(new DropTableStmt(false,
-                    new TableName(Env.getCurrentEnv().getCurrentCatalog().getName(),
+                    new TableName(createTableInfo.getCtlName(),
                             createTableInfo.getDbName(), createTableInfo.getTableName()), true));
         } catch (Exception e) {
             // TODO: refactor it with normal error process.
@@ -166,4 +207,15 @@ public class CreateTableCommand extends Command implements ForwardWithSync {
     public <R, C> R accept(PlanVisitor<R, C> visitor, C context) {
         return visitor.visitCreateTableCommand(this, context);
     }
+
+    // for test
+    public CreateTableInfo getCreateTableInfo() {
+        return createTableInfo;
+    }
+
+    @Override
+    public StmtType stmtType() {
+        return StmtType.CREATE;
+    }
 }
+

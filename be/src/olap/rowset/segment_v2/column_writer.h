@@ -30,6 +30,7 @@
 
 #include "common/status.h" // for Status
 #include "olap/field.h"    // for Field
+#include "olap/rowset/segment_v2/bloom_filter.h"
 #include "olap/rowset/segment_v2/common.h"
 #include "olap/rowset/segment_v2/inverted_index_writer.h"
 #include "util/bitmap.h" // for BitmapChange
@@ -60,10 +61,13 @@ struct ColumnWriterOptions {
     bool need_bitmap_index = false;
     bool need_bloom_filter = false;
     bool is_ngram_bf_index = false;
+    bool need_inverted_index = false;
     uint8_t gram_size;
     uint16_t gram_bf_size;
-    std::vector<const TabletIndex*> indexes;
+    BloomFilterOptions bf_options;
+    std::vector<const TabletIndex*> indexes; // unused
     const TabletIndex* inverted_index = nullptr;
+    InvertedIndexFileWriter* inverted_index_file_writer;
     std::string to_string() const {
         std::stringstream ss;
         ss << std::boolalpha << "meta=" << meta->DebugString()
@@ -87,6 +91,18 @@ class ColumnWriter {
 public:
     static Status create(const ColumnWriterOptions& opts, const TabletColumn* column,
                          io::FileWriter* file_writer, std::unique_ptr<ColumnWriter>* writer);
+    static Status create_struct_writer(const ColumnWriterOptions& opts, const TabletColumn* column,
+                                       io::FileWriter* file_writer,
+                                       std::unique_ptr<ColumnWriter>* writer);
+    static Status create_array_writer(const ColumnWriterOptions& opts, const TabletColumn* column,
+                                      io::FileWriter* file_writer,
+                                      std::unique_ptr<ColumnWriter>* writer);
+    static Status create_map_writer(const ColumnWriterOptions& opts, const TabletColumn* column,
+                                    io::FileWriter* file_writer,
+                                    std::unique_ptr<ColumnWriter>* writer);
+    static Status create_agg_state_writer(const ColumnWriterOptions& opts,
+                                          const TabletColumn* column, io::FileWriter* file_writer,
+                                          std::unique_ptr<ColumnWriter>* writer);
 
     explicit ColumnWriter(std::unique_ptr<Field> field, bool is_nullable)
             : _field(std::move(field)), _is_nullable(is_nullable) {}
@@ -142,8 +158,6 @@ public:
 
     virtual Status write_inverted_index() = 0;
 
-    virtual size_t get_inverted_index_size() = 0;
-
     virtual Status write_bloom_filter_index() = 0;
 
     virtual ordinal_t get_next_rowid() const = 0;
@@ -164,7 +178,7 @@ private:
 class FlushPageCallback {
 public:
     virtual ~FlushPageCallback() = default;
-    virtual Status put_extra_info_in_page(DataPageFooterPB* footer) { return Status::OK(); }
+    virtual void put_extra_info_in_page(DataPageFooterPB* footer) {}
 };
 
 // Encode one column's data into some memory slice.
@@ -194,7 +208,6 @@ public:
     Status write_zone_map() override;
     Status write_bitmap_index() override;
     Status write_inverted_index() override;
-    size_t get_inverted_index_size() override;
     Status write_bloom_filter_index() override;
     ordinal_t get_next_rowid() const override { return _next_rowid; }
 
@@ -206,9 +219,15 @@ public:
     // used for append not null data. When page is full, will append data not reach num_rows.
     Status append_data_in_current_page(const uint8_t** ptr, size_t* num_written);
 
-    Status append_data_in_current_page(const uint8_t* ptr, size_t* num_written);
+    Status append_data_in_current_page(const uint8_t* ptr, size_t* num_written) {
+        RETURN_IF_CATCH_EXCEPTION(
+                { return _internal_append_data_in_current_page(ptr, num_written); });
+    }
     friend class ArrayColumnWriter;
     friend class OffsetColumnWriter;
+
+private:
+    Status _internal_append_data_in_current_page(const uint8_t* ptr, size_t* num_written);
 
 private:
     std::unique_ptr<PageBuilder> _page_builder;
@@ -280,7 +299,7 @@ public:
     Status append_data(const uint8_t** ptr, size_t num_rows) override;
 
 private:
-    Status put_extra_info_in_page(DataPageFooterPB* footer) override;
+    void put_extra_info_in_page(DataPageFooterPB* footer) override;
 
     uint64_t _next_offset;
 };
@@ -320,7 +339,6 @@ public:
         return Status::OK();
     }
     Status write_inverted_index() override;
-    size_t get_inverted_index_size() override;
     Status write_bloom_filter_index() override {
         if (_opts.need_bloom_filter) {
             return Status::NotSupported("struct not support bloom filter index");
@@ -372,7 +390,6 @@ public:
         return Status::OK();
     }
     Status write_inverted_index() override;
-    size_t get_inverted_index_size() override;
     Status write_bloom_filter_index() override {
         if (_opts.need_bloom_filter) {
             return Status::NotSupported("array not support bloom filter index");
@@ -411,7 +428,6 @@ public:
     Status write_data() override;
     Status write_ordinal_index() override;
     Status write_inverted_index() override;
-    size_t get_inverted_index_size() override;
     Status append_nulls(size_t num_rows) override;
 
     Status finish_current_page() override;

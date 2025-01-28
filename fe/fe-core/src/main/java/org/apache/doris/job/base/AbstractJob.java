@@ -50,6 +50,8 @@ import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
@@ -57,7 +59,11 @@ import java.util.stream.Collectors;
 @Data
 @Log4j2
 public abstract class AbstractJob<T extends AbstractTask, C> implements Job<T, C>, Writable {
-
+    public static final ImmutableList<Column> COMMON_SCHEMA = ImmutableList.of(
+            new Column("SucceedTaskCount", ScalarType.createStringType()),
+            new Column("FailedTaskCount", ScalarType.createStringType()),
+            new Column("CanceledTaskCount", ScalarType.createStringType())
+    );
     @SerializedName(value = "jid")
     private Long jobId;
 
@@ -90,6 +96,16 @@ public abstract class AbstractJob<T extends AbstractTask, C> implements Job<T, C
 
     @SerializedName(value = "sql")
     String executeSql;
+
+
+    @SerializedName(value = "stc")
+    private AtomicLong succeedTaskCount = new AtomicLong(0);
+
+    @SerializedName(value = "ftc")
+    private AtomicLong failedTaskCount = new AtomicLong(0);
+
+    @SerializedName(value = "ctc")
+    private AtomicLong canceledTaskCount = new AtomicLong(0);
 
     public AbstractJob() {
     }
@@ -128,19 +144,21 @@ public abstract class AbstractJob<T extends AbstractTask, C> implements Job<T, C
         this.executeSql = executeSql;
     }
 
-    private List<T> runningTasks = new ArrayList<>();
+    private CopyOnWriteArrayList<T> runningTasks = new CopyOnWriteArrayList<>();
 
     private Lock createTaskLock = new ReentrantLock();
 
     @Override
-    public void cancelAllTasks() throws JobException {
+    public void cancelAllTasks(boolean needWaitCancelComplete) throws JobException {
         if (CollectionUtils.isEmpty(runningTasks)) {
             return;
         }
         for (T task : runningTasks) {
-            task.cancel();
+            task.cancel(needWaitCancelComplete);
+            canceledTaskCount.incrementAndGet();
         }
-        runningTasks = new ArrayList<>();
+        runningTasks = new CopyOnWriteArrayList<>();
+        logUpdateOperation();
     }
 
     private static final ImmutableList<String> TITLE_NAMES =
@@ -166,8 +184,9 @@ public abstract class AbstractJob<T extends AbstractTask, C> implements Job<T, C
             throw new JobException("no running task");
         }
         runningTasks.stream().filter(task -> task.getTaskId().equals(taskId)).findFirst()
-                .orElseThrow(() -> new JobException("no task id: " + taskId)).cancel();
+                .orElseThrow(() -> new JobException("Not found task id: " + taskId)).cancel(true);
         runningTasks.removeIf(task -> task.getTaskId().equals(taskId));
+        canceledTaskCount.incrementAndGet();
         if (jobConfig.getExecuteType().equals(JobExecuteType.ONE_TIME)) {
             updateJobStatus(JobStatus.FINISHED);
         }
@@ -195,8 +214,9 @@ public abstract class AbstractJob<T extends AbstractTask, C> implements Job<T, C
     }
 
     public List<T> commonCreateTasks(TaskType taskType, C taskContext) {
-        if (!getJobStatus().equals(JobStatus.RUNNING)) {
-            log.warn("job is not running, job id is {}", jobId);
+        if (!canCreateTask(taskType)) {
+            log.info("job is not ready for scheduling, job id is {},job status is {}, taskType is {}", jobId,
+                    jobStatus, taskType);
             return new ArrayList<>();
         }
         if (!isReadyForScheduling(taskContext)) {
@@ -215,6 +235,19 @@ public abstract class AbstractJob<T extends AbstractTask, C> implements Job<T, C
             return tasks;
         } finally {
             createTaskLock.unlock();
+        }
+    }
+
+    private boolean canCreateTask(TaskType taskType) {
+        JobStatus currentJobStatus = getJobStatus();
+
+        switch (taskType) {
+            case SCHEDULED:
+                return currentJobStatus.equals(JobStatus.RUNNING);
+            case MANUAL:
+                return currentJobStatus.equals(JobStatus.RUNNING) || currentJobStatus.equals(JobStatus.PAUSED);
+            default:
+                throw new IllegalArgumentException("Unsupported TaskType: " + taskType);
         }
     }
 
@@ -244,11 +277,11 @@ public abstract class AbstractJob<T extends AbstractTask, C> implements Job<T, C
         if (null == newJobStatus) {
             throw new IllegalArgumentException("jobStatus cannot be null");
         }
+        if (jobStatus == newJobStatus) {
+            return;
+        }
         String errorMsg = String.format("Can't update job %s status to the %s status",
                 jobStatus.name(), newJobStatus.name());
-        if (jobStatus == newJobStatus) {
-            throw new IllegalArgumentException(errorMsg);
-        }
         if (newJobStatus.equals(JobStatus.RUNNING) && !jobStatus.equals(JobStatus.PAUSED)) {
             throw new IllegalArgumentException(errorMsg);
         }
@@ -259,7 +292,7 @@ public abstract class AbstractJob<T extends AbstractTask, C> implements Job<T, C
             this.finishTimeMs = System.currentTimeMillis();
         }
         if (JobStatus.PAUSED.equals(newJobStatus) || JobStatus.STOPPED.equals(newJobStatus)) {
-            cancelAllTasks();
+            cancelAllTasks(JobStatus.STOPPED.equals(newJobStatus) ? false : true);
         }
         jobStatus = newJobStatus;
     }
@@ -270,7 +303,7 @@ public abstract class AbstractJob<T extends AbstractTask, C> implements Job<T, C
     public static AbstractJob readFields(DataInput in) throws IOException {
         String jsonJob = Text.readString(in);
         AbstractJob job = GsonUtils.GSON.fromJson(jsonJob, AbstractJob.class);
-        job.runningTasks = new ArrayList<>();
+        job.runningTasks = new CopyOnWriteArrayList();
         job.createTaskLock = new ReentrantLock();
         return job;
     }
@@ -289,34 +322,47 @@ public abstract class AbstractJob<T extends AbstractTask, C> implements Job<T, C
 
     @Override
     public void onTaskFail(T task) throws JobException {
-        updateJobStatusIfEnd();
+        failedTaskCount.incrementAndGet();
+        updateJobStatusIfEnd(false, task.getTaskType());
         runningTasks.remove(task);
+        logUpdateOperation();
     }
 
     @Override
     public void onTaskSuccess(T task) throws JobException {
-        updateJobStatusIfEnd();
+        succeedTaskCount.incrementAndGet();
+        updateJobStatusIfEnd(true, task.getTaskType());
         runningTasks.remove(task);
+        logUpdateOperation();
 
     }
 
 
-    private void updateJobStatusIfEnd() throws JobException {
+    private void updateJobStatusIfEnd(boolean taskSuccess, TaskType taskType) throws JobException {
         JobExecuteType executeType = getJobConfig().getExecuteType();
-        if (executeType.equals(JobExecuteType.MANUAL)) {
+        if (executeType.equals(JobExecuteType.MANUAL) || taskType.equals(TaskType.MANUAL)) {
             return;
         }
         switch (executeType) {
             case ONE_TIME:
+                updateJobStatus(JobStatus.FINISHED);
+                this.finishTimeMs = System.currentTimeMillis();
+                break;
             case INSTANT:
-                Env.getCurrentEnv().getJobManager().getJob(jobId).updateJobStatus(JobStatus.FINISHED);
+                this.finishTimeMs = System.currentTimeMillis();
+                if (taskSuccess) {
+                    updateJobStatus(JobStatus.FINISHED);
+                } else {
+                    updateJobStatus(JobStatus.STOPPED);
+                }
                 break;
             case RECURRING:
                 TimerDefinition timerDefinition = getJobConfig().getTimerDefinition();
                 if (null != timerDefinition.getEndTimeMs()
                         && timerDefinition.getEndTimeMs() < System.currentTimeMillis()
                         + timerDefinition.getIntervalUnit().getIntervalMs(timerDefinition.getInterval())) {
-                    Env.getCurrentEnv().getJobManager().getJob(jobId).updateJobStatus(JobStatus.FINISHED);
+                    this.finishTimeMs = System.currentTimeMillis();
+                    updateJobStatus(JobStatus.FINISHED);
                 }
                 break;
             default:
@@ -354,6 +400,9 @@ public abstract class AbstractJob<T extends AbstractTask, C> implements Job<T, C
         trow.addToColumnValue(new TCell().setStringVal(jobStatus.name()));
         trow.addToColumnValue(new TCell().setStringVal(executeSql));
         trow.addToColumnValue(new TCell().setStringVal(TimeUtils.longToTimeString(createTimeMs)));
+        trow.addToColumnValue(new TCell().setStringVal(String.valueOf(succeedTaskCount.get())));
+        trow.addToColumnValue(new TCell().setStringVal(String.valueOf(failedTaskCount.get())));
+        trow.addToColumnValue(new TCell().setStringVal(String.valueOf(canceledTaskCount.get())));
         trow.addToColumnValue(new TCell().setStringVal(comment));
         return trow;
     }
@@ -366,6 +415,23 @@ public abstract class AbstractJob<T extends AbstractTask, C> implements Job<T, C
     @Override
     public TRow getTvfInfo() {
         return getCommonTvfInfo();
+    }
+
+    /**
+     * Generates a common error message when the execution queue is full.
+     *
+     * @param taskId                  The ID of the task.
+     * @param queueConfigName         The name of the queue configuration.
+     * @param executeThreadConfigName The name of the execution thread configuration.
+     * @return A formatted error message.
+     */
+    protected String commonFormatMsgWhenExecuteQueueFull(Long taskId, String queueConfigName,
+                                                         String executeThreadConfigName) {
+        return String.format("Dispatch task failed, jobId: %d, jobName: %s, taskId: %d, the queue size is full, "
+                        + "you can increase the queue size by setting the property "
+                        + "%s in the fe.conf file or increase the value of "
+                        + "the property %s in the fe.conf file", getJobId(), getJobName(), taskId, queueConfigName,
+                executeThreadConfigName);
     }
 
     @Override

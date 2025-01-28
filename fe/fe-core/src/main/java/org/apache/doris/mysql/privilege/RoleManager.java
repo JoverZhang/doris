@@ -37,10 +37,12 @@ import org.apache.doris.persist.gson.GsonUtils;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.resource.workloadgroup.WorkloadGroupMgr;
 
+import com.aliyuncs.utils.StringUtils;
 import com.google.common.base.Joiner;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import com.google.common.collect.Streams;
 import com.google.gson.annotations.SerializedName;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -52,6 +54,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
+import java.util.concurrent.ConcurrentMap;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -62,7 +65,7 @@ public class RoleManager implements Writable, GsonPostProcessable {
 
     // Concurrency control is delegated by Auth, so not concurrentMap
     @SerializedName(value = "roles")
-    private Map<String, Role> roles = Maps.newHashMap();
+    private ConcurrentMap<String, Role> roles = Maps.newConcurrentMap();
 
     public RoleManager() {
         roles.put(Role.OPERATOR.getRoleName(), Role.OPERATOR);
@@ -98,6 +101,14 @@ public class RoleManager implements Writable, GsonPostProcessable {
 
         // we just remove the role from this map and remain others unchanged(privs, etc..)
         roles.remove(qualifiedRole);
+    }
+
+    private void replaceResourceLevel(Map<PrivLevel, List<Entry<ResourcePattern, PrivBitSet>>> map, PrivLevel type) {
+        List<Entry<ResourcePattern, PrivBitSet>> clusterSet = map.get(PrivLevel.RESOURCE);
+        if (clusterSet != null && !clusterSet.isEmpty()) {
+            map.remove(PrivLevel.RESOURCE);
+            map.put(type, clusterSet);
+        }
     }
 
     public Role revokePrivs(String name, TablePattern tblPattern, PrivBitSet privs,
@@ -150,30 +161,49 @@ public class RoleManager implements Writable, GsonPostProcessable {
             }
             List<String> info = Lists.newArrayList();
             info.add(role.getRoleName());
+            info.add(role.getComment());
             info.add(Joiner.on(", ").join(Env.getCurrentEnv().getAuth().getRoleUsers(role.getRoleName())));
-            Map<PrivLevel, String> infoMap =
-                    Stream.concat(
-                            role.getTblPatternToPrivs().entrySet().stream()
-                                    .collect(Collectors.groupingBy(entry -> entry.getKey().getPrivLevel())).entrySet()
-                                    .stream(),
-                            Stream.concat(role.getResourcePatternToPrivs().entrySet().stream()
-                                            .collect(Collectors.groupingBy(entry -> entry.getKey().getPrivLevel()))
-                                            .entrySet().stream(),
-                                    role.getWorkloadGroupPatternToPrivs().entrySet().stream()
-                                            .collect(Collectors.groupingBy(entry -> entry.getKey().getPrivLevel()))
-                                            .entrySet().stream())
-                    ).collect(Collectors.toMap(Entry::getKey, entry -> {
-                                if (entry.getKey() == PrivLevel.GLOBAL) {
-                                    return entry.getValue().stream().findFirst().map(priv -> priv.getValue().toString())
-                                            .orElse(FeConstants.null_string);
-                                } else {
-                                    return entry.getValue().stream()
-                                            .map(priv -> priv.getKey() + ": " + priv.getValue())
-                                            .collect(Collectors.joining("; "));
-                                }
-                            }, (s1, s2) -> s1 + " " + s2
-                    ));
-            Stream.of(PrivLevel.GLOBAL, PrivLevel.CATALOG, PrivLevel.DATABASE, PrivLevel.TABLE, PrivLevel.RESOURCE)
+
+            Map<PrivLevel, List<Entry<ResourcePattern, PrivBitSet>>> clusterMap = role.getClusterPatternToPrivs()
+                    .entrySet().stream().collect(Collectors.groupingBy(entry -> entry.getKey().getPrivLevel()));
+            replaceResourceLevel(clusterMap, PrivLevel.CLUSTER);
+
+            Map<PrivLevel, List<Entry<ResourcePattern, PrivBitSet>>> stageMap = role.getStagePatternToPrivs()
+                    .entrySet().stream().collect(Collectors.groupingBy(entry -> entry.getKey().getPrivLevel()));
+            replaceResourceLevel(stageMap, PrivLevel.STAGE);
+
+            Map<PrivLevel, List<Entry<ResourcePattern, PrivBitSet>>> storageVaultMap
+                    = role.getStorageVaultPatternToPrivs()
+                    .entrySet().stream().collect(Collectors.groupingBy(entry -> entry.getKey().getPrivLevel()));
+            replaceResourceLevel(storageVaultMap, PrivLevel.STORAGE_VAULT);
+
+            Map<PrivLevel, String> infoMap = Streams.concat(
+                    role.getTblPatternToPrivs().entrySet().stream()
+                            .collect(Collectors.groupingBy(entry -> entry.getKey().getPrivLevel())).entrySet()
+                            .stream(),
+                    role.getResourcePatternToPrivs().entrySet().stream()
+                            .collect(Collectors.groupingBy(entry -> entry.getKey().getPrivLevel()))
+                            .entrySet().stream(),
+                    role.getWorkloadGroupPatternToPrivs().entrySet().stream()
+                            .collect(Collectors.groupingBy(entry -> entry.getKey().getPrivLevel()))
+                            .entrySet().stream(),
+                    clusterMap.entrySet().stream(), stageMap.entrySet().stream(),
+                    storageVaultMap.entrySet().stream()).collect(Collectors.toMap(Entry::getKey, entry -> {
+                        if (entry.getKey() == PrivLevel.GLOBAL) {
+                            return entry.getValue().stream().findFirst().map(priv -> priv.getValue().toString())
+                                    .orElse(FeConstants.null_string);
+                        } else {
+                            return entry.getValue().stream()
+                                    .map(priv -> priv.getKey() + ": " + priv.getValue())
+                                    .collect(Collectors.joining("; "));
+                        }
+                    }, (s1, s2) -> s1 + " " + s2
+            ));
+
+            // METADATA in ShowRolesStmt, the 2nd CLUSTER is for compute group.
+            Stream.of(PrivLevel.GLOBAL, PrivLevel.CATALOG, PrivLevel.DATABASE, PrivLevel.TABLE, PrivLevel.RESOURCE,
+                        PrivLevel.CLUSTER, PrivLevel.STAGE, PrivLevel.STORAGE_VAULT, PrivLevel.WORKLOAD_GROUP,
+                        PrivLevel.CLUSTER)
                     .forEach(level -> {
                         String infoItem = infoMap.get(level);
                         if (Strings.isNullOrEmpty(infoItem)) {
@@ -182,6 +212,31 @@ public class RoleManager implements Writable, GsonPostProcessable {
                         info.add(infoItem);
                     });
             results.add(info);
+        }
+    }
+
+    public void getRoleWorkloadGroupPrivs(List<List<String>> result, Set<String> limitedRole) {
+        for (Role role : roles.values()) {
+            if (ClusterNamespace.getNameFromFullName(role.getRoleName()).startsWith(DEFAULT_ROLE_PREFIX)) {
+                continue;
+            }
+
+            if (limitedRole != null && !limitedRole.contains(role.getRoleName())) {
+                continue;
+            }
+            String isGrantable = role.checkGlobalPriv(PrivPredicate.ADMIN) ? "YES" : "NO";
+
+            for (Map.Entry<WorkloadGroupPattern, PrivBitSet> entry : role.getWorkloadGroupPatternToPrivs().entrySet()) {
+                List<String> row = Lists.newArrayList();
+                row.add(role.getRoleName());
+                row.add(entry.getKey().getworkloadGroupName());
+                if (StringUtils.isEmpty(entry.getValue().toString())) {
+                    continue;
+                }
+                row.add(entry.getValue().toString());
+                row.add(isGrantable);
+                result.add(row);
+            }
         }
     }
 
@@ -260,14 +315,13 @@ public class RoleManager implements Writable, GsonPostProcessable {
             return roleManager;
         } else {
             String json = Text.readString(in);
-            RoleManager rm = GsonUtils.GSON.fromJson(json, RoleManager.class);
-            return rm;
+            return GsonUtils.GSON.fromJson(json, RoleManager.class);
         }
     }
 
     // should be removed after version 3.0
     private void removeClusterPrefix() {
-        Map<String, Role> newRoles = Maps.newHashMap();
+        ConcurrentMap<String, Role> newRoles = Maps.newConcurrentMap();
         for (Map.Entry<String, Role> entry : roles.entrySet()) {
             String roleName = ClusterNamespace.getNameFromFullName(entry.getKey());
             newRoles.put(roleName, entry.getValue());
