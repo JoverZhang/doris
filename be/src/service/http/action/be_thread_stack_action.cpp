@@ -139,6 +139,9 @@ ucontext_t g_signal_context {};
 std::array<MemoryRange, MAX_MEMORY_RANGES> g_memory_ranges {};
 size_t g_memory_range_count = 0;
 int g_notification_pipe[2] = {-1, -1};
+#ifdef BE_TEST
+std::atomic<BeThreadStackSignalWaitHookForTest> g_signal_wait_hook_for_test {nullptr};
+#endif
 
 int rt_tgsigqueueinfo(pid_t tgid, pid_t tid, int sig, siginfo_t* info) {
     return static_cast<int>(syscall(__NR_rt_tgsigqueueinfo, tgid, tid, sig, info));
@@ -363,6 +366,14 @@ void stack_trace_signal_handler(int /*sig*/, siginfo_t* info, void* context) {
                             sizeof(notification_sequence));
         (void)res;
     }
+
+#ifdef BE_TEST
+    if (needs_coordinator_unwind) {
+        if (auto hook = g_signal_wait_hook_for_test.load(std::memory_order_acquire)) {
+            hook();
+        }
+    }
+#endif
 
     while (needs_coordinator_unwind &&
            g_unwind_release_sequence.load(std::memory_order_acquire) != notification_sequence &&
@@ -1111,6 +1122,12 @@ void append_thread_result(std::stringstream& out, const ThreadInfo& thread,
 #endif // __linux__
 
 } // namespace
+
+#if defined(BE_TEST) && defined(__linux__)
+void set_be_thread_stack_signal_wait_hook_for_test(BeThreadStackSignalWaitHookForTest hook) {
+    g_signal_wait_hook_for_test.store(hook, std::memory_order_release);
+}
+#endif
 
 void BeThreadStackAction::handle(HttpRequest* req) {
     req->add_output_header(HttpHeaders::CONTENT_TYPE, HEADER_TEXT.data());

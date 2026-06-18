@@ -40,4 +40,9 @@ public:
     void handle(HttpRequest* req) override;
 };
 
+#if defined(BE_TEST) && defined(__linux__)
+using BeThreadStackSignalWaitHookForTest = void (*)();
+void set_be_thread_stack_signal_wait_hook_for_test(BeThreadStackSignalWaitHookForTest hook);
+#endif
+
 } // namespace doris

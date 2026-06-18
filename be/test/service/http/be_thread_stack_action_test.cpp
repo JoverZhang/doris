@@ -21,7 +21,12 @@
 #include <gtest/gtest.h>
 
 #ifdef __linux__
+#include <limits.h>
+#include <link.h>
+#include <signal.h>
+#include <spawn.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <array>
@@ -30,6 +35,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <mutex>
@@ -43,6 +49,9 @@
 #include "service/http/ev_http_server.h"
 #include "service/http/http_client.h"
 #include "service/http/http_method.h"
+#include "util/defer_op.h"
+
+extern char** environ;
 
 namespace doris {
 
@@ -150,12 +159,18 @@ EvHttpServer* s_server = nullptr;
 BeThreadStackAction* s_action = nullptr;
 int s_real_port = 0;
 std::string s_hostname;
+constexpr char LOADER_LOCK_CHILD_ENV[] = "DORIS_BE_THREAD_STACK_LOADER_LOCK_CHILD_TEST";
+constexpr char LOADER_LOCK_CHILD_TEST[] =
+        "BeThreadStackActionTest.DISABLED_SignalContextLibunwindLoaderLockChild";
 
-Status do_get(const std::string& path, long* http_status, std::string* body) {
+Status do_get(const std::string& path, long* http_status, std::string* body,
+              int64_t timeout_ms = 5000) {
     HttpClient client;
     RETURN_IF_ERROR(client.init(s_hostname + path, /*set_fail_on_error=*/false));
     client.set_method(GET);
-    client.set_timeout_ms(5000);
+    if (timeout_ms > 0) {
+        client.set_timeout_ms(timeout_ms);
+    }
     RETURN_IF_ERROR(client.execute(body));
     *http_status = client.get_http_status();
     return Status::OK();
@@ -203,6 +218,182 @@ bool wait_until_syscall(pid_t tid, long expected_syscall) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     return false;
+}
+
+template <typename Predicate>
+bool wait_until(Predicate predicate, std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (predicate()) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return predicate();
+}
+
+struct LoaderLockPhdrState {
+    std::atomic<pid_t> tid {0};
+    std::atomic<int> callback_entered {0};
+    std::atomic<int> release_callback {0};
+};
+
+#if defined(__x86_64__)
+__attribute__((noinline, no_sanitize("address")))
+#endif
+int loader_lock_phdr_callback(dl_phdr_info* /*info*/, size_t /*size*/, void* data) {
+    auto* state = reinterpret_cast<LoaderLockPhdrState*>(data);
+#if defined(__x86_64__)
+    // This callback runs while glibc's dl_iterate_phdr() holds the loader lock. Keep the
+    // worker parked here with rbp cleared so the signal handler cannot finish through the
+    // frame-pointer fast path and must wait for coordinator-side libunwind. The signal hook flips
+    // release_callback only after that wait starts, so the test loop itself does not keep the
+    // loader lock held once coordinator unwinding begins.
+    auto* entered = &state->callback_entered;
+    auto* release = &state->release_callback;
+    __asm__ volatile(
+            "pushq %%rbp\n\t"
+            "xorq %%rbp, %%rbp\n\t"
+            "movl $1, (%0)\n\t"
+            "1:\n\t"
+            "cmpl $0, (%1)\n\t"
+            "jne 2f\n\t"
+            "pause\n\t"
+            "jmp 1b\n\t"
+            "2:\n\t"
+            "popq %%rbp\n\t"
+            :
+            : "r"(entered), "r"(release)
+            : "memory");
+#else
+    state->callback_entered.store(1, std::memory_order_release);
+    while (state->release_callback.load(std::memory_order_acquire) == 0) {
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+    }
+#endif
+    return 1;
+}
+
+std::atomic<int> s_signal_handler_waiting_for_coordinator {0};
+std::atomic<std::atomic<int>*> s_loader_lock_release_from_signal {nullptr};
+
+void release_loader_lock_callback_from_signal_handler() {
+    s_signal_handler_waiting_for_coordinator.store(1, std::memory_order_release);
+    if (auto* release = s_loader_lock_release_from_signal.load(std::memory_order_acquire)) {
+        release->store(1, std::memory_order_release);
+    }
+}
+
+void release_loader_callback_when_signal_handler_waits(std::atomic<int>* release_callback) {
+    s_signal_handler_waiting_for_coordinator.store(0, std::memory_order_release);
+    s_loader_lock_release_from_signal.store(release_callback, std::memory_order_release);
+    set_be_thread_stack_signal_wait_hook_for_test(release_loader_lock_callback_from_signal_handler);
+}
+
+bool signal_handler_waited_for_coordinator() {
+    return s_signal_handler_waiting_for_coordinator.load(std::memory_order_acquire) != 0;
+}
+
+void clear_loader_lock_signal_hook() {
+    set_be_thread_stack_signal_wait_hook_for_test(nullptr);
+    s_loader_lock_release_from_signal.store(nullptr, std::memory_order_release);
+}
+
+std::string current_executable_path() {
+    std::array<char, PATH_MAX> path {};
+    const ssize_t size = ::readlink("/proc/self/exe", path.data(), path.size() - 1);
+    if (size < 0) {
+        return "";
+    }
+    return std::string(path.data(), static_cast<size_t>(size));
+}
+
+std::vector<std::string> child_environment() {
+    std::vector<std::string> env;
+    const std::string child_env_prefix = std::string(LOADER_LOCK_CHILD_ENV) + "=";
+    for (char** entry = environ; entry != nullptr && *entry != nullptr; ++entry) {
+        std::string value(*entry);
+        if (!value.starts_with(child_env_prefix)) {
+            env.push_back(std::move(value));
+        }
+    }
+    env.emplace_back(child_env_prefix + "1");
+    return env;
+}
+
+std::vector<char*> mutable_argv(std::vector<std::string>* values) {
+    std::vector<char*> result;
+    result.reserve(values->size() + 1);
+    for (auto& value : *values) {
+        result.push_back(value.data());
+    }
+    result.push_back(nullptr);
+    return result;
+}
+
+std::string describe_child_status(int status) {
+    if (WIFEXITED(status)) {
+        return "exited with code " + std::to_string(WEXITSTATUS(status));
+    }
+    if (WIFSIGNALED(status)) {
+        return "terminated by signal " + std::to_string(WTERMSIG(status));
+    }
+    return "ended with status " + std::to_string(status);
+}
+
+testing::AssertionResult wait_for_child_success(pid_t pid, std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    int status = 0;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const pid_t result = ::waitpid(pid, &status, WNOHANG);
+        if (result == pid) {
+            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+                return testing::AssertionSuccess();
+            }
+            return testing::AssertionFailure() << "child process " << describe_child_status(status);
+        }
+        if (result < 0 && errno != EINTR) {
+            return testing::AssertionFailure() << "waitpid failed: " << strerror(errno);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    static_cast<void>(::kill(pid, SIGKILL));
+    static_cast<void>(::waitpid(pid, &status, 0));
+    return testing::AssertionFailure()
+           << "child process timed out while reproducing loader-lock unwind";
+}
+
+testing::AssertionResult run_self_gtest_child(const char* child_test,
+                                              std::chrono::milliseconds timeout) {
+    const std::string executable = current_executable_path();
+    if (executable.empty()) {
+        return testing::AssertionFailure()
+               << "failed to resolve /proc/self/exe: " << strerror(errno);
+    }
+
+    std::vector<std::string> args = {
+            executable,
+            std::string("--gtest_filter=") + child_test,
+            "--gtest_also_run_disabled_tests",
+            "--gtest_color=no",
+            "--gtest_print_time=false",
+    };
+    std::vector<std::string> env = child_environment();
+    std::vector<char*> argv = mutable_argv(&args);
+    std::vector<char*> envp = mutable_argv(&env);
+
+    pid_t pid = 0;
+    const int spawn_status =
+            ::posix_spawn(&pid, executable.c_str(), nullptr, nullptr, argv.data(), envp.data());
+    if (spawn_status != 0) {
+        return testing::AssertionFailure() << "posix_spawn failed: " << strerror(spawn_status);
+    }
+    return wait_for_child_success(pid, timeout);
+}
+
+bool loader_lock_child_enabled() {
+    const char* enabled = std::getenv(LOADER_LOCK_CHILD_ENV);
+    return enabled != nullptr && strcmp(enabled, "1") == 0;
 }
 
 } // namespace
@@ -424,6 +615,65 @@ TEST_F(BeThreadStackActionTest, StackTraceCacheSeparatesDwarfModes) {
     EXPECT_EQ(fast_after_disabled, fast_first);
     EXPECT_EQ(disabled_first, disabled_after_fast);
     EXPECT_NE(disabled_after_fast, fast_first);
+}
+
+TEST_F(BeThreadStackActionTest, SignalContextLibunwindDoesNotDeadlockOnLoaderLock) {
+#if !defined(__x86_64__) || !defined(USE_UNWIND) || !USE_UNWIND
+    GTEST_SKIP() << "loader-lock signal-context libunwind coverage requires x86_64 libunwind";
+#else
+    ASSERT_TRUE(run_self_gtest_child(LOADER_LOCK_CHILD_TEST, std::chrono::seconds(15)));
+#endif
+}
+
+TEST_F(BeThreadStackActionTest, DISABLED_SignalContextLibunwindLoaderLockChild) {
+#if !defined(__x86_64__) || !defined(USE_UNWIND) || !USE_UNWIND
+    GTEST_SKIP() << "loader-lock signal-context libunwind coverage requires x86_64 libunwind";
+#else
+    if (!loader_lock_child_enabled()) {
+        GTEST_SKIP() << "child case is executed only by the watchdog parent test";
+    }
+
+    LoaderLockPhdrState phdr_state;
+    std::thread worker([&] {
+        phdr_state.tid.store(static_cast<pid_t>(::syscall(SYS_gettid)), std::memory_order_release);
+        static_cast<void>(dl_iterate_phdr(loader_lock_phdr_callback, &phdr_state));
+    });
+    Defer cleanup([&] {
+        clear_loader_lock_signal_hook();
+        phdr_state.release_callback.store(1, std::memory_order_release);
+        if (worker.joinable()) {
+            worker.join();
+        }
+    });
+
+    // 1. Park worker inside dl_iterate_phdr callback while it holds glibc's loader lock.
+    ASSERT_TRUE(wait_until([&] { return phdr_state.tid.load(std::memory_order_acquire) != 0; },
+                           std::chrono::seconds(5)));
+    ASSERT_TRUE(wait_until(
+            [&] { return phdr_state.callback_entered.load(std::memory_order_acquire) != 0; },
+            std::chrono::seconds(5)))
+            << "worker did not enter dl_iterate_phdr callback while holding loader lock";
+
+    // 2. Let the signal handler release the callback only after it starts waiting for coordinator.
+    release_loader_callback_when_signal_handler_waits(&phdr_state.release_callback);
+
+    // 3. Trigger remote stack capture; current implementation deadlocks in coordinator unw_step().
+    long http_status = 0;
+    std::string body;
+    ASSERT_TRUE(do_get("/api/stack_trace?thread_id=" + std::to_string(phdr_state.tid.load()) +
+                               "&mode=disabled&timeout_ms=1000",
+                       &http_status, &body, /*timeout_ms=*/0)
+                        .ok());
+    EXPECT_EQ(200, http_status);
+
+    // 4. If the request returns, prove we exercised the intended fallback path.
+    EXPECT_TRUE(signal_handler_waited_for_coordinator())
+            << "signal handler did not enter coordinator-unwind wait; body:\n"
+            << body;
+    EXPECT_THAT(thread_result_line(body, phdr_state.tid.load()),
+                testing::HasSubstr("capture_method=signal_context_libunwind"));
+
+#endif
 }
 
 #else
